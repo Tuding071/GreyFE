@@ -297,6 +297,7 @@ jobs:
               onNavigate: (File) -> Unit,
               onBack: () -> Unit
           ) {
+              val context = LocalContext.current   // ✅ FIX: capture context here
               val files = remember(directory) {
                   directory.listFiles()?.sortedWith(
                       compareBy<File> { it.isFile }.thenBy { it.name.lowercase() }
@@ -342,7 +343,7 @@ jobs:
                                       if (file.isDirectory) {
                                           onNavigate(file)
                                       } else {
-                                          openFile(context = LocalContext.current, file = file)
+                                          openFile(context, file)   // ✅ uses captured context
                                       }
                                   }
                               )
@@ -521,9 +522,7 @@ jobs:
               accent = (100, 100, 100, 255)
               img = Image.new('RGBA', (size, size), bg)
               d = ImageDraw.Draw(img)
-              # Folder body
               d.rectangle([size*0.15, size*0.3, size*0.85, size*0.75], fill=white)
-              # Folder tab
               d.rectangle([size*0.15, size*0.2, size*0.5, size*0.3], fill=accent)
               return img
 
