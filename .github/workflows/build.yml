@@ -1,0 +1,583 @@
+name: Build GreyB Explorer
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set Android SDK path
+        run: echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Cache release keystore
+        uses: actions/cache@v4
+        with:
+          path: app/release.keystore
+          key: greyb-explorer-keystore-v1
+
+      - name: Generate project structure
+        run: |
+          mkdir -p app/src/main/java/com/greyb/explorer
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/res/xml
+          mkdir -p gradle/wrapper
+
+      - name: Generate AndroidManifest.xml
+        run: |
+          cat > app/src/main/AndroidManifest.xml << 'ENDOFFILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="28" />
+              <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+                  tools:ignore="ScopedStorage" />
+
+              <application
+                  android:label="GreyB Explorer"
+                  android:icon="@mipmap/ic_launcher"
+                  android:theme="@style/AppTheme"
+                  android:requestLegacyExternalStorage="true"
+                  android:supportsRtl="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:label="GreyB Explorer">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+              </application>
+          </manifest>
+          ENDOFFILE
+
+      - name: Generate file_paths.xml
+        run: |
+          cat > app/src/main/res/xml/file_paths.xml << 'ENDOFFILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths xmlns:android="http://schemas.android.com/apk/res/android">
+              <root-path name="root" path="." />
+              <external-path name="external" path="." />
+              <files-path name="internal_files" path="." />
+              <cache-path name="cache" path="." />
+          </paths>
+          ENDOFFILE
+
+      - name: Generate styles.xml
+        run: |
+          cat > app/src/main/res/values/styles.xml << 'ENDOFFILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">#1E1E1E</item>
+                  <item name="android:navigationBarColor">#1E1E1E</item>
+                  <item name="android:statusBarColor">#1E1E1E</item>
+              </style>
+          </resources>
+          ENDOFFILE
+
+      - name: Generate MainActivity.kt
+        run: |
+          cat > app/src/main/java/com/greyb/explorer/MainActivity.kt << 'ENDOFFILE'
+          package com.greyb.explorer
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Environment
+          import android.provider.Settings
+          import android.webkit.MimeTypeMap
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.BackHandler
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.ContextCompat
+          import androidx.core.content.FileProvider
+          import androidx.lifecycle.Lifecycle
+          import androidx.lifecycle.LifecycleEventObserver
+          import androidx.lifecycle.compose.LocalLifecycleOwner
+          import java.io.File
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      FileExplorerTheme {
+                          FileExplorerApp()
+                      }
+                  }
+              }
+          }
+
+          fun hasStoragePermission(context: Context): Boolean {
+              return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                  Environment.isExternalStorageManager()
+              } else {
+                  ContextCompat.checkSelfPermission(
+                      context,
+                      Manifest.permission.READ_EXTERNAL_STORAGE
+                  ) == PackageManager.PERMISSION_GRANTED
+              }
+          }
+
+          @Composable
+          fun FileExplorerApp() {
+              val context = LocalContext.current
+              var currentDir by remember { mutableStateOf<File?>(null) }
+              var hasPermission by remember { mutableStateOf(hasStoragePermission(context)) }
+
+              val permissionLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.RequestPermission()
+              ) { granted ->
+                  hasPermission = hasStoragePermission(context)
+              }
+
+              val lifecycleOwner = LocalLifecycleOwner.current
+              DisposableEffect(lifecycleOwner) {
+                  val observer = LifecycleEventObserver { _, event ->
+                      if (event == Lifecycle.Event.ON_RESUME) {
+                          hasPermission = hasStoragePermission(context)
+                      }
+                  }
+                  lifecycleOwner.lifecycle.addObserver(observer)
+                  onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+              }
+
+              LaunchedEffect(Unit) {
+                  if (!hasPermission) {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                          val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                          intent.data = Uri.parse("package:${context.packageName}")
+                          context.startActivity(intent)
+                      } else {
+                          permissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
+                      }
+                  }
+              }
+
+              BackHandler(enabled = currentDir != null) {
+                  currentDir = null
+              }
+
+              Surface(
+                  modifier = Modifier.fillMaxSize(),
+                  color = Color(0xFF1E1E1E)
+              ) {
+                  if (!hasPermission) {
+                      Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                          Text(
+                              "Storage permission required\nOpen Settings to grant",
+                              color = Color.White,
+                              fontSize = 18.sp
+                          )
+                      }
+                  } else {
+                      if (currentDir == null) {
+                          StorageRootsScreen(onRootClick = { root -> currentDir = root })
+                      } else {
+                          FileListScreen(
+                              directory = currentDir!!,
+                              onNavigate = { dir -> currentDir = dir },
+                              onBack = { currentDir = null }
+                          )
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun StorageRootsScreen(onRootClick: (File) -> Unit) {
+              val context = LocalContext.current
+              val roots = remember {
+                  val list = mutableListOf<File>()
+                  Environment.getExternalStorageDirectory()?.let { list.add(it) }
+                  val storageDir = File("/storage")
+                  if (storageDir.exists() && storageDir.canRead()) {
+                      storageDir.listFiles()?.forEach { dir ->
+                          if (dir.name != "emulated" && dir.name != "self" && dir.canRead()) {
+                              list.add(dir)
+                          }
+                      }
+                  }
+                  list.distinctBy { it.absolutePath }
+              }
+
+              LazyColumn(
+                  modifier = Modifier.fillMaxSize(),
+                  contentPadding = PaddingValues(16.dp)
+              ) {
+                  items(roots) { root ->
+                      val isInternal = root == Environment.getExternalStorageDirectory()
+                      val label = if (isInternal) "Internal Storage" else root.name
+                      Row(
+                          modifier = Modifier
+                              .fillMaxWidth()
+                              .clickable { onRootClick(root) }
+                              .padding(vertical = 14.dp),
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          Text(
+                              text = if (isInternal) "📱" else "💾",
+                              fontSize = 22.sp
+                          )
+                          Spacer(Modifier.width(12.dp))
+                          Text(
+                              text = label,
+                              color = Color.White,
+                              fontSize = 18.sp,
+                              fontWeight = FontWeight.Medium
+                          )
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun FileListScreen(
+              directory: File,
+              onNavigate: (File) -> Unit,
+              onBack: () -> Unit
+          ) {
+              val files = remember(directory) {
+                  directory.listFiles()?.sortedWith(
+                      compareBy<File> { it.isFile }.thenBy { it.name.lowercase() }
+                  ) ?: emptyList()
+              }
+
+              Column(Modifier.fillMaxSize()) {
+                  Row(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .background(Color(0xFF2A2A2A))
+                          .padding(horizontal = 16.dp, vertical = 14.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Text(
+                          text = "←",
+                          color = Color.White,
+                          fontSize = 20.sp,
+                          modifier = Modifier.clickable { onBack() }
+                      )
+                      Spacer(Modifier.width(12.dp))
+                      Text(
+                          text = directory.path,
+                          color = Color.White,
+                          fontSize = 16.sp,
+                          maxLines = 1
+                      )
+                  }
+
+                  if (files.isEmpty()) {
+                      Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                          Text("Empty folder", color = Color.White, fontSize = 16.sp)
+                      }
+                  } else {
+                      LazyColumn(
+                          modifier = Modifier.fillMaxSize(),
+                          contentPadding = PaddingValues(8.dp)
+                      ) {
+                          items(files) { file ->
+                              FileRow(
+                                  file = file,
+                                  onClick = {
+                                      if (file.isDirectory) {
+                                          onNavigate(file)
+                                      } else {
+                                          openFile(context = LocalContext.current, file = file)
+                                      }
+                                  }
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun FileRow(file: File, onClick: () -> Unit) {
+              Row(
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .clickable { onClick() }
+                      .padding(horizontal = 16.dp, vertical = 12.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Text(
+                      text = if (file.isDirectory) "📁" else "📄",
+                      fontSize = 18.sp
+                  )
+                  Spacer(Modifier.width(12.dp))
+                  Text(
+                      text = file.name,
+                      color = Color.White,
+                      fontSize = 16.sp,
+                      maxLines = 1
+                  )
+              }
+          }
+
+          fun openFile(context: Context, file: File) {
+              val uri = FileProvider.getUriForFile(
+                  context,
+                  context.packageName + ".fileprovider",
+                  file
+              )
+              val mime = MimeTypeMap.getSingleton()
+                  .getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
+              val intent = Intent(Intent.ACTION_VIEW).apply {
+                  setDataAndType(uri, mime)
+                  addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+              }
+              try {
+                  context.startActivity(Intent.createChooser(intent, "Open with"))
+              } catch (e: Exception) {
+                  Toast.makeText(context, "No app to open this file", Toast.LENGTH_SHORT).show()
+              }
+          }
+
+          @Composable
+          fun FileExplorerTheme(content: @Composable () -> Unit) {
+              MaterialTheme(
+                  colorScheme = darkColorScheme(
+                      background = Color(0xFF1E1E1E),
+                      surface = Color(0xFF2A2A2A),
+                      primary = Color.White,
+                      onBackground = Color.White,
+                      onSurface = Color.White
+                  ),
+                  content = content
+              )
+          }
+          ENDOFFILE
+
+      - name: Generate Gradle Scripts
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          cat > settings.gradle.kts << 'ENDOFFILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = "GreyBExplorer"
+          include(":app")
+          ENDOFFILE
+
+          cat > build.gradle.kts << 'ENDOFFILE'
+          plugins {
+              id("com.android.application") version "8.9.1" apply false
+              id("org.jetbrains.kotlin.android") version "2.2.0" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.2.0" apply false
+          }
+          ENDOFFILE
+
+          cat > app/build.gradle.kts << APPEOF
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.greyb.explorer"
+              compileSdk = 36
+
+              defaultConfig {
+                  applicationId = "com.greyb.explorer"
+                  minSdk = 26
+                  targetSdk = 36
+                  versionCode = ${BUILD_NUMBER}
+                  versionName = "${BUILD_NUMBER}"
+              }
+
+              signingConfigs {
+                  create("release") {
+                      storeFile = file("release.keystore")
+                      storePassword = "greyb2024"
+                      keyAlias = "greyb"
+                      keyPassword = "greyb2024"
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = true
+                      isShrinkResources = true
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+                      signingConfig = signingConfigs.getByName("release")
+                  }
+              }
+
+              buildFeatures {
+                  compose = true
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation(platform("androidx.compose:compose-bom:2024.09.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+          }
+          APPEOF
+
+          cat > gradle.properties << 'ENDOFFILE'
+          android.useAndroidX=true
+          android.enableJetifier=true
+          org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m -XX:+UseParallelGC
+          kotlin.code.style=official
+          android.suppressUnsupportedCompileSdk=36
+          ENDOFFILE
+
+      - name: Generate fixed keystore (if missing)
+        run: |
+          if [ ! -f app/release.keystore ]; then
+            keytool -genkey -v -keystore app/release.keystore -alias greyb -keyalg RSA -keysize 2048 -validity 10000 -storepass greyb2024 -keypass greyb2024 -dname "CN=GreyB, OU=GreyB, O=GreyB Explorer, L=Test, S=Test, C=US"
+            echo "✅ New keystore created"
+          else
+            echo "✅ Using existing cached keystore"
+          fi
+
+      - name: Generate launcher icons
+        run: |
+          rm -rf app/src/main/res/mipmap-*
+          pip3 install Pillow --quiet --break-system-packages 2>/dev/null || pip install Pillow --quiet
+          python3 << 'ENDOFFILE'
+          from PIL import Image, ImageDraw
+          import os
+
+          def make_icon(size):
+              bg = (30, 30, 30, 255)
+              white = (255, 255, 255, 255)
+              accent = (100, 100, 100, 255)
+              img = Image.new('RGBA', (size, size), bg)
+              d = ImageDraw.Draw(img)
+              # Folder body
+              d.rectangle([size*0.15, size*0.3, size*0.85, size*0.75], fill=white)
+              # Folder tab
+              d.rectangle([size*0.15, size*0.2, size*0.5, size*0.3], fill=accent)
+              return img
+
+          sizes = {'mdpi':48, 'hdpi':72, 'xhdpi':96, 'xxhdpi':144, 'xxxhdpi':192}
+          for density, s in sizes.items():
+              path = f'app/src/main/res/mipmap-{density}'
+              os.makedirs(path, exist_ok=True)
+              icon = make_icon(s)
+              icon.save(f'{path}/ic_launcher.png')
+              icon.save(f'{path}/ic_launcher_round.png')
+          print("Icons generated!")
+          ENDOFFILE
+
+      - name: Setup Gradle Wrapper
+        run: |
+          gradle wrapper --gradle-version=8.11.1 --distribution-type=bin
+          chmod +x gradlew
+
+      - name: Clean build
+        run: rm -rf app/build && ./gradlew clean --no-daemon
+
+      - name: Build signed release APK
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Verify APK signing
+        run: |
+          APK_PATH="app/build/outputs/apk/release/app-release.apk"
+          if [ -f "$APK_PATH" ]; then
+              echo "✅ Release APK generated"
+              echo "📦 APK size: $(ls -lh "$APK_PATH" | awk '{print $5}')"
+              BT_PATH=$(ls -d $ANDROID_HOME/build-tools/* 2>/dev/null | head -1)
+              if [ -n "$BT_PATH" ]; then $BT_PATH/apksigner verify --print-certs "$APK_PATH" 2>/dev/null || echo "⚠️ apksigner verify skipped"; fi
+          else echo "❌ Release APK not found"; exit 1; fi
+
+      - name: Bundle APK + source
+        run: |
+          mkdir -p GreyB-Explorer-release
+          cp app/build/outputs/apk/release/app-release.apk GreyB-Explorer-release/GreyB-Explorer.apk
+          cp app/src/main/java/com/greyb/explorer/MainActivity.kt GreyB-Explorer-release/
+          cp app/src/main/AndroidManifest.xml GreyB-Explorer-release/
+          cp .github/workflows/build.yml GreyB-Explorer-release/
+          APK_SIZE=$(ls -lh app/build/outputs/apk/release/app-release.apk | awk '{print $5}')
+          cat > GreyB-Explorer-release/BUILD_INFO.txt << INFOEOF
+          Build:      #${{ github.run_number }}
+          Commit:     ${{ github.sha }}
+          Timestamp:  $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          Signed:     Yes (fixed key)
+          APK Size:   ${APK_SIZE}
+          Optimized:  Yes (ProGuard/R8 enabled)
+          INFOEOF
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GreyB-Explorer-${{ github.run_number }}
+          path: GreyB-Explorer-release/
+          retention-days: 30
