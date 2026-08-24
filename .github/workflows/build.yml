@@ -179,10 +179,25 @@ jobs:
               }
           }
 
+          fun getVolumeRoot(externalFilesDir: File): File? {
+              val path = externalFilesDir.absolutePath
+              val index = path.indexOf("/Android/data/")
+              if (index != -1) {
+                  return File(path.substring(0, index))
+              }
+              // Fallback: go up until we find a directory that looks like a volume root
+              var current = externalFilesDir
+              while (current.parentFile != null && current.parentFile!!.name != "0" && current.parentFile!!.name != "storage") {
+                  current = current.parentFile!!
+              }
+              return current.parentFile ?: current
+          }
+
           @Composable
           fun FileExplorerApp() {
               val context = LocalContext.current
-              var currentDir by remember { mutableStateOf<File?>(null) }
+              var navigationStack by remember { mutableStateOf<List<File>>(emptyList()) }
+              val currentDir = navigationStack.lastOrNull()
               var hasPermission by remember { mutableStateOf(hasStoragePermission(context)) }
 
               val permissionLauncher = rememberLauncherForActivityResult(
@@ -214,8 +229,8 @@ jobs:
                   }
               }
 
-              BackHandler(enabled = currentDir != null) {
-                  currentDir = null
+              BackHandler(enabled = navigationStack.isNotEmpty()) {
+                  navigationStack = navigationStack.dropLast(1)
               }
 
               Surface(
@@ -232,12 +247,12 @@ jobs:
                       }
                   } else {
                       if (currentDir == null) {
-                          StorageRootsScreen(onRootClick = { root -> currentDir = root })
+                          StorageRootsScreen(onRootClick = { root -> navigationStack = listOf(root) })
                       } else {
                           FileListScreen(
                               directory = currentDir!!,
-                              onNavigate = { dir -> currentDir = dir },
-                              onBack = { currentDir = null }
+                              onNavigate = { dir -> navigationStack = navigationStack + dir },
+                              onBack = { navigationStack = navigationStack.dropLast(1) }
                           )
                       }
                   }
@@ -248,17 +263,33 @@ jobs:
           fun StorageRootsScreen(onRootClick: (File) -> Unit) {
               val context = LocalContext.current
               val roots = remember {
-                  val list = mutableListOf<File>()
-                  Environment.getExternalStorageDirectory()?.let { list.add(it) }
-                  val storageDir = File("/storage")
-                  if (storageDir.exists() && storageDir.canRead()) {
-                      storageDir.listFiles()?.forEach { dir ->
-                          if (dir.name != "emulated" && dir.name != "self" && dir.canRead()) {
-                              list.add(dir)
+                  val rootsList = mutableListOf<File>()
+
+                  // Primary external storage
+                  Environment.getExternalStorageDirectory()?.let { rootsList.add(it) }
+
+                  // External files dirs (includes SD cards on most devices)
+                  val externalDirs = context.getExternalFilesDirs(null)
+                  for (dir in externalDirs) {
+                      if (dir != null) {
+                          val volumeRoot = getVolumeRoot(dir)
+                          if (volumeRoot != null && volumeRoot.canRead()) {
+                              rootsList.add(volumeRoot)
                           }
                       }
                   }
-                  list.distinctBy { it.absolutePath }
+
+                  // Fallback: scan /storage
+                  val storageDir = File("/storage")
+                  if (storageDir.exists() && storageDir.canRead()) {
+                      storageDir.listFiles()?.forEach { f ->
+                          if (f.name != "emulated" && f.name != "self" && f.canRead()) {
+                              rootsList.add(f)
+                          }
+                      }
+                  }
+
+                  rootsList.distinctBy { it.absolutePath }
               }
 
               LazyColumn(
@@ -297,7 +328,7 @@ jobs:
               onNavigate: (File) -> Unit,
               onBack: () -> Unit
           ) {
-              val context = LocalContext.current   // ✅ FIX: capture context here
+              val context = LocalContext.current
               val files = remember(directory) {
                   directory.listFiles()?.sortedWith(
                       compareBy<File> { it.isFile }.thenBy { it.name.lowercase() }
@@ -343,7 +374,7 @@ jobs:
                                       if (file.isDirectory) {
                                           onNavigate(file)
                                       } else {
-                                          openFile(context, file)   // ✅ uses captured context
+                                          openFile(context, file)
                                       }
                                   }
                               )
