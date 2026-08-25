@@ -128,7 +128,6 @@ jobs:
           import android.os.Build
           import android.os.Bundle
           import android.os.Environment
-          import android.os.storage.StorageManager
           import android.provider.Settings
           import android.webkit.MimeTypeMap
           import android.widget.Toast
@@ -182,52 +181,36 @@ jobs:
 
           fun getStorageRoots(context: Context): List<Pair<String, File>> {
               val roots = mutableListOf<Pair<String, File>>()
-              val storageManager = context.getSystemService(Context.STORAGE_SERVICE) as StorageManager
 
-              // Method 1: StorageManager.storageVolumes (API 24+)
-              try {
-                  val volumes = storageManager.storageVolumes
-                  for (volume in volumes) {
-                      val path: String? = try {
-                          volume.getPath()
-                      } catch (e: Exception) {
-                          null
-                      }
-
-                      if (path != null) {
-                          val dir = File(path)
-                          if (dir.exists() && dir.canRead()) {
-                              val label = if (volume.isPrimary) "Internal Storage" else volume.getDescription(context)
-                              roots.add(label to dir)
-                          }
-                      }
+              // 1. Primary external storage (always available)
+              Environment.getExternalStorageDirectory()?.let {
+                  if (it.exists() && it.canRead()) {
+                      roots.add("Internal Storage" to it)
                   }
-              } catch (e: Exception) {
-                  // fallback below
               }
 
-              // Method 2: Fallback to Environment and external files dirs
-              if (roots.isEmpty()) {
-                  Environment.getExternalStorageDirectory()?.let {
-                      if (it.exists() && it.canRead()) roots.add("Internal Storage" to it)
-                  }
-                  context.getExternalFilesDirs(null).forEach { dir ->
+              // 2. Use getExternalFilesDirs to find other volumes (including SD card)
+              try {
+                  val externalDirs = context.getExternalFilesDirs(null)
+                  for (dir in externalDirs) {
                       if (dir != null) {
                           val path = dir.absolutePath
                           val index = path.indexOf("/Android/data/")
                           if (index != -1) {
-                              val root = File(path.substring(0, index))
-                              if (root.exists() && root.canRead()) {
-                                  val label = if (root == Environment.getExternalStorageDirectory()) "Internal Storage" else root.name
-                                  roots.add(label to root)
+                              val rootPath = path.substring(0, index)
+                              val root = File(rootPath)
+                              if (root.exists() && root.canRead() && root != Environment.getExternalStorageDirectory()) {
+                                  roots.add(root.name to root)
                               }
                           }
                       }
                   }
+              } catch (e: Exception) {
+                  // ignore
               }
 
-              // Method 3: Scan /storage as last resort
-              if (roots.isEmpty()) {
+              // 3. Scan /storage as fallback (works on many devices)
+              try {
                   val storageDir = File("/storage")
                   if (storageDir.exists() && storageDir.canRead()) {
                       storageDir.listFiles()?.forEach { f ->
@@ -236,10 +219,12 @@ jobs:
                           }
                       }
                       val emulated = File("/storage/emulated/0")
-                      if (emulated.exists() && emulated.canRead()) {
+                      if (emulated.exists() && emulated.canRead() && roots.none { it.second == emulated }) {
                           roots.add(0, "Internal Storage" to emulated)
                       }
                   }
+              } catch (e: Exception) {
+                  // ignore
               }
 
               return roots.distinctBy { it.second.absolutePath }
