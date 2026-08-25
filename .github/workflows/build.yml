@@ -152,6 +152,7 @@ jobs:
           import androidx.compose.ui.unit.sp
           import androidx.core.content.ContextCompat
           import androidx.core.content.FileProvider
+          import androidx.documentfile.provider.DocumentFile
           import androidx.lifecycle.Lifecycle
           import androidx.lifecycle.LifecycleEventObserver
           import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -189,7 +190,7 @@ jobs:
                   }
               }
 
-              // 2. Use getExternalFilesDirs to find other volumes (including SD card)
+              // 2. Use getExternalFilesDirs to find other volumes
               try {
                   val externalDirs = context.getExternalFilesDirs(null)
                   for (dir in externalDirs) {
@@ -205,9 +206,7 @@ jobs:
                           }
                       }
                   }
-              } catch (e: Exception) {
-                  // ignore
-              }
+              } catch (e: Exception) { }
 
               // 3. Scan /storage for volume IDs (e.g., XXXX-XXXX)
               try {
@@ -215,7 +214,6 @@ jobs:
                   if (storageDir.exists() && storageDir.canRead()) {
                       storageDir.listFiles()?.forEach { f ->
                           if (f.isDirectory && f.name != "emulated" && f.name != "self" && f.canRead()) {
-                              // Volume IDs often look like XXXX-XXXX (hex)
                               if (f.name.matches(Regex("[0-9A-F]{4}-[0-9A-F]{4}"))) {
                                   roots.add("SD Card" to f)
                               }
@@ -226,9 +224,7 @@ jobs:
                           roots.add(0, "Internal Storage" to emulated)
                       }
                   }
-              } catch (e: Exception) {
-                  // ignore
-              }
+              } catch (e: Exception) { }
 
               return roots.distinctBy { it.second.absolutePath }
           }
@@ -241,10 +237,30 @@ jobs:
               var hasPermission by remember { mutableStateOf(hasStoragePermission(context)) }
               var refreshTrigger by remember { mutableStateOf(0) }
 
+              // SAF state
+              var safRoot by remember { mutableStateOf<DocumentFile?>(null) }
+              var safStack by remember { mutableStateOf<List<DocumentFile>>(emptyList()) }
+
               val permissionLauncher = rememberLauncherForActivityResult(
                   ActivityResultContracts.RequestPermission()
               ) { granted ->
                   hasPermission = hasStoragePermission(context)
+              }
+
+              val safLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.OpenDocumentTree()
+              ) { uri ->
+                  if (uri != null) {
+                      try {
+                          val doc = DocumentFile.fromTreeUri(context, uri)
+                          if (doc != null && doc.canRead()) {
+                              safRoot = doc
+                              safStack = listOf(doc)
+                          }
+                      } catch (e: Exception) {
+                          Toast.makeText(context, "Cannot access selected folder", Toast.LENGTH_SHORT).show()
+                      }
+                  }
               }
 
               val lifecycleOwner = LocalLifecycleOwner.current
@@ -252,7 +268,7 @@ jobs:
                   val observer = LifecycleEventObserver { _, event ->
                       if (event == Lifecycle.Event.ON_RESUME) {
                           hasPermission = hasStoragePermission(context)
-                          refreshTrigger++ // Refresh roots when returning from settings
+                          refreshTrigger++
                       }
                   }
                   lifecycleOwner.lifecycle.addObserver(observer)
@@ -271,15 +287,27 @@ jobs:
                   }
               }
 
-              BackHandler(enabled = navigationStack.isNotEmpty()) {
-                  navigationStack = navigationStack.dropLast(1)
+              BackHandler(enabled = navigationStack.isNotEmpty() || safStack.size > 1) {
+                  if (safStack.size > 1) {
+                      safStack = safStack.dropLast(1)
+                  } else if (navigationStack.isNotEmpty()) {
+                      navigationStack = navigationStack.dropLast(1)
+                  }
               }
 
               Surface(
                   modifier = Modifier.fillMaxSize(),
                   color = Color(0xFF1E1E1E)
               ) {
-                  if (!hasPermission) {
+                  if (safRoot != null) {
+                      // SAF browser
+                      SafBrowserScreen(
+                          currentDoc = safStack.last(),
+                          onNavigate = { doc -> safStack = safStack + doc },
+                          onBack = { safStack = safStack.dropLast(1) },
+                          onExit = { safRoot = null; safStack = emptyList() }
+                      )
+                  } else if (!hasPermission) {
                       PermissionScreen(
                           onGrant = {
                               if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -289,6 +317,9 @@ jobs:
                               } else {
                                   permissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
                               }
+                          },
+                          onUseSaf = {
+                              safLauncher.launch(null)
                           }
                       )
                   } else {
@@ -296,7 +327,8 @@ jobs:
                           StorageRootsScreen(
                               refreshKey = refreshTrigger,
                               onRefresh = { refreshTrigger++ },
-                              onRootClick = { root -> navigationStack = listOf(root) }
+                              onRootClick = { root -> navigationStack = listOf(root) },
+                              onAddStorage = { safLauncher.launch(null) }
                           )
                       } else {
                           FileListScreen(
@@ -310,30 +342,22 @@ jobs:
           }
 
           @Composable
-          fun PermissionScreen(onGrant: () -> Unit) {
+          fun PermissionScreen(onGrant: () -> Unit, onUseSaf: () -> Unit) {
               Column(
                   modifier = Modifier.fillMaxSize(),
                   horizontalAlignment = Alignment.CenterHorizontally,
                   verticalArrangement = Arrangement.Center
               ) {
-                  Text(
-                      "Storage permission required",
-                      color = Color.White,
-                      fontSize = 20.sp,
-                      fontWeight = FontWeight.Bold
-                  )
+                  Text("Storage permission required", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                   Spacer(Modifier.height(8.dp))
-                  Text(
-                      "Grant access to browse files",
-                      color = Color.White.copy(alpha = 0.7f),
-                      fontSize = 16.sp
-                  )
+                  Text("Grant access to browse files", color = Color.White.copy(alpha = 0.7f), fontSize = 16.sp)
                   Spacer(Modifier.height(24.dp))
-                  Button(
-                      onClick = onGrant,
-                      colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0))
-                  ) {
+                  Button(onClick = onGrant, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0))) {
                       Text("Grant Access", color = Color.White, fontSize = 16.sp)
+                  }
+                  Spacer(Modifier.height(12.dp))
+                  TextButton(onClick = onUseSaf) {
+                      Text("Use SAF instead", color = Color(0xFF4FC3F7), fontSize = 14.sp)
                   }
               }
           }
@@ -342,25 +366,29 @@ jobs:
           fun StorageRootsScreen(
               refreshKey: Int,
               onRefresh: () -> Unit,
-              onRootClick: (File) -> Unit
+              onRootClick: (File) -> Unit,
+              onAddStorage: () -> Unit
           ) {
               val context = LocalContext.current
               val roots = remember(refreshKey) { getStorageRoots(context) }
 
               Column(Modifier.fillMaxSize()) {
-                  // Refresh button
                   Row(
-                      modifier = Modifier
-                          .fillMaxWidth()
-                          .background(Color(0xFF2A2A2A))
-                          .padding(horizontal = 16.dp, vertical = 8.dp),
-                      horizontalArrangement = Arrangement.End
+                      modifier = Modifier.fillMaxWidth().background(Color(0xFF2A2A2A)).padding(horizontal = 16.dp, vertical = 8.dp),
+                      horizontalArrangement = Arrangement.SpaceBetween,
+                      verticalAlignment = Alignment.CenterVertically
                   ) {
                       Text(
                           text = "Refresh",
                           color = Color(0xFF4FC3F7),
                           fontSize = 14.sp,
                           modifier = Modifier.clickable { onRefresh() }
+                      )
+                      Text(
+                          text = "Add Storage",
+                          color = Color(0xFF4FC3F7),
+                          fontSize = 14.sp,
+                          modifier = Modifier.clickable { onAddStorage() }
                       )
                   }
 
@@ -370,23 +398,12 @@ jobs:
                   ) {
                       items(roots) { (label, root) ->
                           Row(
-                              modifier = Modifier
-                                  .fillMaxWidth()
-                                  .clickable { onRootClick(root) }
-                                  .padding(vertical = 14.dp),
+                              modifier = Modifier.fillMaxWidth().clickable { onRootClick(root) }.padding(vertical = 14.dp),
                               verticalAlignment = Alignment.CenterVertically
                           ) {
-                              Text(
-                                  text = if (label == "Internal Storage") "📱" else "💾",
-                                  fontSize = 22.sp
-                              )
+                              Text(text = if (label == "Internal Storage") "📱" else "💾", fontSize = 22.sp)
                               Spacer(Modifier.width(12.dp))
-                              Text(
-                                  text = label,
-                                  color = Color.White,
-                                  fontSize = 18.sp,
-                                  fontWeight = FontWeight.Medium
-                              )
+                              Text(text = label, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Medium)
                           }
                       }
                   }
@@ -401,32 +418,17 @@ jobs:
           ) {
               val context = LocalContext.current
               val files = remember(directory) {
-                  directory.listFiles()?.sortedWith(
-                      compareBy<File> { it.isFile }.thenBy { it.name.lowercase() }
-                  ) ?: emptyList()
+                  directory.listFiles()?.sortedWith(compareBy<File> { it.isFile }.thenBy { it.name.lowercase() }) ?: emptyList()
               }
 
               Column(Modifier.fillMaxSize()) {
                   Row(
-                      modifier = Modifier
-                          .fillMaxWidth()
-                          .background(Color(0xFF2A2A2A))
-                          .padding(horizontal = 16.dp, vertical = 14.dp),
+                      modifier = Modifier.fillMaxWidth().background(Color(0xFF2A2A2A)).padding(horizontal = 16.dp, vertical = 14.dp),
                       verticalAlignment = Alignment.CenterVertically
                   ) {
-                      Text(
-                          text = "←",
-                          color = Color.White,
-                          fontSize = 20.sp,
-                          modifier = Modifier.clickable { onBack() }
-                      )
+                      Text("←", color = Color.White, fontSize = 20.sp, modifier = Modifier.clickable { onBack() })
                       Spacer(Modifier.width(12.dp))
-                      Text(
-                          text = directory.path,
-                          color = Color.White,
-                          fontSize = 16.sp,
-                          maxLines = 1
-                      )
+                      Text(directory.path, color = Color.White, fontSize = 16.sp, maxLines = 1)
                   }
 
                   if (files.isEmpty()) {
@@ -439,16 +441,62 @@ jobs:
                           contentPadding = PaddingValues(8.dp)
                       ) {
                           items(files) { file ->
-                              FileRow(
-                                  file = file,
-                                  onClick = {
-                                      if (file.isDirectory) {
-                                          onNavigate(file)
+                              FileRow(file = file, onClick = {
+                                  if (file.isDirectory) onNavigate(file) else openFile(context, file)
+                              })
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun SafBrowserScreen(
+              currentDoc: DocumentFile,
+              onNavigate: (DocumentFile) -> Unit,
+              onBack: () -> Unit,
+              onExit: () -> Unit
+          ) {
+              val context = LocalContext.current
+              val children = remember(currentDoc) {
+                  currentDoc.listFiles().sortedWith(compareBy<DocumentFile> { it.isDirectory }.thenBy { it.name?.lowercase() ?: "" })
+              }
+
+              Column(Modifier.fillMaxSize()) {
+                  Row(
+                      modifier = Modifier.fillMaxWidth().background(Color(0xFF2A2A2A)).padding(horizontal = 16.dp, vertical = 14.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Text("←", color = Color.White, fontSize = 20.sp, modifier = Modifier.clickable { onBack() })
+                      Spacer(Modifier.width(12.dp))
+                      Text(currentDoc.name ?: "Selected Folder", color = Color.White, fontSize = 16.sp, maxLines = 1, modifier = Modifier.weight(1f))
+                      Text("✕", color = Color.White, fontSize = 18.sp, modifier = Modifier.clickable { onExit() })
+                  }
+
+                  if (children.isEmpty()) {
+                      Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                          Text("Empty folder", color = Color.White, fontSize = 16.sp)
+                      }
+                  } else {
+                      LazyColumn(
+                          modifier = Modifier.fillMaxSize(),
+                          contentPadding = PaddingValues(8.dp)
+                      ) {
+                          items(children) { doc ->
+                              Row(
+                                  modifier = Modifier.fillMaxWidth().clickable {
+                                      if (doc.isDirectory) {
+                                          onNavigate(doc)
                                       } else {
-                                          openFile(context, file)
+                                          openFile(context, doc.uri)
                                       }
-                                  }
-                              )
+                                  }.padding(horizontal = 16.dp, vertical = 12.dp),
+                                  verticalAlignment = Alignment.CenterVertically
+                              ) {
+                                  Text(if (doc.isDirectory) "📁" else "📄", fontSize = 18.sp)
+                                  Spacer(Modifier.width(12.dp))
+                                  Text(doc.name ?: "Unknown", color = Color.White, fontSize = 16.sp, maxLines = 1)
+                              }
                           }
                       }
                   }
@@ -458,34 +506,27 @@ jobs:
           @Composable
           fun FileRow(file: File, onClick: () -> Unit) {
               Row(
-                  modifier = Modifier
-                      .fillMaxWidth()
-                      .clickable { onClick() }
-                      .padding(horizontal = 16.dp, vertical = 12.dp),
+                  modifier = Modifier.fillMaxWidth().clickable { onClick() }.padding(horizontal = 16.dp, vertical = 12.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
-                  Text(
-                      text = if (file.isDirectory) "📁" else "📄",
-                      fontSize = 18.sp
-                  )
+                  Text(if (file.isDirectory) "📁" else "📄", fontSize = 18.sp)
                   Spacer(Modifier.width(12.dp))
-                  Text(
-                      text = file.name,
-                      color = Color.White,
-                      fontSize = 16.sp,
-                      maxLines = 1
-                  )
+                  Text(file.name, color = Color.White, fontSize = 16.sp, maxLines = 1)
               }
           }
 
           fun openFile(context: Context, file: File) {
-              val uri = FileProvider.getUriForFile(
-                  context,
-                  context.packageName + ".fileprovider",
-                  file
-              )
-              val mime = MimeTypeMap.getSingleton()
-                  .getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
+              val uri = FileProvider.getUriForFile(context, context.packageName + ".fileprovider", file)
+              val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
+              openUri(context, uri, mime)
+          }
+
+          fun openFile(context: Context, uri: Uri) {
+              val mime = context.contentResolver.getType(uri) ?: "*/*"
+              openUri(context, uri, mime)
+          }
+
+          private fun openUri(context: Context, uri: Uri, mime: String) {
               val intent = Intent(Intent.ACTION_VIEW).apply {
                   setDataAndType(uri, mime)
                   addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -590,6 +631,7 @@ jobs:
               implementation("androidx.compose.material3:material3")
               implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
               implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+              implementation("androidx.documentfile:documentfile:1.0.1")
           }
           APPEOF
 
