@@ -184,38 +184,32 @@ jobs:
               val roots = mutableListOf<Pair<String, File>>()
               val storageManager = context.getSystemService(Context.STORAGE_SERVICE) as StorageManager
 
-              // Method 1: StorageManager (API 24+)
+              // Method 1: StorageManager.storageVolumes (API 24+)
               try {
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                      storageManager.storageVolumes.forEach { volume ->
-                          val dir = volume.directory
-                          if (dir != null && dir.exists() && dir.canRead()) {
-                              val label = if (volume.isPrimary) "Internal Storage" else volume.getDescription(context)
-                              roots.add(label to dir)
+                  val volumes = storageManager.storageVolumes
+                  for (volume in volumes) {
+                      val dir: File? = try {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                              volume.directory
+                          } else {
+                              volume.pathFile
                           }
-                      }
-                  } else {
-                      @Suppress("DEPRECATION")
-                      storageManager.volumeList?.forEach { volume ->
-                          val path = volume.getPath()
-                          val dir = File(path)
-                          if (dir.exists() && dir.canRead()) {
-                              val label = if (volume.isPrimary) "Internal Storage" else volume.getDescription(context)
-                              roots.add(label to dir)
-                          }
+                      } catch (e: Exception) { null }
+
+                      if (dir != null && dir.exists() && dir.canRead()) {
+                          val label = if (volume.isPrimary) "Internal Storage" else volume.getDescription(context)
+                          roots.add(label to dir)
                       }
                   }
               } catch (e: Exception) {
-                  // ignore and fallback
+                  // fallback below
               }
 
               // Method 2: Fallback to Environment and external files dirs
               if (roots.isEmpty()) {
-                  // Primary external storage
                   Environment.getExternalStorageDirectory()?.let {
                       if (it.exists() && it.canRead()) roots.add("Internal Storage" to it)
                   }
-                  // getExternalFilesDirs
                   context.getExternalFilesDirs(null).forEach { dir ->
                       if (dir != null) {
                           val path = dir.absolutePath
@@ -240,7 +234,6 @@ jobs:
                               roots.add(f.name to f)
                           }
                       }
-                      // also add emulated/0 if not already
                       val emulated = File("/storage/emulated/0")
                       if (emulated.exists() && emulated.canRead()) {
                           roots.add(0, "Internal Storage" to emulated)
