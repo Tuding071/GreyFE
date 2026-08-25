@@ -128,6 +128,7 @@ jobs:
           import android.os.Build
           import android.os.Bundle
           import android.os.Environment
+          import android.os.storage.StorageManager
           import android.provider.Settings
           import android.webkit.MimeTypeMap
           import android.widget.Toast
@@ -179,18 +180,75 @@ jobs:
               }
           }
 
-          fun getVolumeRoot(externalFilesDir: File): File? {
-              val path = externalFilesDir.absolutePath
-              val index = path.indexOf("/Android/data/")
-              if (index != -1) {
-                  return File(path.substring(0, index))
+          fun getStorageRoots(context: Context): List<Pair<String, File>> {
+              val roots = mutableListOf<Pair<String, File>>()
+              val storageManager = context.getSystemService(Context.STORAGE_SERVICE) as StorageManager
+
+              // Method 1: StorageManager (API 24+)
+              try {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                      storageManager.storageVolumes.forEach { volume ->
+                          val dir = volume.directory
+                          if (dir != null && dir.exists() && dir.canRead()) {
+                              val label = if (volume.isPrimary) "Internal Storage" else volume.getDescription(context)
+                              roots.add(label to dir)
+                          }
+                      }
+                  } else {
+                      @Suppress("DEPRECATION")
+                      storageManager.volumeList?.forEach { volume ->
+                          val path = volume.getPath()
+                          val dir = File(path)
+                          if (dir.exists() && dir.canRead()) {
+                              val label = if (volume.isPrimary) "Internal Storage" else volume.getDescription(context)
+                              roots.add(label to dir)
+                          }
+                      }
+                  }
+              } catch (e: Exception) {
+                  // ignore and fallback
               }
-              // Fallback: go up until we find a directory that looks like a volume root
-              var current = externalFilesDir
-              while (current.parentFile != null && current.parentFile!!.name != "0" && current.parentFile!!.name != "storage") {
-                  current = current.parentFile!!
+
+              // Method 2: Fallback to Environment and external files dirs
+              if (roots.isEmpty()) {
+                  // Primary external storage
+                  Environment.getExternalStorageDirectory()?.let {
+                      if (it.exists() && it.canRead()) roots.add("Internal Storage" to it)
+                  }
+                  // getExternalFilesDirs
+                  context.getExternalFilesDirs(null).forEach { dir ->
+                      if (dir != null) {
+                          val path = dir.absolutePath
+                          val index = path.indexOf("/Android/data/")
+                          if (index != -1) {
+                              val root = File(path.substring(0, index))
+                              if (root.exists() && root.canRead()) {
+                                  val label = if (root == Environment.getExternalStorageDirectory()) "Internal Storage" else root.name
+                                  roots.add(label to root)
+                              }
+                          }
+                      }
+                  }
               }
-              return current.parentFile ?: current
+
+              // Method 3: Scan /storage as last resort
+              if (roots.isEmpty()) {
+                  val storageDir = File("/storage")
+                  if (storageDir.exists() && storageDir.canRead()) {
+                      storageDir.listFiles()?.forEach { f ->
+                          if (f.name != "emulated" && f.name != "self" && f.canRead()) {
+                              roots.add(f.name to f)
+                          }
+                      }
+                      // also add emulated/0 if not already
+                      val emulated = File("/storage/emulated/0")
+                      if (emulated.exists() && emulated.canRead()) {
+                          roots.add(0, "Internal Storage" to emulated)
+                      }
+                  }
+              }
+
+              return roots.distinctBy { it.second.absolutePath }
           }
 
           @Composable
@@ -247,7 +305,9 @@ jobs:
                       }
                   } else {
                       if (currentDir == null) {
-                          StorageRootsScreen(onRootClick = { root -> navigationStack = listOf(root) })
+                          StorageRootsScreen(
+                              onRootClick = { root -> navigationStack = listOf(root) }
+                          )
                       } else {
                           FileListScreen(
                               directory = currentDir!!,
@@ -262,43 +322,13 @@ jobs:
           @Composable
           fun StorageRootsScreen(onRootClick: (File) -> Unit) {
               val context = LocalContext.current
-              val roots = remember {
-                  val rootsList = mutableListOf<File>()
-
-                  // Primary external storage
-                  Environment.getExternalStorageDirectory()?.let { rootsList.add(it) }
-
-                  // External files dirs (includes SD cards on most devices)
-                  val externalDirs = context.getExternalFilesDirs(null)
-                  for (dir in externalDirs) {
-                      if (dir != null) {
-                          val volumeRoot = getVolumeRoot(dir)
-                          if (volumeRoot != null && volumeRoot.canRead()) {
-                              rootsList.add(volumeRoot)
-                          }
-                      }
-                  }
-
-                  // Fallback: scan /storage
-                  val storageDir = File("/storage")
-                  if (storageDir.exists() && storageDir.canRead()) {
-                      storageDir.listFiles()?.forEach { f ->
-                          if (f.name != "emulated" && f.name != "self" && f.canRead()) {
-                              rootsList.add(f)
-                          }
-                      }
-                  }
-
-                  rootsList.distinctBy { it.absolutePath }
-              }
+              val roots = remember { getStorageRoots(context) }
 
               LazyColumn(
                   modifier = Modifier.fillMaxSize(),
                   contentPadding = PaddingValues(16.dp)
               ) {
-                  items(roots) { root ->
-                      val isInternal = root == Environment.getExternalStorageDirectory()
-                      val label = if (isInternal) "Internal Storage" else root.name
+                  items(roots) { (label, root) ->
                       Row(
                           modifier = Modifier
                               .fillMaxWidth()
@@ -307,7 +337,7 @@ jobs:
                           verticalAlignment = Alignment.CenterVertically
                       ) {
                           Text(
-                              text = if (isInternal) "📱" else "💾",
+                              text = if (label == "Internal Storage") "📱" else "💾",
                               fontSize = 22.sp
                           )
                           Spacer(Modifier.width(12.dp))
