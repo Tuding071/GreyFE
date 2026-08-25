@@ -182,14 +182,14 @@ jobs:
           fun getStorageRoots(context: Context): List<Pair<String, File>> {
               val roots = mutableListOf<Pair<String, File>>()
 
-              // 1. Primary external storage (always available)
+              // 1. Primary external storage
               Environment.getExternalStorageDirectory()?.let {
                   if (it.exists() && it.canRead()) {
                       roots.add("Internal Storage" to it)
                   }
               }
 
-              // 2. Use getExternalFilesDirs to find other volumes (including SD card)
+              // 2. Use getExternalFilesDirs to find other volumes
               try {
                   val externalDirs = context.getExternalFilesDirs(null)
                   for (dir in externalDirs) {
@@ -209,7 +209,7 @@ jobs:
                   // ignore
               }
 
-              // 3. Scan /storage as fallback (works on many devices)
+              // 3. Scan /storage
               try {
                   val storageDir = File("/storage")
                   if (storageDir.exists() && storageDir.canRead()) {
@@ -227,6 +227,20 @@ jobs:
                   // ignore
               }
 
+              // 4. Scan /mnt/media_rw (often contains SD card mount point)
+              try {
+                  val mediaDir = File("/mnt/media_rw")
+                  if (mediaDir.exists() && mediaDir.canRead()) {
+                      mediaDir.listFiles()?.forEach { f ->
+                          if (f.isDirectory && f.canRead()) {
+                              roots.add("SD Card" to f)
+                          }
+                      }
+                  }
+              } catch (e: Exception) {
+                  // ignore
+              }
+
               return roots.distinctBy { it.second.absolutePath }
           }
 
@@ -236,6 +250,7 @@ jobs:
               var navigationStack by remember { mutableStateOf<List<File>>(emptyList()) }
               val currentDir = navigationStack.lastOrNull()
               var hasPermission by remember { mutableStateOf(hasStoragePermission(context)) }
+              var refreshTrigger by remember { mutableStateOf(0) }
 
               val permissionLauncher = rememberLauncherForActivityResult(
                   ActivityResultContracts.RequestPermission()
@@ -248,6 +263,7 @@ jobs:
                   val observer = LifecycleEventObserver { _, event ->
                       if (event == Lifecycle.Event.ON_RESUME) {
                           hasPermission = hasStoragePermission(context)
+                          refreshTrigger++ // Refresh roots when returning from settings
                       }
                   }
                   lifecycleOwner.lifecycle.addObserver(observer)
@@ -257,6 +273,7 @@ jobs:
               LaunchedEffect(Unit) {
                   if (!hasPermission) {
                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                          // Open settings for All Files Access
                           val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
                           intent.data = Uri.parse("package:${context.packageName}")
                           context.startActivity(intent)
@@ -275,16 +292,21 @@ jobs:
                   color = Color(0xFF1E1E1E)
               ) {
                   if (!hasPermission) {
-                      Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                          Text(
-                              "Storage permission required\nOpen Settings to grant",
-                              color = Color.White,
-                              fontSize = 18.sp
-                          )
-                      }
+                      PermissionScreen(
+                          onGrant = {
+                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                  val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                                  intent.data = Uri.parse("package:${context.packageName}")
+                                  context.startActivity(intent)
+                              } else {
+                                  permissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
+                              }
+                          }
+                      )
                   } else {
                       if (currentDir == null) {
                           StorageRootsScreen(
+                              refreshKey = refreshTrigger,
                               onRootClick = { root -> navigationStack = listOf(root) }
                           )
                       } else {
@@ -299,9 +321,38 @@ jobs:
           }
 
           @Composable
-          fun StorageRootsScreen(onRootClick: (File) -> Unit) {
+          fun PermissionScreen(onGrant: () -> Unit) {
+              Column(
+                  modifier = Modifier.fillMaxSize(),
+                  horizontalAlignment = Alignment.CenterHorizontally,
+                  verticalArrangement = Arrangement.Center
+              ) {
+                  Text(
+                      "Storage permission required",
+                      color = Color.White,
+                      fontSize = 20.sp,
+                      fontWeight = FontWeight.Bold
+                  )
+                  Spacer(Modifier.height(8.dp))
+                  Text(
+                      "Grant access to browse files",
+                      color = Color.White.copy(alpha = 0.7f),
+                      fontSize = 16.sp
+                  )
+                  Spacer(Modifier.height(24.dp))
+                  Button(
+                      onClick = onGrant,
+                      colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0))
+                  ) {
+                      Text("Grant Access", color = Color.White, fontSize = 16.sp)
+                  }
+              }
+          }
+
+          @Composable
+          fun StorageRootsScreen(refreshKey: Int, onRootClick: (File) -> Unit) {
               val context = LocalContext.current
-              val roots = remember { getStorageRoots(context) }
+              val roots = remember(refreshKey) { getStorageRoots(context) }
 
               LazyColumn(
                   modifier = Modifier.fillMaxSize(),
