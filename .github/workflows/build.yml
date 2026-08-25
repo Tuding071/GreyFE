@@ -189,7 +189,7 @@ jobs:
                   }
               }
 
-              // 2. Use getExternalFilesDirs to find other volumes
+              // 2. Use getExternalFilesDirs to find other volumes (including SD card)
               try {
                   val externalDirs = context.getExternalFilesDirs(null)
                   for (dir in externalDirs) {
@@ -209,32 +209,21 @@ jobs:
                   // ignore
               }
 
-              // 3. Scan /storage
+              // 3. Scan /storage for volume IDs (e.g., XXXX-XXXX)
               try {
                   val storageDir = File("/storage")
                   if (storageDir.exists() && storageDir.canRead()) {
                       storageDir.listFiles()?.forEach { f ->
-                          if (f.name != "emulated" && f.name != "self" && f.canRead()) {
-                              roots.add(f.name to f)
+                          if (f.isDirectory && f.name != "emulated" && f.name != "self" && f.canRead()) {
+                              // Volume IDs often look like XXXX-XXXX (hex)
+                              if (f.name.matches(Regex("[0-9A-F]{4}-[0-9A-F]{4}"))) {
+                                  roots.add("SD Card" to f)
+                              }
                           }
                       }
                       val emulated = File("/storage/emulated/0")
                       if (emulated.exists() && emulated.canRead() && roots.none { it.second == emulated }) {
                           roots.add(0, "Internal Storage" to emulated)
-                      }
-                  }
-              } catch (e: Exception) {
-                  // ignore
-              }
-
-              // 4. Scan /mnt/media_rw (often contains SD card mount point)
-              try {
-                  val mediaDir = File("/mnt/media_rw")
-                  if (mediaDir.exists() && mediaDir.canRead()) {
-                      mediaDir.listFiles()?.forEach { f ->
-                          if (f.isDirectory && f.canRead()) {
-                              roots.add("SD Card" to f)
-                          }
                       }
                   }
               } catch (e: Exception) {
@@ -273,7 +262,6 @@ jobs:
               LaunchedEffect(Unit) {
                   if (!hasPermission) {
                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                          // Open settings for All Files Access
                           val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
                           intent.data = Uri.parse("package:${context.packageName}")
                           context.startActivity(intent)
@@ -307,6 +295,7 @@ jobs:
                       if (currentDir == null) {
                           StorageRootsScreen(
                               refreshKey = refreshTrigger,
+                              onRefresh = { refreshTrigger++ },
                               onRootClick = { root -> navigationStack = listOf(root) }
                           )
                       } else {
@@ -350,33 +339,55 @@ jobs:
           }
 
           @Composable
-          fun StorageRootsScreen(refreshKey: Int, onRootClick: (File) -> Unit) {
+          fun StorageRootsScreen(
+              refreshKey: Int,
+              onRefresh: () -> Unit,
+              onRootClick: (File) -> Unit
+          ) {
               val context = LocalContext.current
               val roots = remember(refreshKey) { getStorageRoots(context) }
 
-              LazyColumn(
-                  modifier = Modifier.fillMaxSize(),
-                  contentPadding = PaddingValues(16.dp)
-              ) {
-                  items(roots) { (label, root) ->
-                      Row(
-                          modifier = Modifier
-                              .fillMaxWidth()
-                              .clickable { onRootClick(root) }
-                              .padding(vertical = 14.dp),
-                          verticalAlignment = Alignment.CenterVertically
-                      ) {
-                          Text(
-                              text = if (label == "Internal Storage") "📱" else "💾",
-                              fontSize = 22.sp
-                          )
-                          Spacer(Modifier.width(12.dp))
-                          Text(
-                              text = label,
-                              color = Color.White,
-                              fontSize = 18.sp,
-                              fontWeight = FontWeight.Medium
-                          )
+              Column(Modifier.fillMaxSize()) {
+                  // Refresh button
+                  Row(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .background(Color(0xFF2A2A2A))
+                          .padding(horizontal = 16.dp, vertical = 8.dp),
+                      horizontalArrangement = Arrangement.End
+                  ) {
+                      Text(
+                          text = "Refresh",
+                          color = Color(0xFF4FC3F7),
+                          fontSize = 14.sp,
+                          modifier = Modifier.clickable { onRefresh() }
+                      )
+                  }
+
+                  LazyColumn(
+                      modifier = Modifier.fillMaxSize(),
+                      contentPadding = PaddingValues(16.dp)
+                  ) {
+                      items(roots) { (label, root) ->
+                          Row(
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .clickable { onRootClick(root) }
+                                  .padding(vertical = 14.dp),
+                              verticalAlignment = Alignment.CenterVertically
+                          ) {
+                              Text(
+                                  text = if (label == "Internal Storage") "📱" else "💾",
+                                  fontSize = 22.sp
+                              )
+                              Spacer(Modifier.width(12.dp))
+                              Text(
+                                  text = label,
+                                  color = Color.White,
+                                  fontSize = 18.sp,
+                                  fontWeight = FontWeight.Medium
+                              )
+                          }
                       }
                   }
               }
