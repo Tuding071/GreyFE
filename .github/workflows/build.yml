@@ -129,6 +129,7 @@ jobs:
           import android.os.Build
           import android.os.Bundle
           import android.os.Environment
+          import android.os.storage.StorageManager
           import android.provider.Settings
           import android.webkit.MimeTypeMap
           import android.widget.Toast
@@ -158,6 +159,7 @@ jobs:
           import androidx.lifecycle.LifecycleEventObserver
           import androidx.lifecycle.compose.LocalLifecycleOwner
           import java.io.File
+          import java.lang.reflect.Method
 
           class MainActivity : ComponentActivity() {
               override fun onCreate(savedInstanceState: Bundle?) {
@@ -181,51 +183,74 @@ jobs:
               }
           }
 
+          // Reflection-based path extraction for StorageVolume — works across API levels
+          // including older ones where getDirectory()/getPath() aren't public API.
+          private fun storageVolumePath(volume: Any): File? {
+              // Try public getDirectory() first (API 30+)
+              try {
+                  val getDirectory: Method = volume.javaClass.getMethod("getDirectory")
+                  val dir = getDirectory.invoke(volume) as? File
+                  if (dir != null) return dir
+              } catch (e: Exception) { }
+
+              // Fallback: reflection on hidden getPath()/getPathFile()
+              for (methodName in listOf("getPathFile", "getPath")) {
+                  try {
+                      val m: Method = volume.javaClass.getMethod(methodName)
+                      val result = m.invoke(volume)
+                      when (result) {
+                          is File -> return result
+                          is String -> return File(result)
+                      }
+                  } catch (e: Exception) { }
+              }
+              return null
+          }
+
           fun getStorageRoots(context: Context): List<Pair<String, File>> {
               val roots = mutableListOf<Pair<String, File>>()
 
-              // 1. Primary external storage
-              Environment.getExternalStorageDirectory()?.let {
-                  if (it.exists() && it.canRead()) {
-                      roots.add("Internal Storage" to it)
-                  }
-              }
-
-              // 2. Use getExternalFilesDirs to find other volumes
               try {
-                  val externalDirs = context.getExternalFilesDirs(null)
-                  for (dir in externalDirs) {
-                      if (dir != null) {
-                          val path = dir.absolutePath
-                          val index = path.indexOf("/Android/data/")
-                          if (index != -1) {
-                              val rootPath = path.substring(0, index)
-                              val root = File(rootPath)
-                              if (root.exists() && root.canRead() && root != Environment.getExternalStorageDirectory()) {
-                                  roots.add(root.name to root)
-                              }
+                  val storageManager = context.getSystemService(Context.STORAGE_SERVICE) as StorageManager
+                  val volumes = storageManager.storageVolumes
+
+                  for (volume in volumes) {
+                      try {
+                          val isRemovable = volume.isRemovable
+                          val state = volume.state
+                          if (state != Environment.MEDIA_MOUNTED && state != Environment.MEDIA_MOUNTED_READ_ONLY) continue
+
+                          val dir = storageVolumePath(volume) ?: continue
+                          if (!dir.exists() || !dir.canRead()) continue
+
+                          val label = when {
+                              !isRemovable -> "Internal Storage"
+                              else -> volume.getDescription(context) ?: "SD Card"
                           }
-                      }
+                          roots.add(label to dir)
+                      } catch (e: Exception) { }
                   }
               } catch (e: Exception) { }
 
-              // 3. Scan /storage for volume IDs (e.g., XXXX-XXXX)
-              try {
-                  val storageDir = File("/storage")
-                  if (storageDir.exists() && storageDir.canRead()) {
-                      storageDir.listFiles()?.forEach { f ->
-                          if (f.isDirectory && f.name != "emulated" && f.name != "self" && f.canRead()) {
-                              if (f.name.matches(Regex("[0-9A-F]{4}-[0-9A-F]{4}"))) {
+              // Fallback if StorageManager gave us nothing (very old devices / OEM quirks)
+              if (roots.isEmpty()) {
+                  Environment.getExternalStorageDirectory()?.let {
+                      if (it.exists() && it.canRead()) {
+                          roots.add("Internal Storage" to it)
+                      }
+                  }
+                  try {
+                      val storageDir = File("/storage")
+                      if (storageDir.exists() && storageDir.canRead()) {
+                          storageDir.listFiles()?.forEach { f ->
+                              if (f.isDirectory && f.name != "emulated" && f.name != "self" && f.canRead()
+                                  && f.name.matches(Regex("[0-9A-F]{4}-[0-9A-F]{4}"))) {
                                   roots.add("SD Card" to f)
                               }
                           }
                       }
-                      val emulated = File("/storage/emulated/0")
-                      if (emulated.exists() && emulated.canRead() && roots.none { it.second == emulated }) {
-                          roots.add(0, "Internal Storage" to emulated)
-                      }
-                  }
-              } catch (e: Exception) { }
+                  } catch (e: Exception) { }
+              }
 
               return roots.distinctBy { it.second.absolutePath }
           }
@@ -257,7 +282,6 @@ jobs:
                       try {
                           val doc = DocumentFile.fromTreeUri(context, uri)
                           if (doc != null && doc.canRead()) {
-                              // Take persistable permission
                               context.contentResolver.takePersistableUriPermission(
                                   uri,
                                   Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
@@ -272,7 +296,6 @@ jobs:
                   }
               }
 
-              // Load saved SAF URI on startup
               LaunchedEffect(Unit) {
                   val savedUriString = prefs.getString("saf_uri", null)
                   if (savedUriString != null) {
@@ -352,9 +375,7 @@ jobs:
                       if (currentDir == null) {
                           StorageRootsScreen(
                               refreshKey = refreshTrigger,
-                              onRefresh = { refreshTrigger++ },
-                              onRootClick = { root -> navigationStack = listOf(root) },
-                              onAddStorage = { safLauncher.launch(null) }
+                              onRootClick = { root -> navigationStack = listOf(root) }
                           )
                       } else {
                           FileListScreen(
@@ -388,38 +409,60 @@ jobs:
               }
           }
 
+          // Shared header used by all three screens — same height, padding, and font size
+          @Composable
+          fun ScreenHeader(title: String, onBack: (() -> Unit)? = null, trailing: (@Composable () -> Unit)? = null) {
+              Row(
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .background(Color(0xFF2A2A2A))
+                      .padding(horizontal = 16.dp, vertical = 14.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  if (onBack != null) {
+                      Text("←", color = Color.White, fontSize = 20.sp, modifier = Modifier.clickable { onBack() })
+                      Spacer(Modifier.width(12.dp))
+                  }
+                  Text(
+                      text = title,
+                      color = Color.White,
+                      fontSize = 16.sp,
+                      maxLines = 1,
+                      modifier = Modifier.weight(1f)
+                  )
+                  trailing?.invoke()
+              }
+          }
+
           @Composable
           fun StorageRootsScreen(
               refreshKey: Int,
-              onRefresh: () -> Unit,
-              onRootClick: (File) -> Unit,
-              onAddStorage: () -> Unit
+              onRootClick: (File) -> Unit
           ) {
               val context = LocalContext.current
               val roots = remember(refreshKey) { getStorageRoots(context) }
 
               Column(Modifier.fillMaxSize()) {
-                  Row(
-                      modifier = Modifier.fillMaxWidth().background(Color(0xFF2A2A2A)).padding(horizontal = 16.dp, vertical = 8.dp),
-                      horizontalArrangement = Arrangement.SpaceBetween,
-                      verticalAlignment = Alignment.CenterVertically
-                  ) {
-                      Text("Refresh", color = Color(0xFF4FC3F7), fontSize = 14.sp, modifier = Modifier.clickable { onRefresh() })
-                      Text("Add Storage", color = Color(0xFF4FC3F7), fontSize = 14.sp, modifier = Modifier.clickable { onAddStorage() })
-                  }
+                  ScreenHeader(title = "Storage")
 
-                  LazyColumn(
-                      modifier = Modifier.fillMaxSize(),
-                      contentPadding = PaddingValues(16.dp)
-                  ) {
-                      items(roots) { (label, root) ->
-                          Row(
-                              modifier = Modifier.fillMaxWidth().clickable { onRootClick(root) }.padding(vertical = 14.dp),
-                              verticalAlignment = Alignment.CenterVertically
-                          ) {
-                              Text(text = if (label == "Internal Storage") "📱" else "💾", fontSize = 22.sp)
-                              Spacer(Modifier.width(12.dp))
-                              Text(text = label, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Medium)
+                  if (roots.isEmpty()) {
+                      Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                          Text("No storage found", color = Color.White, fontSize = 16.sp)
+                      }
+                  } else {
+                      LazyColumn(
+                          modifier = Modifier.fillMaxSize(),
+                          contentPadding = PaddingValues(16.dp)
+                      ) {
+                          items(roots) { (label, root) ->
+                              Row(
+                                  modifier = Modifier.fillMaxWidth().clickable { onRootClick(root) }.padding(vertical = 14.dp),
+                                  verticalAlignment = Alignment.CenterVertically
+                              ) {
+                                  Text(text = if (label == "Internal Storage") "📱" else "💾", fontSize = 22.sp)
+                                  Spacer(Modifier.width(12.dp))
+                                  Text(text = label, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Medium)
+                              }
                           }
                       }
                   }
@@ -438,14 +481,7 @@ jobs:
               }
 
               Column(Modifier.fillMaxSize()) {
-                  Row(
-                      modifier = Modifier.fillMaxWidth().background(Color(0xFF2A2A2A)).padding(horizontal = 16.dp, vertical = 14.dp),
-                      verticalAlignment = Alignment.CenterVertically
-                  ) {
-                      Text("←", color = Color.White, fontSize = 20.sp, modifier = Modifier.clickable { onBack() })
-                      Spacer(Modifier.width(12.dp))
-                      Text(directory.path, color = Color.White, fontSize = 16.sp, maxLines = 1)
-                  }
+                  ScreenHeader(title = directory.path, onBack = onBack)
 
                   if (files.isEmpty()) {
                       Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -479,15 +515,13 @@ jobs:
               }
 
               Column(Modifier.fillMaxSize()) {
-                  Row(
-                      modifier = Modifier.fillMaxWidth().background(Color(0xFF2A2A2A)).padding(horizontal = 16.dp, vertical = 14.dp),
-                      verticalAlignment = Alignment.CenterVertically
-                  ) {
-                      Text("←", color = Color.White, fontSize = 20.sp, modifier = Modifier.clickable { onBack() })
-                      Spacer(Modifier.width(12.dp))
-                      Text(currentDoc.name ?: "Selected Folder", color = Color.White, fontSize = 16.sp, maxLines = 1, modifier = Modifier.weight(1f))
-                      Text("✕", color = Color.White, fontSize = 18.sp, modifier = Modifier.clickable { onExit() })
-                  }
+                  ScreenHeader(
+                      title = currentDoc.name ?: "Selected Folder",
+                      onBack = onBack,
+                      trailing = {
+                          Text("✕", color = Color.White, fontSize = 18.sp, modifier = Modifier.clickable { onExit() })
+                      }
+                  )
 
                   if (children.isEmpty()) {
                       Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
