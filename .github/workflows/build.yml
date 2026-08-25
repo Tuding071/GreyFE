@@ -188,17 +188,18 @@ jobs:
               try {
                   val volumes = storageManager.storageVolumes
                   for (volume in volumes) {
-                      val dir: File? = try {
-                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                              volume.directory
-                          } else {
-                              volume.pathFile
-                          }
-                      } catch (e: Exception) { null }
+                      val path: String? = try {
+                          volume.getPath()
+                      } catch (e: Exception) {
+                          null
+                      }
 
-                      if (dir != null && dir.exists() && dir.canRead()) {
-                          val label = if (volume.isPrimary) "Internal Storage" else volume.getDescription(context)
-                          roots.add(label to dir)
+                      if (path != null) {
+                          val dir = File(path)
+                          if (dir.exists() && dir.canRead()) {
+                              val label = if (volume.isPrimary) "Internal Storage" else volume.getDescription(context)
+                              roots.add(label to dir)
+                          }
                       }
                   }
               } catch (e: Exception) {
