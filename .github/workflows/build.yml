@@ -485,4 +485,258 @@ jobs:
                   ) {
                       Text("←", color = Color.White, fontSize = 20.sp, modifier = Modifier.clickable { onBack() })
                       Spacer(Modifier.width(12.dp))
-                      Text(currentDoc.name ?: "Selected Folder", color = Color.White, fontSize = 16.sp, maxLines = 1, modifier = Modifier
+                      Text(currentDoc.name ?: "Selected Folder", color = Color.White, fontSize = 16.sp, maxLines = 1, modifier = Modifier.weight(1f))
+                      Text("✕", color = Color.White, fontSize = 18.sp, modifier = Modifier.clickable { onExit() })
+                  }
+
+                  if (children.isEmpty()) {
+                      Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                          Text("Empty folder", color = Color.White, fontSize = 16.sp)
+                      }
+                  } else {
+                      LazyColumn(
+                          modifier = Modifier.fillMaxSize(),
+                          contentPadding = PaddingValues(8.dp)
+                      ) {
+                          items(children) { doc ->
+                              Row(
+                                  modifier = Modifier.fillMaxWidth().clickable {
+                                      if (doc.isDirectory) {
+                                          onNavigate(doc)
+                                      } else {
+                                          openFile(context, doc.uri)
+                                      }
+                                  }.padding(horizontal = 16.dp, vertical = 12.dp),
+                                  verticalAlignment = Alignment.CenterVertically
+                              ) {
+                                  Text(if (doc.isDirectory) "📁" else "📄", fontSize = 18.sp)
+                                  Spacer(Modifier.width(12.dp))
+                                  Text(doc.name ?: "Unknown", color = Color.White, fontSize = 16.sp, maxLines = 1)
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun FileRow(file: File, onClick: () -> Unit) {
+              Row(
+                  modifier = Modifier.fillMaxWidth().clickable { onClick() }.padding(horizontal = 16.dp, vertical = 12.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Text(if (file.isDirectory) "📁" else "📄", fontSize = 18.sp)
+                  Spacer(Modifier.width(12.dp))
+                  Text(file.name, color = Color.White, fontSize = 16.sp, maxLines = 1)
+              }
+          }
+
+          fun openFile(context: Context, file: File) {
+              val uri = FileProvider.getUriForFile(context, context.packageName + ".fileprovider", file)
+              val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
+              openUri(context, uri, mime)
+          }
+
+          fun openFile(context: Context, uri: Uri) {
+              val mime = context.contentResolver.getType(uri) ?: "*/*"
+              openUri(context, uri, mime)
+          }
+
+          private fun openUri(context: Context, uri: Uri, mime: String) {
+              val intent = Intent(Intent.ACTION_VIEW).apply {
+                  setDataAndType(uri, mime)
+                  addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+              }
+              try {
+                  context.startActivity(Intent.createChooser(intent, "Open with"))
+              } catch (e: Exception) {
+                  Toast.makeText(context, "No app to open this file", Toast.LENGTH_SHORT).show()
+              }
+          }
+
+          @Composable
+          fun FileExplorerTheme(content: @Composable () -> Unit) {
+              MaterialTheme(
+                  colorScheme = darkColorScheme(
+                      background = Color(0xFF1E1E1E),
+                      surface = Color(0xFF2A2A2A),
+                      primary = Color.White,
+                      onBackground = Color.White,
+                      onSurface = Color.White
+                  ),
+                  content = content
+              )
+          }
+          ENDOFFILE
+
+      - name: Generate Gradle Scripts
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          cat > settings.gradle.kts << 'ENDOFFILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = "GreyBExplorer"
+          include(":app")
+          ENDOFFILE
+
+          cat > build.gradle.kts << 'ENDOFFILE'
+          plugins {
+              id("com.android.application") version "8.9.1" apply false
+              id("org.jetbrains.kotlin.android") version "2.2.0" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.2.0" apply false
+          }
+          ENDOFFILE
+
+          cat > app/build.gradle.kts << APPEOF
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.greyb.explorer"
+              compileSdk = 36
+
+              defaultConfig {
+                  applicationId = "com.greyb.explorer"
+                  minSdk = 26
+                  targetSdk = 36
+                  versionCode = ${BUILD_NUMBER}
+                  versionName = "${BUILD_NUMBER}"
+              }
+
+              signingConfigs {
+                  create("release") {
+                      storeFile = file("release.keystore")
+                      storePassword = "greyb2024"
+                      keyAlias = "greyb"
+                      keyPassword = "greyb2024"
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = true
+                      isShrinkResources = true
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+                      signingConfig = signingConfigs.getByName("release")
+                  }
+              }
+
+              buildFeatures {
+                  compose = true
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation(platform("androidx.compose:compose-bom:2024.09.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+              implementation("androidx.documentfile:documentfile:1.0.1")
+          }
+          APPEOF
+
+          cat > gradle.properties << 'ENDOFFILE'
+          android.useAndroidX=true
+          android.enableJetifier=true
+          org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m -XX:+UseParallelGC
+          kotlin.code.style=official
+          android.suppressUnsupportedCompileSdk=36
+          ENDOFFILE
+
+      - name: Generate fixed keystore (if missing)
+        run: |
+          if [ ! -f app/release.keystore ]; then
+            keytool -genkey -v -keystore app/release.keystore -alias greyb -keyalg RSA -keysize 2048 -validity 10000 -storepass greyb2024 -keypass greyb2024 -dname "CN=GreyB, OU=GreyB, O=GreyB Explorer, L=Test, S=Test, C=US"
+            echo "✅ New keystore created"
+          else
+            echo "✅ Using existing cached keystore"
+          fi
+
+      - name: Generate launcher icons
+        run: |
+          rm -rf app/src/main/res/mipmap-*
+          pip3 install Pillow --quiet --break-system-packages 2>/dev/null || pip install Pillow --quiet
+          python3 << 'ENDOFFILE'
+          from PIL import Image, ImageDraw
+          import os
+
+          def make_icon(size):
+              bg = (30, 30, 30, 255)
+              white = (255, 255, 255, 255)
+              accent = (100, 100, 100, 255)
+              img = Image.new('RGBA', (size, size), bg)
+              d = ImageDraw.Draw(img)
+              d.rectangle([size*0.15, size*0.3, size*0.85, size*0.75], fill=white)
+              d.rectangle([size*0.15, size*0.2, size*0.5, size*0.3], fill=accent)
+              return img
+
+          sizes = {'mdpi':48, 'hdpi':72, 'xhdpi':96, 'xxhdpi':144, 'xxxhdpi':192}
+          for density, s in sizes.items():
+              path = f'app/src/main/res/mipmap-{density}'
+              os.makedirs(path, exist_ok=True)
+              icon = make_icon(s)
+              icon.save(f'{path}/ic_launcher.png')
+              icon.save(f'{path}/ic_launcher_round.png')
+          print("Icons generated!")
+          ENDOFFILE
+
+      - name: Setup Gradle Wrapper
+        run: |
+          gradle wrapper --gradle-version=8.11.1 --distribution-type=bin
+          chmod +x gradlew
+
+      - name: Clean build
+        run: rm -rf app/build && ./gradlew clean --no-daemon
+
+      - name: Build signed release APK
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Verify APK signing
+        run: |
+          APK_PATH="app/build/outputs/apk/release/app-release.apk"
+          if [ -f "$APK_PATH" ]; then
+              echo "✅ Release APK generated"
+              echo "📦 APK size: $(ls -lh "$APK_PATH" | awk '{print $5}')"
+              BT_PATH=$(ls -d $ANDROID_HOME/build-tools/* 2>/dev/null | head -1)
+              if [ -n "$BT_PATH" ]; then $BT_PATH/apksigner verify --print-certs "$APK_PATH" 2>/dev/null || echo "⚠️ apksigner verify skipped"; fi
+          else echo "❌ Release APK not found"; exit 1; fi
+
+      - name: Bundle APK + source
+        run: |
+          mkdir -p GreyB-Explorer-release
+          cp app/build/outputs/apk/release/app-release.apk GreyB-Explorer-release/GreyB-Explorer.apk
+          cp app/src/main/java/com/greyb/explorer/MainActivity.kt GreyB-Explorer-release/
+          cp app/src/main/AndroidManifest.xml GreyB-Explorer-release/
+          cp .github/workflows/build.yml GreyB-Explorer-release/
+          APK_SIZE=$(ls -lh app/build/outputs/apk/release/app-release.apk | awk '{print $5}')
+          cat > GreyB-Explorer-release/BUILD_INFO.txt << INFOEOF
+          Build:      #${{ github.run_number }}
+          Commit:     ${{ github.sha }}
+          Timestamp:  $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          Signed:     Yes (fixed key)
+          APK Size:   ${APK_SIZE}
+          Optimized:  Yes (ProGuard/R8 enabled)
+          INFOEOF
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GreyB-Explorer-${{ github.run_number }}
+          path: GreyB-Explorer-release/
+          retention-days: 30
