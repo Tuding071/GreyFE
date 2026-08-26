@@ -746,13 +746,18 @@ jobs:
               }
           }
 
-          // Shared thumbnail/icon box — always the same size so icons and real
-          // thumbnails line up. Folders with no image thumbnail show a folder icon
-          // with "Folder" written in blue-violet beneath it.
+          // ---------- UPDATED FileThumbBox ----------
+          // Folder without thumbnail: grey background (#2A2A2A) with "Folder" text.
+          // Folder with thumbnail: image with semi-transparent overlay and "Folder" text.
           @Composable
           fun FileThumbBox(isDirectory: Boolean, thumb: Bitmap?) {
               Box(
-                  modifier = Modifier.size(56.dp).clip(RoundedCornerShape(8.dp)),
+                  modifier = Modifier
+                      .size(56.dp)
+                      .clip(RoundedCornerShape(8.dp))
+                      .background(
+                          if (isDirectory && thumb == null) Color(0xFF2A2A2A) else Color.Transparent
+                      ),
                   contentAlignment = Alignment.Center
               ) {
                   if (thumb != null) {
@@ -762,22 +767,28 @@ jobs:
                           contentScale = ContentScale.Crop,
                           modifier = Modifier.fillMaxSize()
                       )
-                  } else if (isDirectory) {
-                      Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                          Icon(
-                              imageVector = Icons.Filled.Folder,
-                              contentDescription = null,
-                              tint = Color(0xFF8A2BE2),
-                              modifier = Modifier.size(34.dp)
-                          )
-                          Text(
-                              text = "Folder",
-                              color = Color(0xFF8A2BE2),
-                              fontSize = 9.sp,
-                              fontWeight = FontWeight.Medium,
-                              maxLines = 1
-                          )
+                      if (isDirectory) {
+                          Box(
+                              modifier = Modifier
+                                  .fillMaxSize()
+                                  .background(Color(0x88000000)),
+                              contentAlignment = Alignment.Center
+                          ) {
+                              Text(
+                                  text = "Folder",
+                                  color = Color.White,
+                                  fontSize = 10.sp,
+                                  fontWeight = FontWeight.Bold
+                              )
+                          }
                       }
+                  } else if (isDirectory) {
+                      Text(
+                          text = "Folder",
+                          color = Color.White,
+                          fontSize = 10.sp,
+                          fontWeight = FontWeight.Medium
+                      )
                   } else {
                       Icon(
                           imageVector = Icons.Filled.InsertDriveFile,
