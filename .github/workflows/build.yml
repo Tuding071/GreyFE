@@ -192,8 +192,6 @@ jobs:
           import java.io.FileOutputStream
           import java.lang.reflect.Method
           import java.security.MessageDigest
-          import kotlin.math.max
-          import kotlin.math.min
 
           class MainActivity : ComponentActivity() {
               override fun onCreate(savedInstanceState: Bundle?) {
@@ -383,6 +381,8 @@ jobs:
               }
           }
 
+          // Reflection-based path extraction for StorageVolume — works across API levels
+          // including older ones where getDirectory()/getPath() aren't public API.
           private fun storageVolumePath(volume: Any): File? {
               try {
                   val getDirectory: Method = volume.javaClass.getMethod("getDirectory")
@@ -1133,9 +1133,9 @@ jobs:
               implementation(platform("androidx.compose:compose-bom:2024.09.00"))
               implementation("androidx.compose.ui:ui")
               implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.compose.foundation:foundation")
               implementation("androidx.compose.material3:material3")
               implementation("androidx.compose.material:material-icons-extended")
-              implementation("androidx.compose.foundation:foundation-pager")
               implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
               implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
               implementation("androidx.documentfile:documentfile:1.0.1")
