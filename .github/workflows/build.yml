@@ -147,8 +147,11 @@ jobs:
           import androidx.compose.foundation.Image
           import androidx.compose.foundation.background
           import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.gestures.awaitEachGesture
+          import androidx.compose.foundation.gestures.awaitFirstDown
+          import androidx.compose.foundation.gestures.calculatePan
+          import androidx.compose.foundation.gestures.calculateZoom
           import androidx.compose.foundation.gestures.detectTapGestures
-          import androidx.compose.foundation.gestures.detectTransformGestures
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.LazyColumn
           import androidx.compose.foundation.lazy.items
@@ -977,20 +980,36 @@ jobs:
                           )
                       }
                       .pointerInput(file.absolutePath) {
-                          detectTransformGestures { _, pan, zoom, _ ->
-                              val newScale = (scale * zoom).coerceIn(minScale, maxScale)
-                              if (newScale > minScale) {
-                                  offsetX += pan.x / newScale
-                                  offsetY += pan.y / newScale
-                                  val maxOffsetX = (containerSize.x * (newScale - 1f)) / (2f * newScale)
-                                  val maxOffsetY = (containerSize.y * (newScale - 1f)) / (2f * newScale)
-                                  offsetX = offsetX.coerceIn(-maxOffsetX, maxOffsetX)
-                                  offsetY = offsetY.coerceIn(-maxOffsetY, maxOffsetY)
-                              } else {
-                                  offsetX = 0f
-                                  offsetY = 0f
-                              }
-                              scale = newScale
+                          // REPLACED WITH THE FIX FROM CLAUDE
+                          awaitEachGesture {
+                              awaitFirstDown(requireUnconsumed = false)
+                              do {
+                                  val event = awaitPointerEvent()
+                                  val zoomChange = event.calculateZoom()
+                                  val panChange = event.calculatePan()
+
+                                  // Only claim the gesture once there's real pinch intent (2+ pointers)
+                                  // or we're already zoomed in. At scale == 1f with a single finger,
+                                  // do nothing here so the drag passes through to the HorizontalPager
+                                  // for swipe-to-next/prev.
+                                  val isMultiTouch = event.changes.size > 1
+                                  if (isMultiTouch || scale > minScale + 0.01f) {
+                                      val newScale = (scale * zoomChange).coerceIn(minScale, maxScale)
+                                      if (newScale > minScale) {
+                                          offsetX += panChange.x / newScale
+                                          offsetY += panChange.y / newScale
+                                          val maxOffsetX = (containerSize.x * (newScale - 1f)) / (2f * newScale)
+                                          val maxOffsetY = (containerSize.y * (newScale - 1f)) / (2f * newScale)
+                                          offsetX = offsetX.coerceIn(-maxOffsetX, maxOffsetX)
+                                          offsetY = offsetY.coerceIn(-maxOffsetY, maxOffsetY)
+                                      } else {
+                                          offsetX = 0f
+                                          offsetY = 0f
+                                      }
+                                      scale = newScale
+                                      event.changes.forEach { it.consume() }
+                                  }
+                              } while (event.changes.any { it.pressed })
                           }
                       },
                   contentAlignment = Alignment.Center
