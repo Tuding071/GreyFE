@@ -142,6 +142,8 @@ jobs:
           import androidx.activity.compose.setContent
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.compose.animation.AnimatedVisibility
+          import androidx.compose.animation.core.Animatable
+          import androidx.compose.animation.core.tween
           import androidx.compose.animation.fadeIn
           import androidx.compose.animation.fadeOut
           import androidx.compose.foundation.Image
@@ -151,7 +153,7 @@ jobs:
           import androidx.compose.foundation.gestures.awaitFirstDown
           import androidx.compose.foundation.gestures.calculatePan
           import androidx.compose.foundation.gestures.calculateZoom
-          import androidx.compose.foundation.gestures.detectTapGestures
+          import androidx.compose.foundation.gestures.waitForUpOrCancellation
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.LazyColumn
           import androidx.compose.foundation.lazy.items
@@ -189,7 +191,9 @@ jobs:
           import androidx.lifecycle.LifecycleEventObserver
           import androidx.lifecycle.compose.LocalLifecycleOwner
           import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
           import kotlinx.coroutines.withContext
+          import kotlinx.coroutines.withTimeoutOrNull
           import java.io.File
           import java.io.FileOutputStream
           import java.lang.reflect.Method
@@ -945,15 +949,23 @@ jobs:
                   bitmap = FullImageCache.decodeForViewer(file.absolutePath, targetDimension)
               }
 
-              var scale by remember(file.absolutePath) { mutableStateOf(1f) }
-              var offsetX by remember(file.absolutePath) { mutableStateOf(0f) }
-              var offsetY by remember(file.absolutePath) { mutableStateOf(0f) }
-
               val minScale = 1f
               val maxScale = 6f
 
-              LaunchedEffect(scale) {
-                  onZoomStateChanged(scale > minScale + 0.01f)
+              val scaleAnim = remember(file.absolutePath) { Animatable(1f) }
+              val offsetXAnim = remember(file.absolutePath) { Animatable(0f) }
+              val offsetYAnim = remember(file.absolutePath) { Animatable(0f) }
+              val scope = rememberCoroutineScope()
+
+              LaunchedEffect(scaleAnim.value) {
+                  onZoomStateChanged(scaleAnim.value > minScale + 0.01f)
+              }
+
+              fun clampOffsets(scale: Float, x: Float, y: Float): Offset {
+                  if (scale <= minScale) return Offset.Zero
+                  val maxOffsetX = (containerSize.x * (scale - 1f)) / (2f * scale)
+                  val maxOffsetY = (containerSize.y * (scale - 1f)) / (2f * scale)
+                  return Offset(x.coerceIn(-maxOffsetX, maxOffsetX), y.coerceIn(-maxOffsetY, maxOffsetY))
               }
 
               Box(
@@ -961,55 +973,73 @@ jobs:
                       .fillMaxSize()
                       .onSizeChangedCompat { w, h -> containerSize = Offset(w.toFloat(), h.toFloat()) }
                       .pointerInput(file.absolutePath) {
-                          detectTapGestures(
-                              onTap = { onTap() },
-                              onDoubleTap = { tapPos ->
-                                  if (scale > minScale + 0.05f) {
-                                      scale = minScale
-                                      offsetX = 0f
-                                      offsetY = 0f
-                                  } else {
-                                      val newScale = 3f
-                                      val cx = containerSize.x / 2f
-                                      val cy = containerSize.y / 2f
-                                      offsetX = (cx - tapPos.x)
-                                      offsetY = (cy - tapPos.y)
-                                      scale = newScale
+                          awaitEachGesture {
+                              val down = awaitFirstDown(requireUnconsumed = false)
+
+                              // Detect double-tap by watching for a second down within
+                              // the standard window, without a separate detector that
+                              // could race with the pan/zoom handling below.
+                              var isDoubleTap = false
+                              val firstUp = waitForUpOrCancellation()
+                              if (firstUp != null) {
+                                  val secondDownTimeout = withTimeoutOrNull(300L) {
+                                      awaitFirstDown(requireUnconsumed = false)
+                                  }
+                                  if (secondDownTimeout != null) {
+                                      isDoubleTap = true
+                                      waitForUpOrCancellation()
                                   }
                               }
-                          )
+
+                              if (isDoubleTap) {
+                                  if (scaleAnim.value > minScale + 0.05f) {
+                                      scope.launch { scaleAnim.animateTo(minScale, animationSpec = tween(220)) }
+                                      scope.launch { offsetXAnim.animateTo(0f, animationSpec = tween(220)) }
+                                      scope.launch { offsetYAnim.animateTo(0f, animationSpec = tween(220)) }
+                                  } else {
+                                      val target = 3f
+                                      val cx = containerSize.x / 2f
+                                      val cy = containerSize.y / 2f
+                                      val tapPos = down.position
+                                      val newOffset = clampOffsets(target, cx - tapPos.x, cy - tapPos.y)
+                                      scope.launch { scaleAnim.animateTo(target, animationSpec = tween(220)) }
+                                      scope.launch { offsetXAnim.animateTo(newOffset.x, animationSpec = tween(220)) }
+                                      scope.launch { offsetYAnim.animateTo(newOffset.y, animationSpec = tween(220)) }
+                                  }
+                              } else if (firstUp != null) {
+                                  onTap()
+                              }
+                          }
                       }
                       .pointerInput(file.absolutePath) {
-                          // REPLACED WITH THE FIX FROM CLAUDE
                           awaitEachGesture {
                               awaitFirstDown(requireUnconsumed = false)
                               do {
                                   val event = awaitPointerEvent()
                                   val zoomChange = event.calculateZoom()
                                   val panChange = event.calculatePan()
-
-                                  // Only claim the gesture once there's real pinch intent (2+ pointers)
-                                  // or we're already zoomed in. At scale == 1f with a single finger,
-                                  // do nothing here so the drag passes through to the HorizontalPager
-                                  // for swipe-to-next/prev.
                                   val isMultiTouch = event.changes.size > 1
-                                  if (isMultiTouch || scale > minScale + 0.01f) {
-                                      val newScale = (scale * zoomChange).coerceIn(minScale, maxScale)
-                                      if (newScale > minScale) {
-                                          offsetX += panChange.x / newScale
-                                          offsetY += panChange.y / newScale
-                                          val maxOffsetX = (containerSize.x * (newScale - 1f)) / (2f * newScale)
-                                          val maxOffsetY = (containerSize.y * (newScale - 1f)) / (2f * newScale)
-                                          offsetX = offsetX.coerceIn(-maxOffsetX, maxOffsetX)
-                                          offsetY = offsetY.coerceIn(-maxOffsetY, maxOffsetY)
-                                      } else {
-                                          offsetX = 0f
-                                          offsetY = 0f
-                                      }
-                                      scale = newScale
+
+                                  if (isMultiTouch || scaleAnim.value > minScale + 0.01f) {
+                                      val newScale = (scaleAnim.value * zoomChange).coerceIn(minScale, maxScale)
+                                      val rawX = offsetXAnim.value + panChange.x / newScale
+                                      val rawY = offsetYAnim.value + panChange.y / newScale
+                                      val clamped = clampOffsets(newScale, rawX, rawY)
+                                      scope.launch { scaleAnim.snapTo(newScale) }
+                                      scope.launch { offsetXAnim.snapTo(clamped.x) }
+                                      scope.launch { offsetYAnim.snapTo(clamped.y) }
                                       event.changes.forEach { it.consume() }
                                   }
                               } while (event.changes.any { it.pressed })
+
+                              // Pinch released while zoomed below the minimum threshold —
+                              // snap back to 1x smoothly rather than leaving it stuck
+                              // at some in-between scale.
+                              if (scaleAnim.value < minScale + 0.02f && scaleAnim.value != minScale) {
+                                  scope.launch { scaleAnim.animateTo(minScale, animationSpec = tween(180)) }
+                                  scope.launch { offsetXAnim.animateTo(0f, animationSpec = tween(180)) }
+                                  scope.launch { offsetYAnim.animateTo(0f, animationSpec = tween(180)) }
+                              }
                           }
                       },
                   contentAlignment = Alignment.Center
@@ -1023,10 +1053,10 @@ jobs:
                           modifier = Modifier
                               .fillMaxSize()
                               .graphicsLayer(
-                                  scaleX = scale,
-                                  scaleY = scale,
-                                  translationX = offsetX * scale,
-                                  translationY = offsetY * scale
+                                  scaleX = scaleAnim.value,
+                                  scaleY = scaleAnim.value,
+                                  translationX = offsetXAnim.value * scaleAnim.value,
+                                  translationY = offsetYAnim.value * scaleAnim.value
                               )
                       )
                   } else {
