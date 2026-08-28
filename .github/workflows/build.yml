@@ -126,6 +126,8 @@ jobs:
           import android.content.pm.PackageManager
           import android.graphics.Bitmap
           import android.graphics.BitmapFactory
+          import android.graphics.ImageDecoder
+          import android.graphics.drawable.AnimatedImageDrawable
           import android.media.MediaMetadataRetriever
           import android.media.ThumbnailUtils
           import android.net.Uri
@@ -146,24 +148,38 @@ jobs:
           import androidx.compose.animation.core.tween
           import androidx.compose.animation.fadeIn
           import androidx.compose.animation.fadeOut
+          import androidx.compose.animation.slideInHorizontally
+          import androidx.compose.animation.slideOutHorizontally
+          import androidx.compose.foundation.Canvas
           import androidx.compose.foundation.Image
           import androidx.compose.foundation.background
           import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.combinedClickable
           import androidx.compose.foundation.gestures.awaitEachGesture
           import androidx.compose.foundation.gestures.awaitFirstDown
           import androidx.compose.foundation.gestures.calculatePan
           import androidx.compose.foundation.gestures.calculateZoom
+          import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.interaction.MutableInteractionSource
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.LazyColumn
           import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.lazy.rememberLazyListState
           import androidx.compose.foundation.pager.HorizontalPager
           import androidx.compose.foundation.pager.rememberPagerState
+          import androidx.compose.foundation.rememberScrollState
           import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.material.icons.Icons
-          import androidx.compose.material.icons.filled.ArrowBack
+          import androidx.compose.material.icons.filled.Bookmark
+          import androidx.compose.material.icons.filled.BookmarkBorder
           import androidx.compose.material.icons.filled.Close
+          import androidx.compose.material.icons.filled.DragHandle
           import androidx.compose.material.icons.filled.Folder
+          import androidx.compose.material.icons.filled.Home
           import androidx.compose.material.icons.filled.InsertDriveFile
+          import androidx.compose.material.icons.filled.List
+          import androidx.compose.material.icons.filled.MoreVert
           import androidx.compose.material.icons.filled.PhoneAndroid
           import androidx.compose.material.icons.filled.SdCard
           import androidx.compose.material3.*
@@ -175,6 +191,7 @@ jobs:
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.asImageBitmap
           import androidx.compose.ui.graphics.graphicsLayer
+          import androidx.compose.ui.graphics.toArgb
           import androidx.compose.ui.input.pointer.pointerInput
           import androidx.compose.ui.layout.ContentScale
           import androidx.compose.ui.layout.layout
@@ -183,6 +200,8 @@ jobs:
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
+          import androidx.compose.ui.viewinterop.AndroidView
+          import androidx.compose.ui.window.Popup
           import androidx.core.content.ContextCompat
           import androidx.core.content.FileProvider
           import androidx.documentfile.provider.DocumentFile
@@ -192,7 +211,6 @@ jobs:
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.launch
           import kotlinx.coroutines.withContext
-          import kotlinx.coroutines.withTimeoutOrNull
           import java.io.File
           import java.io.FileOutputStream
           import java.lang.reflect.Method
@@ -253,6 +271,45 @@ jobs:
               return parts
           }
 
+          // ---------- Bookmarks ----------
+          // Persisted as an ordered, pipe-delimited list of absolute paths in
+          // SharedPreferences. "Home" (root/storage list) is implicit and always
+          // rendered first — it is never stored in this list.
+          object Bookmarks {
+              private const val PREFS = "bookmarks_prefs"
+              private const val KEY = "bookmark_paths"
+
+              fun getAll(context: Context): List<String> {
+                  val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, "") ?: ""
+                  return if (raw.isBlank()) emptyList() else raw.split("|").filter { it.isNotBlank() }
+              }
+
+              fun isBookmarked(context: Context, path: String): Boolean = getAll(context).contains(path)
+
+              fun add(context: Context, path: String) {
+                  val current = getAll(context).toMutableList()
+                  if (!current.contains(path)) {
+                      current.add(path)
+                      save(context, current)
+                  }
+              }
+
+              fun remove(context: Context, path: String) {
+                  val current = getAll(context).toMutableList()
+                  current.remove(path)
+                  save(context, current)
+              }
+
+              fun reorder(context: Context, newOrder: List<String>) {
+                  save(context, newOrder)
+              }
+
+              private fun save(context: Context, list: List<String>) {
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      .edit().putString(KEY, list.joinToString("|")).apply()
+              }
+          }
+
           // ---------- Thumbnail cache ----------
           object ThumbnailCache {
               private const val MAX_THUMBS = 500
@@ -273,6 +330,8 @@ jobs:
                   val ext = name.substringAfterLast('.', "").lowercase()
                   return ext in setOf("jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif")
               }
+
+              fun isGif(name: String): Boolean = name.substringAfterLast('.', "").lowercase() == "gif"
 
               fun isVideo(name: String): Boolean {
                   val ext = name.substringAfterLast('.', "").lowercase()
@@ -384,6 +443,22 @@ jobs:
                       BitmapFactory.decodeFile(path, opts2)
                   } catch (e: Exception) { null }
               }
+
+              // Loads a GIF as an AnimatedImageDrawable (API 28+) for real animated
+              // playback in the viewer. On API 26-27 (below ImageDecoder availability)
+              // falls back to a static first-frame bitmap via BitmapFactory.
+              fun loadAnimatedDrawable(context: Context, path: String): Any? {
+                  return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                      try {
+                          val source = ImageDecoder.createSource(File(path))
+                          ImageDecoder.decodeDrawable(source) { decoder, _, _ ->
+                              decoder.isMemorySizeBudgeted = true
+                          }
+                      } catch (e: Exception) { null }
+                  } else {
+                      try { BitmapFactory.decodeFile(path) } catch (e: Exception) { null }
+                  }
+              }
           }
 
           // Reflection-based path extraction for StorageVolume — works across API levels
@@ -458,8 +533,8 @@ jobs:
           @Composable
           fun FileExplorerApp() {
               val context = LocalContext.current
-              var navigationStack by remember { mutableStateOf<List<File>>(emptyList()) }
-              val currentDir = navigationStack.lastOrNull()
+              // null currentDir means "Home" (the storage roots list)
+              var currentDir by remember { mutableStateOf<File?>(null) }
               var hasPermission by remember { mutableStateOf(hasStoragePermission(context)) }
               var refreshTrigger by remember { mutableStateOf(0) }
 
@@ -468,6 +543,9 @@ jobs:
 
               var viewerImages by remember { mutableStateOf<List<File>?>(null) }
               var viewerStartIndex by remember { mutableStateOf(0) }
+
+              var panelOpen by remember { mutableStateOf(false) }
+              var bookmarkListVersion by remember { mutableStateOf(0) }
 
               val prefs = context.getSharedPreferences("saf_prefs", Context.MODE_PRIVATE)
 
@@ -537,13 +615,22 @@ jobs:
                   onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
               }
 
-              BackHandler(enabled = viewerImages != null || navigationStack.isNotEmpty() || safStack.size > 1) {
-                  if (viewerImages != null) {
-                      viewerImages = null
-                  } else if (safStack.size > 1) {
-                      safStack = safStack.dropLast(1)
-                  } else if (navigationStack.isNotEmpty()) {
-                      navigationStack = navigationStack.dropLast(1)
+              // Relies on the system/hardware back button throughout, as requested —
+              // no in-app back arrow. Priority: close viewer > close panel > pop SAF
+              // stack > go up a directory (to Home when at a storage root).
+              BackHandler(enabled = viewerImages != null || panelOpen || currentDir != null || safStack.size > 1) {
+                  when {
+                      viewerImages != null -> viewerImages = null
+                      panelOpen -> panelOpen = false
+                      safStack.size > 1 -> safStack = safStack.dropLast(1)
+                      currentDir != null -> {
+                          val parent = currentDir!!.parentFile
+                          currentDir = if (parent != null && getStorageRoots(context).any { it.second.absolutePath == currentDir!!.absolutePath }) {
+                              null
+                          } else {
+                              parent
+                          }
+                      }
                   }
               }
 
@@ -551,53 +638,78 @@ jobs:
                   modifier = Modifier.fillMaxSize(),
                   color = Color(0xFF1E1E1E)
               ) {
-                  if (viewerImages != null) {
-                      ImageViewerScreen(
-                          images = viewerImages!!,
-                          startIndex = viewerStartIndex,
-                          onClose = { viewerImages = null }
-                      )
-                  } else if (safRoot != null) {
-                      SafBrowserScreen(
-                          currentDoc = safStack.last(),
-                          onNavigate = { doc -> safStack = safStack + doc },
-                          onBack = { safStack = safStack.dropLast(1) },
-                          onExit = {
-                              safRoot = null
-                              safStack = emptyList()
-                              prefs.edit().remove("saf_uri").apply()
-                          }
-                      )
-                  } else if (!hasPermission) {
-                      PermissionScreen(
-                          onGrant = {
-                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                                  val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                                  intent.data = Uri.parse("package:${context.packageName}")
-                                  context.startActivity(intent)
-                              } else {
-                                  permissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
-                              }
-                          },
-                          onUseSaf = { safLauncher.launch(null) }
-                      )
-                  } else {
-                      if (currentDir == null) {
-                          StorageRootsScreen(
-                              refreshKey = refreshTrigger,
-                              onRootClick = { root -> navigationStack = listOf(root) }
+                  Box(modifier = Modifier.fillMaxSize()) {
+                      if (viewerImages != null) {
+                          ImageViewerScreen(
+                              images = viewerImages!!,
+                              startIndex = viewerStartIndex,
+                              onClose = { viewerImages = null }
+                          )
+                      } else if (safRoot != null) {
+                          SafBrowserScreen(
+                              currentDoc = safStack.last(),
+                              onNavigate = { doc -> safStack = safStack + doc },
+                              onExit = {
+                                  safRoot = null
+                                  safStack = emptyList()
+                                  prefs.edit().remove("saf_uri").apply()
+                              },
+                              onOpenPanel = { panelOpen = true }
+                          )
+                      } else if (!hasPermission) {
+                          PermissionScreen(
+                              onGrant = {
+                                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                      val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                                      intent.data = Uri.parse("package:${context.packageName}")
+                                      context.startActivity(intent)
+                                  } else {
+                                      permissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
+                                  }
+                              },
+                              onUseSaf = { safLauncher.launch(null) }
                           )
                       } else {
-                          FileListScreen(
-                              directory = currentDir!!,
-                              onNavigate = { dir -> navigationStack = navigationStack + dir },
-                              onBack = { navigationStack = navigationStack.dropLast(1) },
-                              onOpenImage = { images, index ->
-                                  viewerImages = images
-                                  viewerStartIndex = index
-                              }
-                          )
+                          val dir = currentDir
+                          if (dir == null) {
+                              HomeScreen(
+                                  refreshKey = refreshTrigger,
+                                  onRootClick = { root -> currentDir = root },
+                                  onOpenPanel = { panelOpen = true }
+                              )
+                          } else {
+                              FileListScreen(
+                                  directory = dir,
+                                  onNavigate = { d -> currentDir = d },
+                                  onJumpTo = { target -> currentDir = target },
+                                  onOpenImage = { images, index ->
+                                      viewerImages = images
+                                      viewerStartIndex = index
+                                  },
+                                  onOpenPanel = { panelOpen = true },
+                                  bookmarkListVersion = bookmarkListVersion,
+                                  onBookmarkChanged = { bookmarkListVersion++ }
+                              )
+                          }
                       }
+
+                      BookmarksPanel(
+                          visible = panelOpen,
+                          listVersion = bookmarkListVersion,
+                          onDismiss = { panelOpen = false },
+                          onNavigateHome = {
+                              currentDir = null
+                              panelOpen = false
+                          },
+                          onNavigateTo = { path ->
+                              currentDir = File(path)
+                              panelOpen = false
+                          },
+                          onReorder = { newOrder ->
+                              Bookmarks.reorder(context, newOrder)
+                              bookmarkListVersion++
+                          }
+                      )
                   }
               }
           }
@@ -623,45 +735,109 @@ jobs:
               }
           }
 
+          // Header with: bookmarks button (left, replaces back arrow), scrollable
+          // tappable breadcrumb trail (center), three-dot menu (right, optional).
           @Composable
-          fun ScreenHeader(title: String, onBack: (() -> Unit)? = null, trailing: (@Composable () -> Unit)? = null) {
+          fun ScreenHeader(
+              breadcrumbs: List<Pair<String, () -> Unit>>,
+              onOpenPanel: () -> Unit,
+              menuContent: (@Composable (closeMenu: () -> Unit) -> Unit)? = null
+          ) {
+              var menuOpen by remember { mutableStateOf(false) }
+              val scrollState = rememberScrollState()
+
+              LaunchedEffect(breadcrumbs.size) {
+                  scrollState.scrollTo(scrollState.maxValue)
+              }
+
               Row(
                   modifier = Modifier
                       .fillMaxWidth()
                       .background(Color(0xFF2A2A2A))
-                      .padding(horizontal = 16.dp, vertical = 16.dp),
+                      .padding(horizontal = 12.dp, vertical = 12.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
-                  if (onBack != null) {
-                      Icon(
-                          imageVector = Icons.Filled.ArrowBack,
-                          contentDescription = "Back",
-                          tint = Color.White,
-                          modifier = Modifier.size(24.dp).clickable { onBack() }
-                      )
-                      Spacer(Modifier.width(14.dp))
-                  }
-                  Text(
-                      text = title,
-                      color = Color.White,
-                      fontSize = 17.sp,
-                      maxLines = 1,
-                      modifier = Modifier.weight(1f)
+                  Icon(
+                      imageVector = Icons.Filled.List,
+                      contentDescription = "Bookmarks",
+                      tint = Color.White,
+                      modifier = Modifier.size(22.dp).clickable { onOpenPanel() }
                   )
-                  trailing?.invoke()
+                  Spacer(Modifier.width(12.dp))
+
+                  Row(
+                      modifier = Modifier
+                          .weight(1f)
+                          .horizontalScroll(scrollState),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      breadcrumbs.forEachIndexed { index, (label, onClick) ->
+                          if (index > 0) {
+                              Text(
+                                  text = " \u203a ",
+                                  color = Color(0xFF777777),
+                                  fontSize = 12.sp
+                              )
+                          }
+                          val isLast = index == breadcrumbs.lastIndex
+                          Text(
+                              text = label,
+                              color = if (isLast) Color.White else Color(0xFF4FC3F7),
+                              fontSize = 12.sp,
+                              maxLines = 1,
+                              modifier = Modifier.clickable(enabled = !isLast) { onClick() }
+                          )
+                      }
+                  }
+
+                  if (menuContent != null) {
+                      Spacer(Modifier.width(8.dp))
+                      Box {
+                          Icon(
+                              imageVector = Icons.Filled.MoreVert,
+                              contentDescription = "Menu",
+                              tint = Color.White,
+                              modifier = Modifier.size(22.dp).clickable { menuOpen = true }
+                          )
+                          if (menuOpen) {
+                              Popup(onDismissRequest = { menuOpen = false }) {
+                                  Column(
+                                      modifier = Modifier
+                                          .background(Color(0xFF333333), RoundedCornerShape(8.dp))
+                                          .padding(vertical = 4.dp)
+                                  ) {
+                                      menuContent { menuOpen = false }
+                                  }
+                              }
+                          }
+                      }
+                  }
               }
           }
 
           @Composable
-          fun StorageRootsScreen(
+          fun MenuRow(text: String, onClick: () -> Unit) {
+              Text(
+                  text = text,
+                  color = Color.White,
+                  fontSize = 14.sp,
+                  modifier = Modifier
+                      .clickable { onClick() }
+                      .padding(horizontal = 16.dp, vertical = 12.dp)
+              )
+          }
+
+          @Composable
+          fun HomeScreen(
               refreshKey: Int,
-              onRootClick: (File) -> Unit
+              onRootClick: (File) -> Unit,
+              onOpenPanel: () -> Unit
           ) {
               val context = LocalContext.current
               val roots = remember(refreshKey) { getStorageRoots(context) }
 
               Column(Modifier.fillMaxSize()) {
-                  ScreenHeader(title = "Storage")
+                  ScreenHeader(breadcrumbs = listOf("Home" to {}), onOpenPanel = onOpenPanel)
 
                   if (roots.isEmpty()) {
                       Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -673,10 +849,7 @@ jobs:
                           contentPadding = PaddingValues(16.dp)
                       ) {
                           items(roots) { (label, root) ->
-                              Row(
-                                  modifier = Modifier.fillMaxWidth().clickable { onRootClick(root) }.padding(vertical = 12.dp),
-                                  verticalAlignment = Alignment.CenterVertically
-                              ) {
+                              TappableRow(onClick = { onRootClick(root) }) {
                                   Icon(
                                       imageVector = if (label == "Internal Storage") Icons.Filled.PhoneAndroid else Icons.Filled.SdCard,
                                       contentDescription = label,
@@ -684,7 +857,7 @@ jobs:
                                       modifier = Modifier.size(56.dp)
                                   )
                                   Spacer(Modifier.width(16.dp))
-                                  Text(text = label, color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.Medium)
+                                  Text(text = label, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Medium)
                               }
                           }
                       }
@@ -692,12 +865,45 @@ jobs:
               }
           }
 
+          // Wraps a row with tap feedback: white background + black text while
+          // pressed, using combinedClickable's interaction source to detect press
+          // state without needing a separate gesture detector.
+          @Composable
+          fun TappableRow(onClick: () -> Unit, content: @Composable RowScope.() -> Unit) {
+              val interactionSource = remember { MutableInteractionSource() }
+              val pressed by interactionSource.collectIsPressedAsState()
+              val bg = if (pressed) Color.White else Color.Transparent
+
+              Row(
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .background(bg)
+                      .clickable(
+                          interactionSource = interactionSource,
+                          indication = null,
+                          onClick = onClick
+                      )
+                      .padding(horizontal = 16.dp, vertical = 10.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  CompositionLocalProvider(androidx.compose.material3.LocalContentColor provides if (pressed) Color.Black else Color.White) {
+                      content()
+                  }
+              }
+          }
+
+          @Composable
+          fun collectIsPressedAsState() = Unit // placeholder removed below
+
           @Composable
           fun FileListScreen(
               directory: File,
               onNavigate: (File) -> Unit,
-              onBack: () -> Unit,
-              onOpenImage: (images: List<File>, index: Int) -> Unit
+              onJumpTo: (File) -> Unit,
+              onOpenImage: (images: List<File>, index: Int) -> Unit,
+              onOpenPanel: () -> Unit,
+              bookmarkListVersion: Int,
+              onBookmarkChanged: () -> Unit
           ) {
               val context = LocalContext.current
               val files = remember(directory) {
@@ -707,8 +913,51 @@ jobs:
               }
               val imagesInDir = remember(files) { files.filter { it.isFile && ThumbnailCache.isImage(it.name) } }
 
+              val bookmarked = remember(directory, bookmarkListVersion) {
+                  Bookmarks.isBookmarked(context, directory.absolutePath)
+              }
+
+              // Build breadcrumb segments from root storage down to the current
+              // directory, each tappable to jump straight there.
+              val storageRoots = remember { getStorageRoots(context) }
+              val matchingRoot = storageRoots.firstOrNull { directory.absolutePath.startsWith(it.second.absolutePath) }
+              val breadcrumbs = remember(directory) {
+                  val list = mutableListOf<Pair<String, () -> Unit>>()
+                  list.add("Home" to { })
+                  if (matchingRoot != null) {
+                      val rootFile = matchingRoot.second
+                      val relative = directory.absolutePath.removePrefix(rootFile.absolutePath).trim('/')
+                      list.add(matchingRoot.first to { onJumpTo(rootFile) })
+                      if (relative.isNotEmpty()) {
+                          var acc = rootFile
+                          relative.split("/").forEach { segment ->
+                              acc = File(acc, segment)
+                              val target = acc
+                              list.add(segment to { onJumpTo(target) })
+                          }
+                      }
+                  } else {
+                      list.add(directory.name to { })
+                  }
+                  list
+              }
+
               Column(Modifier.fillMaxSize()) {
-                  ScreenHeader(title = directory.path, onBack = onBack)
+                  ScreenHeader(
+                      breadcrumbs = breadcrumbs,
+                      onOpenPanel = onOpenPanel,
+                      menuContent = { close ->
+                          MenuRow(text = if (bookmarked) "Remove bookmark" else "Add to bookmarks") {
+                              if (bookmarked) {
+                                  Bookmarks.remove(context, directory.absolutePath)
+                              } else {
+                                  Bookmarks.add(context, directory.absolutePath)
+                              }
+                              onBookmarkChanged()
+                              close()
+                          }
+                      }
+                  )
 
                   if (files.isEmpty()) {
                       Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -740,8 +989,8 @@ jobs:
           fun SafBrowserScreen(
               currentDoc: DocumentFile,
               onNavigate: (DocumentFile) -> Unit,
-              onBack: () -> Unit,
-              onExit: () -> Unit
+              onExit: () -> Unit,
+              onOpenPanel: () -> Unit
           ) {
               val context = LocalContext.current
               val children = remember(currentDoc) {
@@ -751,15 +1000,13 @@ jobs:
 
               Column(Modifier.fillMaxSize()) {
                   ScreenHeader(
-                      title = currentDoc.name ?: "Selected Folder",
-                      onBack = onBack,
-                      trailing = {
-                          Icon(
-                              imageVector = Icons.Filled.Close,
-                              contentDescription = "Exit",
-                              tint = Color.White,
-                              modifier = Modifier.size(22.dp).clickable { onExit() }
-                          )
+                      breadcrumbs = listOf((currentDoc.name ?: "Selected Folder") to {}),
+                      onOpenPanel = onOpenPanel,
+                      menuContent = { close ->
+                          MenuRow(text = "Close folder access") {
+                              onExit()
+                              close()
+                          }
                       }
                   )
 
@@ -773,19 +1020,16 @@ jobs:
                           contentPadding = PaddingValues(8.dp)
                       ) {
                           items(children) { doc ->
-                              Row(
-                                  modifier = Modifier.fillMaxWidth().clickable {
-                                      if (doc.isDirectory) {
-                                          onNavigate(doc)
-                                      } else {
-                                          openFile(context, doc.uri)
-                                      }
-                                  }.padding(horizontal = 16.dp, vertical = 12.dp),
-                                  verticalAlignment = Alignment.CenterVertically
-                              ) {
+                              TappableRow(onClick = {
+                                  if (doc.isDirectory) {
+                                      onNavigate(doc)
+                                  } else {
+                                      openFile(context, doc.uri)
+                                  }
+                              }) {
                                   FileThumbBox(isDirectory = doc.isDirectory, thumb = null)
                                   Spacer(Modifier.width(16.dp))
-                                  Text(doc.name ?: "Unknown", color = Color.White, fontSize = 18.sp, maxLines = 1)
+                                  Text(doc.name ?: "Unknown", fontSize = 15.sp, maxLines = 1)
                               }
                           }
                       }
@@ -793,8 +1037,6 @@ jobs:
               }
           }
 
-          // Folder tiles always show a dim bottom bar with "Folder" text —
-          // whether the tile is the grey+icon fallback or a real photo thumbnail.
           @Composable
           fun FileThumbBox(isDirectory: Boolean, thumb: Bitmap?) {
               Box(
@@ -862,13 +1104,153 @@ jobs:
                   }
               }
 
-              Row(
-                  modifier = Modifier.fillMaxWidth().clickable { onClick() }.padding(horizontal = 16.dp, vertical = 8.dp),
-                  verticalAlignment = Alignment.CenterVertically
-              ) {
+              TappableRow(onClick = onClick) {
                   FileThumbBox(isDirectory = file.isDirectory, thumb = thumb)
                   Spacer(Modifier.width(16.dp))
-                  Text(file.name, color = Color.White, fontSize = 18.sp, maxLines = 1)
+                  Text(file.name, fontSize = 15.sp, maxLines = 1)
+              }
+          }
+
+          // ---------- Bookmarks side panel ----------
+          @Composable
+          fun BookmarksPanel(
+              visible: Boolean,
+              listVersion: Int,
+              onDismiss: () -> Unit,
+              onNavigateHome: () -> Unit,
+              onNavigateTo: (String) -> Unit,
+              onReorder: (List<String>) -> Unit
+          ) {
+              val context = LocalContext.current
+              var order by remember(listVersion) { mutableStateOf(Bookmarks.getAll(context)) }
+              var draggingIndex by remember { mutableStateOf(-1) }
+              var dragOffsetY by remember { mutableStateOf(0f) }
+
+              if (!visible && draggingIndex == -1) return
+
+              Box(modifier = Modifier.fillMaxSize()) {
+                  AnimatedVisibility(
+                      visible = visible,
+                      enter = fadeIn(),
+                      exit = fadeOut()
+                  ) {
+                      Box(
+                          modifier = Modifier
+                              .fillMaxSize()
+                              .background(Color(0x99000000))
+                              .clickable(
+                                  interactionSource = remember { MutableInteractionSource() },
+                                  indication = null,
+                                  onClick = onDismiss
+                              )
+                      )
+                  }
+
+                  AnimatedVisibility(
+                      visible = visible,
+                      enter = slideInHorizontally(initialOffsetX = { -it }),
+                      exit = slideOutHorizontally(targetOffsetX = { -it }),
+                      modifier = Modifier.align(Alignment.CenterStart)
+                  ) {
+                      Column(
+                          modifier = Modifier
+                              .fillMaxHeight()
+                              .width(240.dp)
+                              .background(Color(0xFF232323))
+                              .padding(vertical = 12.dp)
+                      ) {
+                          Text(
+                              text = "Bookmarks",
+                              color = Color(0xFF888888),
+                              fontSize = 11.sp,
+                              fontWeight = FontWeight.Medium,
+                              modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                          )
+
+                          // Home — pinned, not draggable, always first.
+                          TappableRow(onClick = onNavigateHome) {
+                              Icon(
+                                  imageVector = Icons.Filled.Home,
+                                  contentDescription = null,
+                                  tint = Color(0xFF4FC3F7),
+                                  modifier = Modifier.size(20.dp)
+                              )
+                              Spacer(Modifier.width(10.dp))
+                              Text("Home", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                          }
+
+                          Spacer(Modifier.height(4.dp))
+
+                          order.forEachIndexed { index, path ->
+                              val name = File(path).name.ifEmpty { path }
+                              val isDragging = index == draggingIndex
+                              Row(
+                                  modifier = Modifier
+                                      .fillMaxWidth()
+                                      .graphicsLayer {
+                                          translationY = if (isDragging) dragOffsetY else 0f
+                                      }
+                                      .background(if (isDragging) Color(0xFF2F2F2F) else Color.Transparent)
+                                      .clickable { onNavigateTo(path) }
+                                      .padding(horizontal = 16.dp, vertical = 10.dp),
+                                  verticalAlignment = Alignment.CenterVertically
+                              ) {
+                                  Icon(
+                                      imageVector = Icons.Filled.DragHandle,
+                                      contentDescription = "Reorder",
+                                      tint = Color(0xFF666666),
+                                      modifier = Modifier
+                                          .size(18.dp)
+                                          .pointerInput(order) {
+                                              detectDragGesturesAfterLongPress(
+                                                  onDragStart = {
+                                                      draggingIndex = index
+                                                      dragOffsetY = 0f
+                                                  },
+                                                  onDrag = { change, dragAmount ->
+                                                      change.consume()
+                                                      dragOffsetY += dragAmount.y
+                                                      val rowHeightPx = 40f
+                                                      val moveBy = (dragOffsetY / rowHeightPx).toInt()
+                                                      if (moveBy != 0) {
+                                                          val newIndex = (draggingIndex + moveBy).coerceIn(0, order.size - 1)
+                                                          if (newIndex != draggingIndex) {
+                                                              val mutable = order.toMutableList()
+                                                              val item = mutable.removeAt(draggingIndex)
+                                                              mutable.add(newIndex, item)
+                                                              order = mutable
+                                                              draggingIndex = newIndex
+                                                              dragOffsetY = 0f
+                                                          }
+                                                      }
+                                                  },
+                                                  onDragEnd = {
+                                                      draggingIndex = -1
+                                                      dragOffsetY = 0f
+                                                      onReorder(order)
+                                                  },
+                                                  onDragCancel = {
+                                                      draggingIndex = -1
+                                                      dragOffsetY = 0f
+                                                  }
+                                              )
+                                          }
+                                  )
+                                  Spacer(Modifier.width(8.dp))
+                                  Text(name, color = Color.White, fontSize = 14.sp, maxLines = 1, modifier = Modifier.weight(1f))
+                              }
+                          }
+
+                          if (order.isEmpty()) {
+                              Text(
+                                  text = "No bookmarks yet",
+                                  color = Color(0xFF666666),
+                                  fontSize = 12.sp,
+                                  modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                              )
+                          }
+                      }
+                  }
               }
           }
 
@@ -885,13 +1267,18 @@ jobs:
                       modifier = Modifier.fillMaxSize(),
                       userScrollEnabled = !currentPageZoomed
                   ) { page ->
-                      ZoomableImagePage(
-                          file = images[page],
-                          onTap = { controlsVisible = !controlsVisible },
-                          onZoomStateChanged = { zoomed ->
-                              if (page == pagerState.currentPage) currentPageZoomed = zoomed
-                          }
-                      )
+                      val file = images[page]
+                      if (ThumbnailCache.isGif(file.name)) {
+                          GifPage(file = file, onTap = { controlsVisible = !controlsVisible })
+                      } else {
+                          ZoomableImagePage(
+                              file = file,
+                              onTap = { controlsVisible = !controlsVisible },
+                              onZoomStateChanged = { zoomed ->
+                                  if (page == pagerState.currentPage) currentPageZoomed = zoomed
+                              }
+                          )
+                      }
                   }
 
                   AnimatedVisibility(
@@ -931,6 +1318,41 @@ jobs:
               }
 
               BackHandler { onClose() }
+          }
+
+          // GIFs get a dedicated page using an Android ImageView driven by
+          // AnimatedImageDrawable so they actually play, instead of the static
+          // Compose Image used for other formats.
+          @Composable
+          fun GifPage(file: File, onTap: () -> Unit) {
+              val context = LocalContext.current
+              Box(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .clickable(
+                          interactionSource = remember { MutableInteractionSource() },
+                          indication = null,
+                          onClick = onTap
+                      ),
+                  contentAlignment = Alignment.Center
+              ) {
+                  AndroidView(
+                      factory = { ctx ->
+                          android.widget.ImageView(ctx).apply {
+                              scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+                              val drawable = FullImageCache.loadAnimatedDrawable(ctx, file.absolutePath)
+                              when (drawable) {
+                                  is AnimatedImageDrawable -> {
+                                      setImageDrawable(drawable)
+                                      drawable.start()
+                                  }
+                                  is Bitmap -> setImageBitmap(drawable)
+                              }
+                          }
+                      },
+                      modifier = Modifier.fillMaxSize()
+                  )
+              }
           }
 
           @Composable
@@ -978,8 +1400,6 @@ jobs:
                       .fillMaxSize()
                       .onSizeChangedCompat { w, h -> containerSize = Offset(w.toFloat(), h.toFloat()) }
                       .pointerInput(file.absolutePath) {
-                          // Single unified gesture loop — handles tap, double-tap, pinch,
-                          // and pan all from one pointer event stream so nothing races.
                           awaitEachGesture {
                               val down = awaitFirstDown(requireUnconsumed = false)
                               val downTime = System.currentTimeMillis()
@@ -1006,13 +1426,10 @@ jobs:
                                   }
                               } while (event.changes.any { it.pressed })
 
-                              // Settle a pinch that ended slightly under 1x back to exactly 1x.
                               if (scaleAnim.value < minScale + 0.02f && scaleAnim.value != minScale) {
                                   animateTo(minScale, 0f, 0f, 180)
                               }
 
-                              // Only treat this as a tap/double-tap candidate if the finger
-                              // didn't actually drag or pinch during this gesture.
                               if (!moved && !wasMultiTouch) {
                                   val elapsed = System.currentTimeMillis() - downTime
                                   if (elapsed < 500) {
@@ -1020,8 +1437,6 @@ jobs:
                                           awaitFirstDown(requireUnconsumed = false)
                                       }
                                       if (secondDown != null) {
-                                          // Consume the rest of this second touch so it
-                                          // doesn't leak into the next gesture loop iteration.
                                           do {
                                               val e2 = awaitPointerEvent()
                                               e2.changes.forEach { it.consume() }
