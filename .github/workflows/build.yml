@@ -1036,6 +1036,13 @@ jobs:
                           contentScale = ContentScale.Crop,
                           modifier = Modifier.fillMaxSize()
                       )
+                  } else if (!isDirectory) {
+                      Icon(
+                          imageVector = Icons.Filled.InsertDriveFile,
+                          contentDescription = null,
+                          tint = Color(0xFFB0BEC5),
+                          modifier = Modifier.size(34.dp)
+                      )
                   }
 
                   if (isDirectory) {
@@ -1069,13 +1076,6 @@ jobs:
                               )
                           }
                       }
-                  } else {
-                      Icon(
-                          imageVector = Icons.Filled.InsertDriveFile,
-                          contentDescription = null,
-                          tint = Color(0xFFB0BEC5),
-                          modifier = Modifier.size(34.dp)
-                      )
                   }
               }
           }
