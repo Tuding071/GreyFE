@@ -146,10 +146,10 @@ jobs:
           import androidx.compose.animation.AnimatedVisibility
           import androidx.compose.animation.core.Animatable
           import androidx.compose.animation.core.animateDecay
-          import androidx.compose.animation.core.splineBasedDecay
           import androidx.compose.animation.core.tween
           import androidx.compose.animation.fadeIn
           import androidx.compose.animation.fadeOut
+          import androidx.compose.animation.rememberSplineBasedDecay
           import androidx.compose.animation.slideInHorizontally
           import androidx.compose.animation.slideOutHorizontally
           import androidx.compose.foundation.Image
@@ -443,7 +443,6 @@ jobs:
                   } catch (e: Exception) { null }
               }
 
-              // CORRECTED: no isMemorySizeBudgeted
               fun loadAnimatedDrawable(context: Context, path: String): Any? {
                   return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                       try {
@@ -1352,6 +1351,7 @@ jobs:
           ) {
               val density = LocalDensity.current
               var containerSize by remember { mutableStateOf(Offset.Zero) }
+              val decayAnimationSpec = rememberSplineBasedDecay<Float>()
 
               val targetDimension = with(density) { (2200.dp.toPx()).toInt() }
               var bitmap by remember(file.absolutePath) { mutableStateOf<Bitmap?>(null) }
@@ -1427,7 +1427,7 @@ jobs:
                                   scope.launch {
                                       offsetXAnim.animateDecay(
                                           initialVelocity = velocity.x / currentScale,
-                                          animationSpec = splineBasedDecay(density)
+                                          animationSpec = decayAnimationSpec
                                       ) {
                                           val clamped = clampOffsets(currentScale, this.value, offsetYAnim.value)
                                           if (this.value != clamped.x) {
@@ -1438,7 +1438,7 @@ jobs:
                                   scope.launch {
                                       offsetYAnim.animateDecay(
                                           initialVelocity = velocity.y / currentScale,
-                                          animationSpec = splineBasedDecay(density)
+                                          animationSpec = decayAnimationSpec
                                       ) {
                                           val clamped = clampOffsets(currentScale, offsetXAnim.value, this.value)
                                           if (this.value != clamped.y) {
