@@ -153,7 +153,6 @@ jobs:
           import androidx.compose.foundation.gestures.awaitFirstDown
           import androidx.compose.foundation.gestures.calculatePan
           import androidx.compose.foundation.gestures.calculateZoom
-          import androidx.compose.foundation.gestures.waitForUpOrCancellation
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.LazyColumn
           import androidx.compose.foundation.lazy.items
@@ -968,59 +967,34 @@ jobs:
                   return Offset(x.coerceIn(-maxOffsetX, maxOffsetX), y.coerceIn(-maxOffsetY, maxOffsetY))
               }
 
+              fun animateTo(target: Float, offX: Float, offY: Float, durationMs: Int = 220) {
+                  scope.launch { scaleAnim.animateTo(target, animationSpec = tween(durationMs)) }
+                  scope.launch { offsetXAnim.animateTo(offX, animationSpec = tween(durationMs)) }
+                  scope.launch { offsetYAnim.animateTo(offY, animationSpec = tween(durationMs)) }
+              }
+
               Box(
                   modifier = Modifier
                       .fillMaxSize()
                       .onSizeChangedCompat { w, h -> containerSize = Offset(w.toFloat(), h.toFloat()) }
                       .pointerInput(file.absolutePath) {
+                          // Single unified gesture loop — handles tap, double-tap, pinch,
+                          // and pan all from one pointer event stream so nothing races.
                           awaitEachGesture {
                               val down = awaitFirstDown(requireUnconsumed = false)
+                              val downTime = System.currentTimeMillis()
+                              var moved = false
+                              var wasMultiTouch = false
 
-                              // Detect double-tap by watching for a second down within
-                              // the standard window, without a separate detector that
-                              // could race with the pan/zoom handling below.
-                              var isDoubleTap = false
-                              val firstUp = waitForUpOrCancellation()
-                              if (firstUp != null) {
-                                  val secondDownTimeout = withTimeoutOrNull(300L) {
-                                      awaitFirstDown(requireUnconsumed = false)
-                                  }
-                                  if (secondDownTimeout != null) {
-                                      isDoubleTap = true
-                                      waitForUpOrCancellation()
-                                  }
-                              }
-
-                              if (isDoubleTap) {
-                                  if (scaleAnim.value > minScale + 0.05f) {
-                                      scope.launch { scaleAnim.animateTo(minScale, animationSpec = tween(220)) }
-                                      scope.launch { offsetXAnim.animateTo(0f, animationSpec = tween(220)) }
-                                      scope.launch { offsetYAnim.animateTo(0f, animationSpec = tween(220)) }
-                                  } else {
-                                      val target = 3f
-                                      val cx = containerSize.x / 2f
-                                      val cy = containerSize.y / 2f
-                                      val tapPos = down.position
-                                      val newOffset = clampOffsets(target, cx - tapPos.x, cy - tapPos.y)
-                                      scope.launch { scaleAnim.animateTo(target, animationSpec = tween(220)) }
-                                      scope.launch { offsetXAnim.animateTo(newOffset.x, animationSpec = tween(220)) }
-                                      scope.launch { offsetYAnim.animateTo(newOffset.y, animationSpec = tween(220)) }
-                                  }
-                              } else if (firstUp != null) {
-                                  onTap()
-                              }
-                          }
-                      }
-                      .pointerInput(file.absolutePath) {
-                          awaitEachGesture {
-                              awaitFirstDown(requireUnconsumed = false)
                               do {
                                   val event = awaitPointerEvent()
                                   val zoomChange = event.calculateZoom()
                                   val panChange = event.calculatePan()
                                   val isMultiTouch = event.changes.size > 1
+                                  if (isMultiTouch) wasMultiTouch = true
 
                                   if (isMultiTouch || scaleAnim.value > minScale + 0.01f) {
+                                      if (panChange.getDistance() > 1f || zoomChange != 1f) moved = true
                                       val newScale = (scaleAnim.value * zoomChange).coerceIn(minScale, maxScale)
                                       val rawX = offsetXAnim.value + panChange.x / newScale
                                       val rawY = offsetYAnim.value + panChange.y / newScale
@@ -1032,13 +1006,40 @@ jobs:
                                   }
                               } while (event.changes.any { it.pressed })
 
-                              // Pinch released while zoomed below the minimum threshold —
-                              // snap back to 1x smoothly rather than leaving it stuck
-                              // at some in-between scale.
+                              // Settle a pinch that ended slightly under 1x back to exactly 1x.
                               if (scaleAnim.value < minScale + 0.02f && scaleAnim.value != minScale) {
-                                  scope.launch { scaleAnim.animateTo(minScale, animationSpec = tween(180)) }
-                                  scope.launch { offsetXAnim.animateTo(0f, animationSpec = tween(180)) }
-                                  scope.launch { offsetYAnim.animateTo(0f, animationSpec = tween(180)) }
+                                  animateTo(minScale, 0f, 0f, 180)
+                              }
+
+                              // Only treat this as a tap/double-tap candidate if the finger
+                              // didn't actually drag or pinch during this gesture.
+                              if (!moved && !wasMultiTouch) {
+                                  val elapsed = System.currentTimeMillis() - downTime
+                                  if (elapsed < 500) {
+                                      val secondDown = withTimeoutOrNull(300L) {
+                                          awaitFirstDown(requireUnconsumed = false)
+                                      }
+                                      if (secondDown != null) {
+                                          // Consume the rest of this second touch so it
+                                          // doesn't leak into the next gesture loop iteration.
+                                          do {
+                                              val e2 = awaitPointerEvent()
+                                              e2.changes.forEach { it.consume() }
+                                          } while (e2.changes.any { it.pressed })
+
+                                          if (scaleAnim.value > minScale + 0.05f) {
+                                              animateTo(minScale, 0f, 0f)
+                                          } else {
+                                              val target = 3f
+                                              val cx = containerSize.x / 2f
+                                              val cy = containerSize.y / 2f
+                                              val newOffset = clampOffsets(target, cx - down.position.x, cy - down.position.y)
+                                              animateTo(target, newOffset.x, newOffset.y)
+                                          }
+                                      } else {
+                                          onTap()
+                                      }
+                                  }
                               }
                           }
                       },
