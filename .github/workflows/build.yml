@@ -145,6 +145,8 @@ jobs:
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.compose.animation.AnimatedVisibility
           import androidx.compose.animation.core.Animatable
+          import androidx.compose.animation.core.animateDecay
+          import androidx.compose.animation.core.splineBasedDecay
           import androidx.compose.animation.core.tween
           import androidx.compose.animation.fadeIn
           import androidx.compose.animation.fadeOut
@@ -190,6 +192,8 @@ jobs:
           import androidx.compose.ui.graphics.asImageBitmap
           import androidx.compose.ui.graphics.graphicsLayer
           import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.input.pointer.util.VelocityTracker
+          import androidx.compose.ui.input.pointer.util.addPointerInputChange
           import androidx.compose.ui.layout.ContentScale
           import androidx.compose.ui.layout.layout
           import androidx.compose.ui.platform.LocalContext
@@ -668,6 +672,7 @@ jobs:
                                   directory = dir,
                                   onNavigate = { d -> currentDir = d },
                                   onJumpTo = { target -> currentDir = target },
+                                  onNavigateHome = { currentDir = null },
                                   onOpenImage = { images, index ->
                                       viewerImages = images
                                       viewerStartIndex = index
@@ -878,6 +883,7 @@ jobs:
               directory: File,
               onNavigate: (File) -> Unit,
               onJumpTo: (File) -> Unit,
+              onNavigateHome: () -> Unit,
               onOpenImage: (images: List<File>, index: Int) -> Unit,
               onOpenPanel: () -> Unit,
               bookmarkListVersion: Int,
@@ -899,7 +905,7 @@ jobs:
               val matchingRoot = storageRoots.firstOrNull { directory.absolutePath.startsWith(it.second.absolutePath) }
               val breadcrumbs = remember(directory) {
                   val list = mutableListOf<Pair<String, () -> Unit>>()
-                  list.add("Home" to { })
+                  list.add("Home" to onNavigateHome)
                   if (matchingRoot != null) {
                       val rootFile = matchingRoot.second
                       val relative = directory.absolutePath.removePrefix(rootFile.absolutePath).trim('/')
@@ -1031,13 +1037,39 @@ jobs:
                           contentScale = ContentScale.Crop,
                           modifier = Modifier.fillMaxSize()
                       )
-                  } else if (isDirectory) {
-                      Icon(
-                          imageVector = Icons.Filled.Folder,
-                          contentDescription = null,
-                          tint = Color(0xFF9A9A9A),
-                          modifier = Modifier.size(30.dp)
-                      )
+                  }
+
+                  if (isDirectory) {
+                      if (thumb != null) {
+                          Box(
+                              modifier = Modifier
+                                  .background(Color(0x99000000), RoundedCornerShape(6.dp))
+                                  .padding(horizontal = 8.dp, vertical = 3.dp)
+                          ) {
+                              Text(
+                                  text = "Folder",
+                                  color = Color.White,
+                                  fontSize = 9.sp,
+                                  fontWeight = FontWeight.Medium
+                              )
+                          }
+                      } else {
+                          Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                              Icon(
+                                  imageVector = Icons.Filled.Folder,
+                                  contentDescription = null,
+                                  tint = Color(0xFF9A9A9A),
+                                  modifier = Modifier.size(28.dp)
+                              )
+                              Spacer(Modifier.height(2.dp))
+                              Text(
+                                  text = "Folder",
+                                  color = Color(0xFFCCCCCC),
+                                  fontSize = 8.sp,
+                                  fontWeight = FontWeight.Medium
+                              )
+                          }
+                      }
                   } else {
                       Icon(
                           imageVector = Icons.Filled.InsertDriveFile,
@@ -1045,24 +1077,6 @@ jobs:
                           tint = Color(0xFFB0BEC5),
                           modifier = Modifier.size(34.dp)
                       )
-                  }
-
-                  if (isDirectory) {
-                      Box(
-                          modifier = Modifier
-                              .align(Alignment.BottomCenter)
-                              .fillMaxWidth()
-                              .height(16.dp)
-                              .background(Color(0x8C000000)),
-                          contentAlignment = Alignment.Center
-                      ) {
-                          Text(
-                              text = "Folder",
-                              color = Color.White,
-                              fontSize = 8.sp,
-                              fontWeight = FontWeight.Medium
-                          )
-                      }
                   }
               }
           }
@@ -1380,6 +1394,7 @@ jobs:
                               val downTime = System.currentTimeMillis()
                               var moved = false
                               var wasMultiTouch = false
+                              val velocityTracker = VelocityTracker()
 
                               do {
                                   val event = awaitPointerEvent()
@@ -1397,12 +1412,40 @@ jobs:
                                       scope.launch { scaleAnim.snapTo(newScale) }
                                       scope.launch { offsetXAnim.snapTo(clamped.x) }
                                       scope.launch { offsetYAnim.snapTo(clamped.y) }
-                                      event.changes.forEach { it.consume() }
+                                      event.changes.forEach {
+                                          velocityTracker.addPointerInputChange(it)
+                                          it.consume()
+                                      }
                                   }
                               } while (event.changes.any { it.pressed })
 
                               if (scaleAnim.value < minScale + 0.02f && scaleAnim.value != minScale) {
                                   animateTo(minScale, 0f, 0f, 180)
+                              } else if (moved && !wasMultiTouch && scaleAnim.value > minScale + 0.01f) {
+                                  val velocity = velocityTracker.calculateVelocity()
+                                  val currentScale = scaleAnim.value
+                                  scope.launch {
+                                      offsetXAnim.animateDecay(
+                                          initialVelocity = velocity.x / currentScale,
+                                          animationSpec = splineBasedDecay(density)
+                                      ) {
+                                          val clamped = clampOffsets(currentScale, this.value, offsetYAnim.value)
+                                          if (this.value != clamped.x) {
+                                              scope.launch { offsetXAnim.snapTo(clamped.x) }
+                                          }
+                                      }
+                                  }
+                                  scope.launch {
+                                      offsetYAnim.animateDecay(
+                                          initialVelocity = velocity.y / currentScale,
+                                          animationSpec = splineBasedDecay(density)
+                                      ) {
+                                          val clamped = clampOffsets(currentScale, offsetXAnim.value, this.value)
+                                          if (this.value != clamped.y) {
+                                              scope.launch { offsetYAnim.snapTo(clamped.y) }
+                                          }
+                                      }
+                                  }
                               }
 
                               if (!moved && !wasMultiTouch) {
