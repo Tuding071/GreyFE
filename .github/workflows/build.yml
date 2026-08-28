@@ -150,11 +150,9 @@ jobs:
           import androidx.compose.animation.fadeOut
           import androidx.compose.animation.slideInHorizontally
           import androidx.compose.animation.slideOutHorizontally
-          import androidx.compose.foundation.Canvas
           import androidx.compose.foundation.Image
           import androidx.compose.foundation.background
           import androidx.compose.foundation.clickable
-          import androidx.compose.foundation.combinedClickable
           import androidx.compose.foundation.gestures.awaitEachGesture
           import androidx.compose.foundation.gestures.awaitFirstDown
           import androidx.compose.foundation.gestures.calculatePan
@@ -162,10 +160,10 @@ jobs:
           import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
           import androidx.compose.foundation.horizontalScroll
           import androidx.compose.foundation.interaction.MutableInteractionSource
+          import androidx.compose.foundation.interaction.collectIsPressedAsState
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.LazyColumn
           import androidx.compose.foundation.lazy.items
-          import androidx.compose.foundation.lazy.rememberLazyListState
           import androidx.compose.foundation.pager.HorizontalPager
           import androidx.compose.foundation.pager.rememberPagerState
           import androidx.compose.foundation.rememberScrollState
@@ -191,7 +189,6 @@ jobs:
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.asImageBitmap
           import androidx.compose.ui.graphics.graphicsLayer
-          import androidx.compose.ui.graphics.toArgb
           import androidx.compose.ui.input.pointer.pointerInput
           import androidx.compose.ui.layout.ContentScale
           import androidx.compose.ui.layout.layout
@@ -211,6 +208,7 @@ jobs:
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.launch
           import kotlinx.coroutines.withContext
+          import kotlinx.coroutines.withTimeoutOrNull
           import java.io.File
           import java.io.FileOutputStream
           import java.lang.reflect.Method
@@ -272,9 +270,6 @@ jobs:
           }
 
           // ---------- Bookmarks ----------
-          // Persisted as an ordered, pipe-delimited list of absolute paths in
-          // SharedPreferences. "Home" (root/storage list) is implicit and always
-          // rendered first — it is never stored in this list.
           object Bookmarks {
               private const val PREFS = "bookmarks_prefs"
               private const val KEY = "bookmark_paths"
@@ -444,16 +439,12 @@ jobs:
                   } catch (e: Exception) { null }
               }
 
-              // Loads a GIF as an AnimatedImageDrawable (API 28+) for real animated
-              // playback in the viewer. On API 26-27 (below ImageDecoder availability)
-              // falls back to a static first-frame bitmap via BitmapFactory.
+              // CORRECTED: no isMemorySizeBudgeted
               fun loadAnimatedDrawable(context: Context, path: String): Any? {
                   return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                       try {
                           val source = ImageDecoder.createSource(File(path))
-                          ImageDecoder.decodeDrawable(source) { decoder, _, _ ->
-                              decoder.isMemorySizeBudgeted = true
-                          }
+                          ImageDecoder.decodeDrawable(source)
                       } catch (e: Exception) { null }
                   } else {
                       try { BitmapFactory.decodeFile(path) } catch (e: Exception) { null }
@@ -461,8 +452,7 @@ jobs:
               }
           }
 
-          // Reflection-based path extraction for StorageVolume — works across API levels
-          // including older ones where getDirectory()/getPath() aren't public API.
+          // Reflection-based path extraction for StorageVolume
           private fun storageVolumePath(volume: Any): File? {
               try {
                   val getDirectory: Method = volume.javaClass.getMethod("getDirectory")
@@ -533,7 +523,6 @@ jobs:
           @Composable
           fun FileExplorerApp() {
               val context = LocalContext.current
-              // null currentDir means "Home" (the storage roots list)
               var currentDir by remember { mutableStateOf<File?>(null) }
               var hasPermission by remember { mutableStateOf(hasStoragePermission(context)) }
               var refreshTrigger by remember { mutableStateOf(0) }
@@ -615,9 +604,6 @@ jobs:
                   onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
               }
 
-              // Relies on the system/hardware back button throughout, as requested —
-              // no in-app back arrow. Priority: close viewer > close panel > pop SAF
-              // stack > go up a directory (to Home when at a storage root).
               BackHandler(enabled = viewerImages != null || panelOpen || currentDir != null || safStack.size > 1) {
                   when {
                       viewerImages != null -> viewerImages = null
@@ -735,8 +721,6 @@ jobs:
               }
           }
 
-          // Header with: bookmarks button (left, replaces back arrow), scrollable
-          // tappable breadcrumb trail (center), three-dot menu (right, optional).
           @Composable
           fun ScreenHeader(
               breadcrumbs: List<Pair<String, () -> Unit>>,
@@ -865,9 +849,6 @@ jobs:
               }
           }
 
-          // Wraps a row with tap feedback: white background + black text while
-          // pressed, using combinedClickable's interaction source to detect press
-          // state without needing a separate gesture detector.
           @Composable
           fun TappableRow(onClick: () -> Unit, content: @Composable RowScope.() -> Unit) {
               val interactionSource = remember { MutableInteractionSource() }
@@ -893,9 +874,6 @@ jobs:
           }
 
           @Composable
-          fun collectIsPressedAsState() = Unit // placeholder removed below
-
-          @Composable
           fun FileListScreen(
               directory: File,
               onNavigate: (File) -> Unit,
@@ -917,8 +895,6 @@ jobs:
                   Bookmarks.isBookmarked(context, directory.absolutePath)
               }
 
-              // Build breadcrumb segments from root storage down to the current
-              // directory, each tappable to jump straight there.
               val storageRoots = remember { getStorageRoots(context) }
               val matchingRoot = storageRoots.firstOrNull { directory.absolutePath.startsWith(it.second.absolutePath) }
               val breadcrumbs = remember(directory) {
@@ -1321,8 +1297,7 @@ jobs:
           }
 
           // GIFs get a dedicated page using an Android ImageView driven by
-          // AnimatedImageDrawable so they actually play, instead of the static
-          // Compose Image used for other formats.
+          // AnimatedImageDrawable so they actually play
           @Composable
           fun GifPage(file: File, onTap: () -> Unit) {
               val context = LocalContext.current
