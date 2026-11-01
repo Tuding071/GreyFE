@@ -109,8 +109,6 @@ jobs:
           <resources>
               <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
                   <item name="android:windowBackground">#1E1E1E</item>
-                  <item name="android:navigationBarColor">#1E1E1E</item>
-                  <item name="android:statusBarColor">#1E1E1E</item>
               </style>
           </resources>
           ENDOFFILE
@@ -139,9 +137,11 @@ jobs:
           import android.webkit.MimeTypeMap
           import android.widget.Toast
           import androidx.activity.ComponentActivity
+          import androidx.activity.SystemBarStyle
           import androidx.activity.compose.BackHandler
           import androidx.activity.compose.rememberLauncherForActivityResult
           import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.compose.animation.AnimatedVisibility
           import androidx.compose.animation.core.Animatable
@@ -221,6 +221,10 @@ jobs:
           class MainActivity : ComponentActivity() {
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  enableEdgeToEdge(
+                      statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+                      navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                  )
                   setContent {
                       FileExplorerTheme {
                           FileExplorerApp()
@@ -634,52 +638,60 @@ jobs:
                               startIndex = viewerStartIndex,
                               onClose = { viewerImages = null }
                           )
-                      } else if (safRoot != null) {
-                          SafBrowserScreen(
-                              currentDoc = safStack.last(),
-                              onNavigate = { doc -> safStack = safStack + doc },
-                              onExit = {
-                                  safRoot = null
-                                  safStack = emptyList()
-                                  prefs.edit().remove("saf_uri").apply()
-                              },
-                              onOpenPanel = { panelOpen = true }
-                          )
-                      } else if (!hasPermission) {
-                          PermissionScreen(
-                              onGrant = {
-                                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                                      val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                                      intent.data = Uri.parse("package:${context.packageName}")
-                                      context.startActivity(intent)
-                                  } else {
-                                      permissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
-                                  }
-                              },
-                              onUseSaf = { safLauncher.launch(null) }
-                          )
                       } else {
-                          val dir = currentDir
-                          if (dir == null) {
-                              HomeScreen(
-                                  refreshKey = refreshTrigger,
-                                  onRootClick = { root -> currentDir = root },
-                                  onOpenPanel = { panelOpen = true }
-                              )
-                          } else {
-                              FileListScreen(
-                                  directory = dir,
-                                  onNavigate = { d -> currentDir = d },
-                                  onJumpTo = { target -> currentDir = target },
-                                  onNavigateHome = { currentDir = null },
-                                  onOpenImage = { images, index ->
-                                      viewerImages = images
-                                      viewerStartIndex = index
-                                  },
-                                  onOpenPanel = { panelOpen = true },
-                                  bookmarkListVersion = bookmarkListVersion,
-                                  onBookmarkChanged = { bookmarkListVersion++ }
-                              )
+                          Box(
+                              modifier = Modifier
+                                  .fillMaxSize()
+                                  .windowInsetsPadding(WindowInsets.systemBars)
+                          ) {
+                              if (safRoot != null) {
+                                  SafBrowserScreen(
+                                      currentDoc = safStack.last(),
+                                      onNavigate = { doc -> safStack = safStack + doc },
+                                      onExit = {
+                                          safRoot = null
+                                          safStack = emptyList()
+                                          prefs.edit().remove("saf_uri").apply()
+                                      },
+                                      onOpenPanel = { panelOpen = true }
+                                  )
+                              } else if (!hasPermission) {
+                                  PermissionScreen(
+                                      onGrant = {
+                                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                              val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                                              intent.data = Uri.parse("package:${context.packageName}")
+                                              context.startActivity(intent)
+                                          } else {
+                                              permissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
+                                          }
+                                      },
+                                      onUseSaf = { safLauncher.launch(null) }
+                                  )
+                              } else {
+                                  val dir = currentDir
+                                  if (dir == null) {
+                                      HomeScreen(
+                                          refreshKey = refreshTrigger,
+                                          onRootClick = { root -> currentDir = root },
+                                          onOpenPanel = { panelOpen = true }
+                                      )
+                                  } else {
+                                      FileListScreen(
+                                          directory = dir,
+                                          onNavigate = { d -> currentDir = d },
+                                          onJumpTo = { target -> currentDir = target },
+                                          onNavigateHome = { currentDir = null },
+                                          onOpenImage = { images, index ->
+                                              viewerImages = images
+                                              viewerStartIndex = index
+                                          },
+                                          onOpenPanel = { panelOpen = true },
+                                          bookmarkListVersion = bookmarkListVersion,
+                                          onBookmarkChanged = { bookmarkListVersion++ }
+                                      )
+                                  }
+                              }
                           }
                       }
 
@@ -1146,6 +1158,7 @@ jobs:
                               .fillMaxHeight()
                               .width(240.dp)
                               .background(Color(0xFF232323))
+                              .windowInsetsPadding(WindowInsets.systemBars)
                               .padding(vertical = 12.dp)
                       ) {
                           Text(
@@ -1280,6 +1293,7 @@ jobs:
                           modifier = Modifier
                               .fillMaxWidth()
                               .background(Color(0xAA000000))
+                              .windowInsetsPadding(WindowInsets.statusBars)
                               .padding(horizontal = 16.dp, vertical = 16.dp),
                           verticalAlignment = Alignment.CenterVertically
                       ) {
