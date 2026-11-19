@@ -134,6 +134,7 @@ jobs:
           import android.os.Build
           import android.os.Bundle
           import android.os.Environment
+          import android.os.StatFs
           import android.os.storage.StorageManager
           import android.provider.Settings
           import android.util.LruCache
@@ -222,6 +223,7 @@ jobs:
           import androidx.compose.ui.layout.ContentScale
           import androidx.compose.ui.layout.layout
           import androidx.compose.ui.layout.onGloballyPositioned
+          import androidx.compose.ui.layout.onSizeChanged
           import androidx.compose.ui.layout.positionInParent
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.platform.LocalDensity
@@ -339,7 +341,7 @@ jobs:
 
           // ---------- Formatting helpers ----------
           fun formatSize(bytes: Long): String {
-              val units = arrayOf("B", "KB", "MB", "GB")
+              val units = arrayOf("B", "KB", "MB", "GB", "TB")
               var value = bytes.toDouble()
               var idx = 0
               while (value >= 1024 && idx < units.size - 1) {
@@ -364,11 +366,10 @@ jobs:
 
           fun isTextName(name: String): Boolean = name.substringAfterLast('.', "").lowercase() in textExtensions
 
-          // ---------- Bookmarks (list capped at 15 items) ----------
+          // ---------- Bookmarks (no limit on how many) ----------
           object Bookmarks {
               private const val PREFS = "bookmarks_prefs"
               private const val KEY = "bookmark_paths"
-              const val MAX_ITEMS = 15
 
               fun getAll(context: Context): List<String> {
                   val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, "") ?: ""
@@ -377,14 +378,12 @@ jobs:
 
               fun isBookmarked(context: Context, path: String): Boolean = getAll(context).contains(path)
 
-              // Returns true when added, false when the list is full
-              fun add(context: Context, path: String): Boolean {
+              fun add(context: Context, path: String) {
                   val current = getAll(context).toMutableList()
-                  if (current.contains(path)) return true
-                  if (current.size >= MAX_ITEMS) return false
-                  current.add(path)
-                  save(context, current)
-                  return true
+                  if (!current.contains(path)) {
+                      current.add(path)
+                      save(context, current)
+                  }
               }
 
               fun remove(context: Context, path: String) {
@@ -423,7 +422,26 @@ jobs:
           // ---------- Tab model ----------
           // A tab is either Home (dir == null) or a folder.
           class TabState(val id: Long, initialDir: File?) {
-              var dir by mutableStateOf(initialDir)
+              private var currentDir by mutableStateOf<File?>(initialDir)
+
+              // Deepest folder of the current path. It stays after you go back (or tap Home), so the
+              // breadcrumbs can still show the trail ahead (muted). It is replaced as soon as you open
+              // a folder that is NOT on that trail (another branch, or another storage like the SD card).
+              var deepest by mutableStateOf<File?>(initialDir)
+                  private set
+
+              var dir: File?
+                  get() = currentDir
+                  set(value) {
+                      currentDir = value
+                      if (value != null) {
+                          val deep = deepest
+                          val keep = deep != null &&
+                              (deep.absolutePath == value.absolutePath ||
+                                  deep.absolutePath.startsWith(value.absolutePath.trimEnd('/') + "/"))
+                          if (!keep) deepest = value
+                      }
+                  }
           }
 
           // ---------- Entries and listings (read once, reused) ----------
@@ -899,7 +917,7 @@ jobs:
                                   .windowInsetsPadding(WindowInsets.systemBars)
                           ) {
                               ScreenHeader(
-                                  breadcrumbs = activeBreadcrumbs(context, tabs.getOrNull(activeIndex)?.dir, tabs.getOrNull(activeIndex)),
+                                  breadcrumbs = activeBreadcrumbs(context, tabs.getOrNull(activeIndex)),
                                   onOpenPanel = { panelOpen = true },
                                   menuOpen = menuOpen,
                                   onMenuToggle = { menuOpen = !menuOpen },
@@ -912,10 +930,9 @@ jobs:
                                               if (bookmarked) {
                                                   Bookmarks.remove(context, activeDir.absolutePath)
                                                   Toast.makeText(context, "Removed from bookmarks", Toast.LENGTH_SHORT).show()
-                                              } else if (Bookmarks.add(context, activeDir.absolutePath)) {
-                                                  Toast.makeText(context, "Added to bookmarks", Toast.LENGTH_SHORT).show()
                                               } else {
-                                                  Toast.makeText(context, "Bookmarks full (max ${Bookmarks.MAX_ITEMS})", Toast.LENGTH_SHORT).show()
+                                                  Bookmarks.add(context, activeDir.absolutePath)
+                                                  Toast.makeText(context, "Added to bookmarks", Toast.LENGTH_SHORT).show()
                                               }
                                               bookmarkListVersion++
                                               close()
@@ -1089,28 +1106,53 @@ jobs:
               }
           }
 
-          fun activeBreadcrumbs(context: Context, dir: File?, tab: TabState?): List<Pair<String, () -> Unit>> {
-              if (dir == null) return listOf("Home" to {})
-              val list = mutableListOf<Pair<String, () -> Unit>>()
-              val storageRoots = StorageRoots.get(context)
-              val matchingRoot = storageRoots.firstOrNull { dir.absolutePath.startsWith(it.second.absolutePath) }
-              list.add("Home" to { tab?.dir = null })
-              if (matchingRoot != null) {
-                  val rootFile = matchingRoot.second
-                  val relative = dir.absolutePath.removePrefix(rootFile.absolutePath).trim('/')
-                  list.add(matchingRoot.first to { tab?.dir = rootFile })
-                  if (relative.isNotEmpty()) {
-                      var acc = rootFile
-                      relative.split("/").forEach { segment ->
-                          acc = File(acc, segment)
-                          val target = acc
-                          list.add(segment to { tab?.dir = target })
+          // CURRENT = bright white, BEFORE = muted (the path behind you), TRAIL = more muted (the
+          // path ahead that you came back from, remembered until you open a different folder).
+          enum class CrumbKind { BEFORE, CURRENT, TRAIL }
+
+          class Crumb(val label: String, val kind: CrumbKind, val onClick: () -> Unit)
+
+          fun activeBreadcrumbs(context: Context, tab: TabState?): List<Crumb> {
+              if (tab == null) return emptyList()
+              val dir = tab.dir
+              val shown = tab.deepest ?: dir
+
+              // label, folder it points to (null for Home), what a tap does
+              val items = mutableListOf<Triple<String, File?, () -> Unit>>()
+              items.add(Triple("Home", null, { tab.dir = null }))
+              if (shown != null) {
+                  val matchingRoot = StorageRoots.get(context).firstOrNull { shown.absolutePath.startsWith(it.second.absolutePath) }
+                  if (matchingRoot != null) {
+                      val rootFile = matchingRoot.second
+                      val relative = shown.absolutePath.removePrefix(rootFile.absolutePath).trim('/')
+                      items.add(Triple(matchingRoot.first, rootFile, { tab.dir = rootFile }))
+                      if (relative.isNotEmpty()) {
+                          var acc = rootFile
+                          relative.split("/").forEach { segment ->
+                              acc = File(acc, segment)
+                              val target = acc
+                              items.add(Triple(segment, target, { tab.dir = target }))
+                          }
                       }
+                  } else {
+                      items.add(Triple(shown.name, shown, { tab.dir = shown }))
                   }
-              } else {
-                  list.add(dir.name to { })
               }
-              return list
+
+              val currentIdx = if (dir == null) {
+                  0
+              } else {
+                  val found = items.indexOfFirst { it.second?.absolutePath == dir.absolutePath }
+                  if (found < 0) items.lastIndex else found
+              }
+              return items.mapIndexed { i, item ->
+                  val kind = when {
+                      i < currentIdx -> CrumbKind.BEFORE
+                      i == currentIdx -> CrumbKind.CURRENT
+                      else -> CrumbKind.TRAIL
+                  }
+                  Crumb(item.first, kind, item.third)
+              }
           }
 
           // Tabs: a thick white line slides under the current tab. The + sits on the same line as the titles.
@@ -1130,6 +1172,22 @@ jobs:
               val indicatorX = remember { Animatable(0f) }
               val indicatorW = remember { Animatable(0f) }
               val plusPressed = remember { mutableStateOf(false) }
+              val tabScroll = rememberScrollState()
+              var tabViewportPx by remember { mutableStateOf(0) }
+
+              // Drop positions of tabs that were closed
+              LaunchedEffect(tabs.size) {
+                  bounds.keys.removeAll { it >= tabs.size }
+              }
+
+              // Keep the current tab visible: scroll the row so it sits in the middle.
+              // Needed when many tabs are open (5, 8, more) and the current one would be off screen.
+              val activeBounds = bounds[activeIndex]
+              LaunchedEffect(activeIndex, activeBounds, tabViewportPx, tabs.size) {
+                  val b = activeBounds ?: return@LaunchedEffect
+                  val want = (b.first + b.second / 2f - tabViewportPx / 2f).roundToInt().coerceIn(0, tabScroll.maxValue)
+                  tabScroll.animateScrollTo(want, tween(200))
+              }
 
               val target = bounds[activeIndex]
               LaunchedEffect(target) {
@@ -1158,7 +1216,8 @@ jobs:
                   Box(
                       modifier = Modifier
                           .weight(1f)
-                          .horizontalScroll(rememberScrollState())
+                          .onSizeChanged { tabViewportPx = it.width }
+                          .horizontalScroll(tabScroll)
                   ) {
                       Row(verticalAlignment = Alignment.Top) {
                           tabs.forEachIndexed { index, tab ->
@@ -1339,16 +1398,22 @@ jobs:
               }
           }
 
-          // One breadcrumb segment with a bigger touch area and the press effect
+          // One breadcrumb segment with a bigger touch area and the press effect.
+          // Current folder = bright white, the rest = muted (like the size and date text).
           @Composable
-          fun BreadcrumbText(label: String, onClick: () -> Unit) {
+          fun BreadcrumbText(label: String, kind: CrumbKind, modifier: Modifier = Modifier, onClick: () -> Unit) {
               val pressed = remember { mutableStateOf(false) }
+              val base = when (kind) {
+                  CrumbKind.CURRENT -> Color.White
+                  CrumbKind.BEFORE -> Color.White.copy(alpha = 0.75f)
+                  CrumbKind.TRAIL -> Color.White.copy(alpha = 0.5f)
+              }
               Text(
                   text = label,
-                  color = if (pressed.value) Color.Black else Color.White,
+                  color = if (pressed.value) Color.Black else base,
                   fontSize = 14.4.sp,
                   maxLines = 1,
-                  modifier = Modifier
+                  modifier = modifier
                       .background(if (pressed.value) Color.White else Color.Transparent)
                       .pressFlash(pressed, onClick)
                       .padding(horizontal = 3.dp, vertical = 8.dp)
@@ -1358,7 +1423,7 @@ jobs:
           // Header: 10% taller than before. Icons and breadcrumbs 20% bigger.
           @Composable
           fun ScreenHeader(
-              breadcrumbs: List<Pair<String, () -> Unit>>,
+              breadcrumbs: List<Crumb>,
               onOpenPanel: () -> Unit,
               menuOpen: Boolean,
               onMenuToggle: () -> Unit,
@@ -1366,9 +1431,17 @@ jobs:
               menuContent: (@Composable (closeMenu: () -> Unit) -> Unit)? = null
           ) {
               val scrollState = rememberScrollState()
+              var viewportPx by remember { mutableStateOf(0) }
+              // Position and width of each breadcrumb, in pixels, measured after layout
+              val crumbBounds = remember { mutableStateMapOf<Int, Pair<Float, Float>>() }
 
-              LaunchedEffect(breadcrumbs.size) {
-                  scrollState.scrollTo(scrollState.maxValue)
+              // Keep the current folder visible: scroll so it sits in the middle (like the tabs)
+              val currentIdx = breadcrumbs.indexOfFirst { it.kind == CrumbKind.CURRENT }.coerceAtLeast(0)
+              val currentBounds = crumbBounds[currentIdx]
+              LaunchedEffect(currentIdx, currentBounds, viewportPx, breadcrumbs.size) {
+                  val b = currentBounds ?: return@LaunchedEffect
+                  val want = (b.first + b.second / 2f - viewportPx / 2f).roundToInt().coerceIn(0, scrollState.maxValue)
+                  scrollState.animateScrollTo(want, tween(200))
               }
 
               Row(
@@ -1384,18 +1457,26 @@ jobs:
                   Row(
                       modifier = Modifier
                           .weight(1f)
+                          .onSizeChanged { viewportPx = it.width }
                           .horizontalScroll(scrollState),
                       verticalAlignment = Alignment.CenterVertically
                   ) {
-                      breadcrumbs.forEachIndexed { index, (label, onClick) ->
+                      breadcrumbs.forEachIndexed { index, crumb ->
                           if (index > 0) {
                               Text(
                                   text = " / ",
-                                  color = Color.White,
+                                  color = Color.White.copy(alpha = if (crumb.kind == CrumbKind.TRAIL) 0.4f else 0.6f),
                                   fontSize = 14.4.sp
                               )
                           }
-                          BreadcrumbText(label = label, onClick = onClick)
+                          BreadcrumbText(
+                              label = crumb.label,
+                              kind = crumb.kind,
+                              modifier = Modifier.onGloballyPositioned { c ->
+                                  crumbBounds[index] = c.positionInParent().x to c.size.width.toFloat()
+                              },
+                              onClick = crumb.onClick
+                          )
                       }
                   }
 
@@ -1545,7 +1626,37 @@ jobs:
                                       modifier = Modifier.size(56.dp)
                                   )
                                   Spacer(Modifier.width(16.dp))
-                                  Text(text = label, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                                  Column {
+                                      Text(text = label, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                                      // Total, free and free percentage. Read in the background (SD cards can be slow).
+                                      val stats by produceState<Pair<Long, Long>?>(
+                                          initialValue = null,
+                                          key1 = root.absolutePath,
+                                          key2 = refreshKey
+                                      ) {
+                                          value = withContext(Dispatchers.IO) {
+                                              try {
+                                                  val s = StatFs(root.absolutePath)
+                                                  s.totalBytes to s.availableBytes
+                                              } catch (e: Exception) { null }
+                                          }
+                                      }
+                                      val info = stats
+                                      val infoText = if (info == null) {
+                                          "Reading storage..."
+                                      } else {
+                                          val total = info.first
+                                          val free = info.second
+                                          val pct = if (total > 0) (free * 100 / total).toInt() else 0
+                                          "${formatSize(total)} total · ${formatSize(free)} free ($pct%)"
+                                      }
+                                      Text(
+                                          text = infoText,
+                                          color = androidx.compose.material3.LocalContentColor.current.copy(alpha = 0.55f),
+                                          fontSize = 12.sp,
+                                          maxLines = 1
+                                      )
+                                  }
                               }
                           }
                       }
