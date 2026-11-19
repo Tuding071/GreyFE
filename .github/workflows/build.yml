@@ -160,6 +160,7 @@ jobs:
           import androidx.compose.foundation.gestures.calculatePan
           import androidx.compose.foundation.gestures.calculateZoom
           import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+          import androidx.compose.foundation.gestures.detectHorizontalDragGestures
           import androidx.compose.foundation.horizontalScroll
           import androidx.compose.foundation.interaction.MutableInteractionSource
           import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -171,8 +172,7 @@ jobs:
           import androidx.compose.foundation.rememberScrollState
           import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.material.icons.Icons
-          import androidx.compose.material.icons.filled.Bookmark
-          import androidx.compose.material.icons.filled.BookmarkBorder
+          import androidx.compose.material.icons.filled.Add
           import androidx.compose.material.icons.filled.Close
           import androidx.compose.material.icons.filled.DragHandle
           import androidx.compose.material.icons.filled.Folder
@@ -203,9 +203,9 @@ jobs:
           import androidx.compose.ui.unit.sp
           import androidx.compose.ui.viewinterop.AndroidView
           import androidx.compose.ui.window.Popup
+          import androidx.compose.ui.window.PopupProperties
           import androidx.core.content.ContextCompat
           import androidx.core.content.FileProvider
-          import androidx.documentfile.provider.DocumentFile
           import androidx.lifecycle.Lifecycle
           import androidx.lifecycle.LifecycleEventObserver
           import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -277,10 +277,11 @@ jobs:
               return parts
           }
 
-          // ---------- Bookmarks ----------
+          // ---------- Bookmarks (max 15) ----------
           object Bookmarks {
               private const val PREFS = "bookmarks_prefs"
               private const val KEY = "bookmark_paths"
+              const val MAX_ITEMS = 15
 
               fun getAll(context: Context): List<String> {
                   val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, "") ?: ""
@@ -291,7 +292,7 @@ jobs:
 
               fun add(context: Context, path: String) {
                   val current = getAll(context).toMutableList()
-                  if (!current.contains(path)) {
+                  if (!current.contains(path) && current.size < MAX_ITEMS) {
                       current.add(path)
                       save(context, current)
                   }
@@ -304,13 +305,36 @@ jobs:
               }
 
               fun reorder(context: Context, newOrder: List<String>) {
-                  save(context, newOrder)
+                  save(context, newOrder.take(MAX_ITEMS))
               }
 
               private fun save(context: Context, list: List<String>) {
                   context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                       .edit().putString(KEY, list.joinToString("|")).apply()
               }
+          }
+
+          // ---------- Saved tabs ----------
+          object SavedTabs {
+              private const val PREFS = "tabs_prefs"
+              private const val KEY = "saved_tabs"
+              const val HOME_TOKEN = "__HOME__"
+
+              fun load(context: Context): List<String> {
+                  val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, "") ?: ""
+                  return if (raw.isBlank()) emptyList() else raw.split("|")
+              }
+
+              fun save(context: Context, tabs: List<String>) {
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      .edit().putString(KEY, tabs.joinToString("|")).apply()
+              }
+          }
+
+          // ---------- Tab model ----------
+          // A tab is either Home (dir == null) or a folder.
+          class TabState(val id: Long, initialDir: File?) {
+              var dir by mutableStateOf(initialDir)
           }
 
           // ---------- Thumbnail cache ----------
@@ -530,65 +554,51 @@ jobs:
           @Composable
           fun FileExplorerApp() {
               val context = LocalContext.current
-              var currentDir by remember { mutableStateOf<File?>(null) }
               var hasPermission by remember { mutableStateOf(hasStoragePermission(context)) }
               var refreshTrigger by remember { mutableStateOf(0) }
 
-              var safRoot by remember { mutableStateOf<DocumentFile?>(null) }
-              var safStack by remember { mutableStateOf<List<DocumentFile>>(emptyList()) }
+              // Tabs
+              val tabs = remember { mutableStateListOf<TabState>() }
+              var nextTabId by remember { mutableStateOf(1L) }
+              var activeIndex by remember { mutableStateOf(0) }
+              var pendingCloseIndex by remember { mutableStateOf(-1) }
 
               var viewerImages by remember { mutableStateOf<List<File>?>(null) }
               var viewerStartIndex by remember { mutableStateOf(0) }
 
               var panelOpen by remember { mutableStateOf(false) }
+              var menuOpen by remember { mutableStateOf(false) }
               var bookmarkListVersion by remember { mutableStateOf(0) }
 
-              val prefs = context.getSharedPreferences("saf_prefs", Context.MODE_PRIVATE)
+              fun newTab(dir: File?) {
+                  tabs.add(TabState(nextTabId, dir))
+                  nextTabId++
+                  activeIndex = tabs.size - 1
+              }
+
+              // Restore saved tabs, or start with a single Home tab
+              LaunchedEffect(Unit) {
+                  if (tabs.isEmpty()) {
+                      val saved = SavedTabs.load(context)
+                      if (saved.isNotEmpty()) {
+                          saved.forEach { token ->
+                              if (token == SavedTabs.HOME_TOKEN) newTab(null)
+                              else newTab(File(token))
+                          }
+                      } else {
+                          newTab(null)
+                      }
+                  }
+              }
 
               val permissionLauncher = rememberLauncherForActivityResult(
                   ActivityResultContracts.RequestPermission()
-              ) { granted ->
+              ) { _ ->
                   hasPermission = hasStoragePermission(context)
               }
 
-              val safLauncher = rememberLauncherForActivityResult(
-                  ActivityResultContracts.OpenDocumentTree()
-              ) { uri ->
-                  if (uri != null) {
-                      try {
-                          val doc = DocumentFile.fromTreeUri(context, uri)
-                          if (doc != null && doc.canRead()) {
-                              context.contentResolver.takePersistableUriPermission(
-                                  uri,
-                                  Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                              )
-                              prefs.edit().putString("saf_uri", uri.toString()).apply()
-                              safRoot = doc
-                              safStack = listOf(doc)
-                          }
-                      } catch (e: Exception) {
-                          Toast.makeText(context, "Cannot access selected folder", Toast.LENGTH_SHORT).show()
-                      }
-                  }
-              }
-
-              LaunchedEffect(Unit) {
-                  val savedUriString = prefs.getString("saf_uri", null)
-                  if (savedUriString != null) {
-                      try {
-                          val uri = Uri.parse(savedUriString)
-                          val doc = DocumentFile.fromTreeUri(context, uri)
-                          if (doc != null && doc.canRead()) {
-                              safRoot = doc
-                              safStack = listOf(doc)
-                          } else {
-                              prefs.edit().remove("saf_uri").apply()
-                          }
-                      } catch (e: Exception) {
-                          prefs.edit().remove("saf_uri").apply()
-                      }
-                  }
-                  if (!hasPermission) {
+              if (!hasPermission) {
+                  LaunchedEffect(Unit) {
                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                           val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
                           intent.data = Uri.parse("package:${context.packageName}")
@@ -611,17 +621,18 @@ jobs:
                   onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
               }
 
-              BackHandler(enabled = viewerImages != null || panelOpen || currentDir != null || safStack.size > 1) {
+              BackHandler(enabled = viewerImages != null || panelOpen || menuOpen || tabs.size > 1 || tabs.getOrNull(activeIndex)?.dir != null) {
                   when {
                       viewerImages != null -> viewerImages = null
+                      menuOpen -> menuOpen = false
                       panelOpen -> panelOpen = false
-                      safStack.size > 1 -> safStack = safStack.dropLast(1)
-                      currentDir != null -> {
-                          val parent = currentDir!!.parentFile
-                          currentDir = if (parent != null && getStorageRoots(context).any { it.second.absolutePath == currentDir!!.absolutePath }) {
-                              null
-                          } else {
-                              parent
+                      else -> {
+                          val tab = tabs.getOrNull(activeIndex) ?: return@BackHandler
+                          val d = tab.dir
+                          if (d != null) {
+                              val parent = d.parentFile
+                              val isRoot = getStorageRoots(context).any { it.second.absolutePath == d.absolutePath }
+                              tab.dir = if (parent != null && !isRoot) parent else null
                           }
                       }
                   }
@@ -638,60 +649,138 @@ jobs:
                               startIndex = viewerStartIndex,
                               onClose = { viewerImages = null }
                           )
-                      } else {
+                      } else if (!hasPermission) {
                           Box(
                               modifier = Modifier
                                   .fillMaxSize()
                                   .windowInsetsPadding(WindowInsets.systemBars)
                           ) {
-                              if (safRoot != null) {
-                                  SafBrowserScreen(
-                                      currentDoc = safStack.last(),
-                                      onNavigate = { doc -> safStack = safStack + doc },
-                                      onExit = {
-                                          safRoot = null
-                                          safStack = emptyList()
-                                          prefs.edit().remove("saf_uri").apply()
-                                      },
-                                      onOpenPanel = { panelOpen = true }
-                                  )
-                              } else if (!hasPermission) {
-                                  PermissionScreen(
-                                      onGrant = {
-                                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                                              val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                                              intent.data = Uri.parse("package:${context.packageName}")
-                                              context.startActivity(intent)
-                                          } else {
-                                              permissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
+                              PermissionScreen(
+                                  onGrant = {
+                                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                          val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                                          intent.data = Uri.parse("package:${context.packageName}")
+                                          context.startActivity(intent)
+                                      } else {
+                                          permissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
+                                      }
+                                  }
+                              )
+                          }
+                      } else {
+                          Column(
+                              modifier = Modifier
+                                  .fillMaxSize()
+                                  .windowInsetsPadding(WindowInsets.systemBars)
+                          ) {
+                              ScreenHeader(
+                                  breadcrumbs = activeBreadcrumbs(context, tabs.getOrNull(activeIndex)?.dir, tabs.getOrNull(activeIndex)),
+                                  onOpenPanel = { panelOpen = true },
+                                  menuOpen = menuOpen,
+                                  onMenuToggle = { menuOpen = !menuOpen },
+                                  onMenuDismiss = { menuOpen = false },
+                                  menuContent = { close ->
+                                      val activeDir = tabs.getOrNull(activeIndex)?.dir
+                                      if (activeDir != null) {
+                                          val bookmarked = Bookmarks.isBookmarked(context, activeDir.absolutePath)
+                                          MenuRow(text = if (bookmarked) "Remove bookmark" else "Add to bookmarks") {
+                                              if (bookmarked) Bookmarks.remove(context, activeDir.absolutePath)
+                                              else Bookmarks.add(context, activeDir.absolutePath)
+                                              bookmarkListVersion++
+                                              close()
                                           }
-                                      },
-                                      onUseSaf = { safLauncher.launch(null) }
-                                  )
-                              } else {
-                                  val dir = currentDir
-                                  if (dir == null) {
-                                      HomeScreen(
-                                          refreshKey = refreshTrigger,
-                                          onRootClick = { root -> currentDir = root },
-                                          onOpenPanel = { panelOpen = true }
-                                      )
-                                  } else {
-                                      FileListScreen(
-                                          directory = dir,
-                                          onNavigate = { d -> currentDir = d },
-                                          onJumpTo = { target -> currentDir = target },
-                                          onNavigateHome = { currentDir = null },
-                                          onOpenImage = { images, index ->
-                                              viewerImages = images
-                                              viewerStartIndex = index
-                                          },
-                                          onOpenPanel = { panelOpen = true },
-                                          bookmarkListVersion = bookmarkListVersion,
-                                          onBookmarkChanged = { bookmarkListVersion++ }
-                                      )
+                                      }
+                                      MenuRow(text = "Save tabs") {
+                                          val tokens = tabs.map { it.dir?.absolutePath ?: SavedTabs.HOME_TOKEN }
+                                          SavedTabs.save(context, tokens)
+                                          Toast.makeText(context, "Tabs saved", Toast.LENGTH_SHORT).show()
+                                          close()
+                                      }
+                                  }
+                              )
+
+                              TabRow(
+                                  tabs = tabs,
+                                  activeIndex = activeIndex,
+                                  onSelect = { activeIndex = it },
+                                  onRequestClose = { pendingCloseIndex = it },
+                                  onSwipeAddTab = { newTab(null) }
+                              )
+
+                              // Content: swipe left/right switches tabs
+                              Box(
+                                  modifier = Modifier
+                                      .fillMaxSize()
+                                      .pointerInput(tabs.size, activeIndex) {
+                                          var total = 0f
+                                          detectHorizontalDragGestures(
+                                              onDragStart = { total = 0f },
+                                              onDragEnd = {
+                                                  if (total < -120f && activeIndex < tabs.size - 1) {
+                                                      activeIndex++
+                                                  } else if (total > 120f && activeIndex > 0) {
+                                                      activeIndex--
+                                                  }
+                                              },
+                                              onHorizontalDrag = { change, dragAmount ->
+                                                  change.consume()
+                                                  total += dragAmount
+                                              }
+                                          )
+                                      }
+                              ) {
+                                  val tab = tabs.getOrNull(activeIndex)
+                                  if (tab != null) {
+                                      val dir = tab.dir
+                                      if (dir == null) {
+                                          HomeScreen(
+                                              refreshKey = refreshTrigger,
+                                              onRootClick = { root -> tab.dir = root }
+                                          )
+                                      } else {
+                                          FileListScreen(
+                                              directory = dir,
+                                              onNavigate = { d -> tab.dir = d },
+                                              onJumpTo = { target -> tab.dir = target },
+                                              onNavigateHome = { tab.dir = null },
+                                              onOpenImage = { images, index ->
+                                                  viewerImages = images
+                                                  viewerStartIndex = index
+                                              },
+                                              bookmarkListVersion = bookmarkListVersion
+                                          )
+                                      }
                                   }
                               }
+                          }
+
+                          // Pending close confirmation
+                          if (pendingCloseIndex >= 0 && pendingCloseIndex < tabs.size) {
+                              val idx = pendingCloseIndex
+                              AlertDialog(
+                                  onDismissRequest = { pendingCloseIndex = -1 },
+                                  title = { Text("Close tab?") },
+                                  text = { Text("Close \"${tabTitle(context, tabs[idx].dir)}\"?") },
+                                  confirmButton = {
+                                      TextButton(onClick = {
+                                          tabs.removeAt(idx)
+                                          if (tabs.isEmpty()) {
+                                              newTab(null)
+                                          } else if (activeIndex >= tabs.size) {
+                                              activeIndex = tabs.size - 1
+                                          } else if (activeIndex > idx) {
+                                              activeIndex--
+                                          }
+                                          pendingCloseIndex = -1
+                                      }) { Text("Close", color = Color(0xFFEF9A9A)) }
+                                  },
+                                  dismissButton = {
+                                      TextButton(onClick = { pendingCloseIndex = -1 }) { Text("Cancel") }
+                                  },
+                                  containerColor = Color(0xFF2A2A2A),
+                                  titleContentColor = Color.White,
+                                  textContentColor = Color.White
+                              )
                           }
                       }
 
@@ -700,11 +789,11 @@ jobs:
                           listVersion = bookmarkListVersion,
                           onDismiss = { panelOpen = false },
                           onNavigateHome = {
-                              currentDir = null
+                              tabs.getOrNull(activeIndex)?.dir = null
                               panelOpen = false
                           },
                           onNavigateTo = { path ->
-                              currentDir = File(path)
+                              tabs.getOrNull(activeIndex)?.dir = File(path)
                               panelOpen = false
                           },
                           onReorder = { newOrder ->
@@ -716,8 +805,100 @@ jobs:
               }
           }
 
+          fun tabTitle(context: Context, dir: File?): String {
+              return if (dir == null) "Home" else (dir.name.ifEmpty { dir.absolutePath })
+          }
+
+          fun activeBreadcrumbs(context: Context, dir: File?, tab: TabState?): List<Pair<String, () -> Unit>> {
+              if (dir == null) return listOf("Home" to {})
+              val list = mutableListOf<Pair<String, () -> Unit>>()
+              val storageRoots = getStorageRoots(context)
+              val matchingRoot = storageRoots.firstOrNull { dir.absolutePath.startsWith(it.second.absolutePath) }
+              list.add("Home" to { tab?.dir = null })
+              if (matchingRoot != null) {
+                  val rootFile = matchingRoot.second
+                  val relative = dir.absolutePath.removePrefix(rootFile.absolutePath).trim('/')
+                  list.add(matchingRoot.first to { tab?.dir = rootFile })
+                  if (relative.isNotEmpty()) {
+                      var acc = rootFile
+                      relative.split("/").forEach { segment ->
+                          acc = File(acc, segment)
+                          val target = acc
+                          list.add(segment to { tab?.dir = target })
+                      }
+                  }
+              } else {
+                  list.add(dir.name to { })
+              }
+              return list
+          }
+
           @Composable
-          fun PermissionScreen(onGrant: () -> Unit, onUseSaf: () -> Unit) {
+          fun TabRow(
+              tabs: List<TabState>,
+              activeIndex: Int,
+              onSelect: (Int) -> Unit,
+              onRequestClose: (Int) -> Unit,
+              onSwipeAddTab: () -> Unit
+          ) {
+              val context = LocalContext.current
+              var swipeTotal by remember { mutableStateOf(0f) }
+              Row(
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .background(Color(0xFF232323))
+                      .pointerInput(tabs.size) {
+                          detectHorizontalDragGestures(
+                              onDragStart = { swipeTotal = 0f },
+                              onDragEnd = { if (swipeTotal < -120f) onSwipeAddTab() },
+                              onHorizontalDrag = { change, dragAmount ->
+                                  change.consume()
+                                  swipeTotal += dragAmount
+                              }
+                          )
+                      }
+                      .horizontalScroll(rememberScrollState())
+                      .padding(horizontal = 6.dp, vertical = 6.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  tabs.forEachIndexed { index, tab ->
+                      val selected = index == activeIndex
+                      Row(
+                          modifier = Modifier
+                              .padding(end = 6.dp)
+                              .clip(RoundedCornerShape(8.dp))
+                              .background(if (selected) Color(0xFF3A3A3A) else Color(0xFF2A2A2A))
+                              .clickable { onSelect(index) }
+                              .padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          Text(
+                              text = tabTitle(context, tab.dir),
+                              color = if (selected) Color.White else Color(0xFFB0B0B0),
+                              fontSize = 13.sp,
+                              maxLines = 1,
+                              modifier = Modifier.widthIn(max = 140.dp)
+                          )
+                          Spacer(Modifier.width(6.dp))
+                          Icon(
+                              imageVector = Icons.Filled.Close,
+                              contentDescription = "Close tab",
+                              tint = Color(0xFFB0B0B0),
+                              modifier = Modifier.size(16.dp).clickable { onRequestClose(index) }
+                          )
+                      }
+                  }
+                  Icon(
+                      imageVector = Icons.Filled.Add,
+                      contentDescription = "New tab",
+                      tint = Color(0xFF90CAF9),
+                      modifier = Modifier.size(22.dp).clickable { onSwipeAddTab() }
+                  )
+              }
+          }
+
+          @Composable
+          fun PermissionScreen(onGrant: () -> Unit) {
               Column(
                   modifier = Modifier.fillMaxSize(),
                   horizontalAlignment = Alignment.CenterHorizontally,
@@ -730,10 +911,6 @@ jobs:
                   Button(onClick = onGrant, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0))) {
                       Text("Grant Access", color = Color.White, fontSize = 16.sp)
                   }
-                  Spacer(Modifier.height(12.dp))
-                  TextButton(onClick = onUseSaf) {
-                      Text("Use SAF instead", color = Color(0xFF4FC3F7), fontSize = 14.sp)
-                  }
               }
           }
 
@@ -741,9 +918,11 @@ jobs:
           fun ScreenHeader(
               breadcrumbs: List<Pair<String, () -> Unit>>,
               onOpenPanel: () -> Unit,
+              menuOpen: Boolean,
+              onMenuToggle: () -> Unit,
+              onMenuDismiss: () -> Unit,
               menuContent: (@Composable (closeMenu: () -> Unit) -> Unit)? = null
           ) {
-              var menuOpen by remember { mutableStateOf(false) }
               val scrollState = rememberScrollState()
 
               LaunchedEffect(breadcrumbs.size) {
@@ -774,7 +953,7 @@ jobs:
                       breadcrumbs.forEachIndexed { index, (label, onClick) ->
                           if (index > 0) {
                               Text(
-                                  text = " \u203a ",
+                                  text = " › ",
                                   color = Color(0xFF777777),
                                   fontSize = 12.sp
                               )
@@ -797,16 +976,37 @@ jobs:
                               imageVector = Icons.Filled.MoreVert,
                               contentDescription = "Menu",
                               tint = Color.White,
-                              modifier = Modifier.size(22.dp).clickable { menuOpen = true }
+                              modifier = Modifier.size(22.dp).clickable { onMenuToggle() }
                           )
                           if (menuOpen) {
-                              Popup(onDismissRequest = { menuOpen = false }) {
-                                  Column(
+                              // Full-screen transparent scrim: any touch outside the menu closes it
+                              Popup(
+                                  onDismissRequest = onMenuDismiss,
+                                  properties = PopupProperties(focusable = true, dismissOnBackPress = true, dismissOnClickOutside = true)
+                              ) {
+                                  Box(
                                       modifier = Modifier
-                                          .background(Color(0xFF333333), RoundedCornerShape(8.dp))
-                                          .padding(vertical = 4.dp)
+                                          .fillMaxSize()
+                                          .clickable(
+                                              interactionSource = remember { MutableInteractionSource() },
+                                              indication = null,
+                                              onClick = onMenuDismiss
+                                          ),
                                   ) {
-                                      menuContent { menuOpen = false }
+                                      Column(
+                                          modifier = Modifier
+                                              .align(Alignment.TopEnd)
+                                              .padding(top = 56.dp, end = 8.dp)
+                                              .background(Color(0xFF333333), RoundedCornerShape(8.dp))
+                                              .padding(vertical = 4.dp)
+                                              .clickable(
+                                                  interactionSource = remember { MutableInteractionSource() },
+                                                  indication = null,
+                                                  onClick = {}
+                                              )
+                                      ) {
+                                          menuContent?.invoke(onMenuDismiss)
+                                      }
                                   }
                               }
                           }
@@ -830,15 +1030,12 @@ jobs:
           @Composable
           fun HomeScreen(
               refreshKey: Int,
-              onRootClick: (File) -> Unit,
-              onOpenPanel: () -> Unit
+              onRootClick: (File) -> Unit
           ) {
               val context = LocalContext.current
               val roots = remember(refreshKey) { getStorageRoots(context) }
 
               Column(Modifier.fillMaxSize()) {
-                  ScreenHeader(breadcrumbs = listOf("Home" to {}), onOpenPanel = onOpenPanel)
-
                   if (roots.isEmpty()) {
                       Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                           Text("No storage found", color = Color.White, fontSize = 16.sp)
@@ -896,9 +1093,7 @@ jobs:
               onJumpTo: (File) -> Unit,
               onNavigateHome: () -> Unit,
               onOpenImage: (images: List<File>, index: Int) -> Unit,
-              onOpenPanel: () -> Unit,
-              bookmarkListVersion: Int,
-              onBookmarkChanged: () -> Unit
+              bookmarkListVersion: Int
           ) {
               val context = LocalContext.current
               val files = remember(directory) {
@@ -908,50 +1103,7 @@ jobs:
               }
               val imagesInDir = remember(files) { files.filter { it.isFile && ThumbnailCache.isImage(it.name) } }
 
-              val bookmarked = remember(directory, bookmarkListVersion) {
-                  Bookmarks.isBookmarked(context, directory.absolutePath)
-              }
-
-              val storageRoots = remember { getStorageRoots(context) }
-              val matchingRoot = storageRoots.firstOrNull { directory.absolutePath.startsWith(it.second.absolutePath) }
-              val breadcrumbs = remember(directory) {
-                  val list = mutableListOf<Pair<String, () -> Unit>>()
-                  list.add("Home" to onNavigateHome)
-                  if (matchingRoot != null) {
-                      val rootFile = matchingRoot.second
-                      val relative = directory.absolutePath.removePrefix(rootFile.absolutePath).trim('/')
-                      list.add(matchingRoot.first to { onJumpTo(rootFile) })
-                      if (relative.isNotEmpty()) {
-                          var acc = rootFile
-                          relative.split("/").forEach { segment ->
-                              acc = File(acc, segment)
-                              val target = acc
-                              list.add(segment to { onJumpTo(target) })
-                          }
-                      }
-                  } else {
-                      list.add(directory.name to { })
-                  }
-                  list
-              }
-
               Column(Modifier.fillMaxSize()) {
-                  ScreenHeader(
-                      breadcrumbs = breadcrumbs,
-                      onOpenPanel = onOpenPanel,
-                      menuContent = { close ->
-                          MenuRow(text = if (bookmarked) "Remove bookmark" else "Add to bookmarks") {
-                              if (bookmarked) {
-                                  Bookmarks.remove(context, directory.absolutePath)
-                              } else {
-                                  Bookmarks.add(context, directory.absolutePath)
-                              }
-                              onBookmarkChanged()
-                              close()
-                          }
-                      }
-                  )
-
                   if (files.isEmpty()) {
                       Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                           Text("Empty folder", color = Color.White, fontSize = 16.sp)
@@ -972,58 +1124,6 @@ jobs:
                                       else -> openFile(context, file)
                                   }
                               })
-                          }
-                      }
-                  }
-              }
-          }
-
-          @Composable
-          fun SafBrowserScreen(
-              currentDoc: DocumentFile,
-              onNavigate: (DocumentFile) -> Unit,
-              onExit: () -> Unit,
-              onOpenPanel: () -> Unit
-          ) {
-              val context = LocalContext.current
-              val children = remember(currentDoc) {
-                  currentDoc.listFiles()
-                      .sortedWith(compareBy<DocumentFile> { it.isDirectory }.thenBy(naturalOrderComparator) { it.name ?: "" })
-              }
-
-              Column(Modifier.fillMaxSize()) {
-                  ScreenHeader(
-                      breadcrumbs = listOf((currentDoc.name ?: "Selected Folder") to {}),
-                      onOpenPanel = onOpenPanel,
-                      menuContent = { close ->
-                          MenuRow(text = "Close folder access") {
-                              onExit()
-                              close()
-                          }
-                      }
-                  )
-
-                  if (children.isEmpty()) {
-                      Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                          Text("Empty folder", color = Color.White, fontSize = 16.sp)
-                      }
-                  } else {
-                      LazyColumn(
-                          modifier = Modifier.fillMaxSize(),
-                          contentPadding = PaddingValues(8.dp)
-                      ) {
-                          items(children) { doc ->
-                              TappableRow(onClick = {
-                                  if (doc.isDirectory) {
-                                      onNavigate(doc)
-                                  } else {
-                                      openFile(context, doc.uri)
-                                  }
-                              }) {
-                                  FileThumbBox(isDirectory = doc.isDirectory, thumb = null)
-                                  Spacer(Modifier.width(16.dp))
-                                  Text(doc.name ?: "Unknown", fontSize = 15.sp, maxLines = 1)
-                              }
                           }
                       }
                   }
@@ -1113,6 +1213,7 @@ jobs:
           }
 
           // ---------- Bookmarks side panel ----------
+          // Press and hold the WHOLE row to drag; it follows the finger until release.
           @Composable
           fun BookmarksPanel(
               visible: Boolean,
@@ -1126,6 +1227,7 @@ jobs:
               var order by remember(listVersion) { mutableStateOf(Bookmarks.getAll(context)) }
               var draggingIndex by remember { mutableStateOf(-1) }
               var dragOffsetY by remember { mutableStateOf(0f) }
+              val rowHeightPx = with(LocalDensity.current) { 44.dp.toPx() }
 
               if (!visible && draggingIndex == -1) return
 
@@ -1169,7 +1271,7 @@ jobs:
                               modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                           )
 
-                          // Home — pinned, not draggable, always first.
+                          // Home: pinned, first, not draggable
                           TappableRow(onClick = onNavigateHome) {
                               Icon(
                                   imageVector = Icons.Filled.Home,
@@ -1193,26 +1295,16 @@ jobs:
                                           translationY = if (isDragging) dragOffsetY else 0f
                                       }
                                       .background(if (isDragging) Color(0xFF2F2F2F) else Color.Transparent)
-                                      .clickable { onNavigateTo(path) }
-                                      .padding(horizontal = 16.dp, vertical = 10.dp),
-                                  verticalAlignment = Alignment.CenterVertically
-                              ) {
-                                  Icon(
-                                      imageVector = Icons.Filled.DragHandle,
-                                      contentDescription = "Reorder",
-                                      tint = Color(0xFF666666),
-                                      modifier = Modifier
-                                          .size(18.dp)
-                                          .pointerInput(order) {
-                                              detectDragGesturesAfterLongPress(
-                                                  onDragStart = {
-                                                      draggingIndex = index
-                                                      dragOffsetY = 0f
-                                                  },
-                                                  onDrag = { change, dragAmount ->
-                                                      change.consume()
-                                                      dragOffsetY += dragAmount.y
-                                                      val rowHeightPx = 40f
+                                      .pointerInput(order) {
+                                          detectDragGesturesAfterLongPress(
+                                              onDragStart = {
+                                                  draggingIndex = index
+                                                  dragOffsetY = 0f
+                                              },
+                                              onDrag = { change, dragAmount ->
+                                                  change.consume()
+                                                  dragOffsetY += dragAmount.y
+                                                  if (draggingIndex >= 0) {
                                                       val moveBy = (dragOffsetY / rowHeightPx).toInt()
                                                       if (moveBy != 0) {
                                                           val newIndex = (draggingIndex + moveBy).coerceIn(0, order.size - 1)
@@ -1222,21 +1314,31 @@ jobs:
                                                               mutable.add(newIndex, item)
                                                               order = mutable
                                                               draggingIndex = newIndex
-                                                              dragOffsetY = 0f
+                                                              dragOffsetY -= moveBy * rowHeightPx
                                                           }
                                                       }
-                                                  },
-                                                  onDragEnd = {
-                                                      draggingIndex = -1
-                                                      dragOffsetY = 0f
-                                                      onReorder(order)
-                                                  },
-                                                  onDragCancel = {
-                                                      draggingIndex = -1
-                                                      dragOffsetY = 0f
                                                   }
-                                              )
-                                          }
+                                              },
+                                              onDragEnd = {
+                                                  draggingIndex = -1
+                                                  dragOffsetY = 0f
+                                                  onReorder(order)
+                                              },
+                                              onDragCancel = {
+                                                  draggingIndex = -1
+                                                  dragOffsetY = 0f
+                                              }
+                                          )
+                                      }
+                                      .clickable { onNavigateTo(path) }
+                                      .padding(horizontal = 16.dp, vertical = 10.dp),
+                                  verticalAlignment = Alignment.CenterVertically
+                              ) {
+                                  Icon(
+                                      imageVector = Icons.Filled.DragHandle,
+                                      contentDescription = null,
+                                      tint = Color(0xFF666666),
+                                      modifier = Modifier.size(18.dp)
                                   )
                                   Spacer(Modifier.width(8.dp))
                                   Text(name, color = Color.White, fontSize = 14.sp, maxLines = 1, modifier = Modifier.weight(1f))
@@ -1527,11 +1629,6 @@ jobs:
           fun openFile(context: Context, file: File) {
               val uri = FileProvider.getUriForFile(context, context.packageName + ".fileprovider", file)
               val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
-              openUri(context, uri, mime)
-          }
-
-          fun openFile(context: Context, uri: Uri) {
-              val mime = context.contentResolver.getType(uri) ?: "*/*"
               openUri(context, uri, mime)
           }
 
