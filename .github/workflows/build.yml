@@ -136,6 +136,7 @@ jobs:
           import android.os.Environment
           import android.os.storage.StorageManager
           import android.provider.Settings
+          import android.util.LruCache
           import android.webkit.MimeTypeMap
           import android.widget.Toast
           import androidx.activity.ComponentActivity
@@ -146,7 +147,6 @@ jobs:
           import androidx.activity.enableEdgeToEdge
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.compose.animation.AnimatedContent
-          import androidx.compose.animation.AnimatedVisibility
           import androidx.compose.animation.core.Animatable
           import androidx.compose.animation.core.RepeatMode
           import androidx.compose.animation.core.animateDecay
@@ -191,8 +191,8 @@ jobs:
           import androidx.compose.material.icons.filled.PhoneAndroid
           import androidx.compose.material.icons.filled.SdCard
           import androidx.compose.material3.AlertDialog
-          import androidx.compose.material3.ButtonDefaults
           import androidx.compose.material3.Button
+          import androidx.compose.material3.ButtonDefaults
           import androidx.compose.material3.CircularProgressIndicator
           import androidx.compose.material3.ExperimentalMaterial3Api
           import androidx.compose.material3.Icon
@@ -215,11 +215,13 @@ jobs:
           import androidx.compose.ui.input.pointer.util.addPointerInputChange
           import androidx.compose.ui.layout.ContentScale
           import androidx.compose.ui.layout.layout
+          import androidx.compose.ui.layout.onGloballyPositioned
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.platform.LocalDensity
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.Dp
+          import androidx.compose.ui.unit.IntOffset
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
           import androidx.compose.ui.viewinterop.AndroidView
@@ -242,6 +244,7 @@ jobs:
           import java.text.SimpleDateFormat
           import java.util.Date
           import java.util.Locale
+          import kotlin.math.roundToInt
 
           class MainActivity : ComponentActivity() {
               override fun onCreate(savedInstanceState: Bundle?) {
@@ -269,7 +272,7 @@ jobs:
               }
           }
 
-          // ---------- Natural sort ----------
+          // ---------- Natural sort helpers ----------
           val naturalOrderComparator = Comparator<String> { a, b ->
               val ax = splitNatural(a.lowercase())
               val bx = splitNatural(b.lowercase())
@@ -302,6 +305,28 @@ jobs:
               return parts
           }
 
+          // ---------- Sorting ----------
+          enum class SortMode(val label: String, val key: String) {
+              NAME_AZ("Name (A-Z)", "name_az"),
+              NAME_ZA("Name (Z-A)", "name_za"),
+              NEWEST("Time (newest first)", "newest"),
+              OLDEST("Time (oldest first)", "oldest");
+
+              companion object {
+                  fun fromKey(key: String?): SortMode = values().firstOrNull { it.key == key } ?: NAME_AZ
+              }
+          }
+
+          object SortPrefs {
+              private const val PREFS = "sort_prefs"
+              private const val KEY = "sort_mode"
+              fun load(context: Context): SortMode =
+                  SortMode.fromKey(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, null))
+              fun save(context: Context, mode: SortMode) {
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY, mode.key).apply()
+              }
+          }
+
           // ---------- Formatting helpers ----------
           fun formatSize(bytes: Long): String {
               val units = arrayOf("B", "KB", "MB", "GB")
@@ -314,8 +339,11 @@ jobs:
               return if (idx == 0) "$bytes B" else String.format(Locale.US, "%.1f %s", value, units[idx])
           }
 
-          fun formatDate(millis: Long): String =
-              SimpleDateFormat("d MMM yyyy, HH:mm", Locale.getDefault()).format(Date(millis))
+          private val dateFormat = ThreadLocal.withInitial {
+              SimpleDateFormat("d MMM yyyy, HH:mm", Locale.getDefault())
+          }
+
+          fun formatDate(millis: Long): String = dateFormat.get()!!.format(Date(millis))
 
           val textExtensions = setOf(
               "txt", "yml", "yaml", "java", "kt", "kts", "xml", "json", "md", "csv", "tsv",
@@ -324,10 +352,9 @@ jobs:
               "php", "rb", "bat", "ps1", "lua", "srt", "vtt"
           )
 
-          fun isTextFile(file: File): Boolean =
-              file.isFile && file.extension.lowercase() in textExtensions
+          fun isTextName(name: String): Boolean = name.substringAfterLast('.', "").lowercase() in textExtensions
 
-          // ---------- Bookmarks (shown list capped at 15 items) ----------
+          // ---------- Bookmarks (list capped at 15 items) ----------
           object Bookmarks {
               private const val PREFS = "bookmarks_prefs"
               private const val KEY = "bookmark_paths"
@@ -387,13 +414,69 @@ jobs:
               var dir by mutableStateOf(initialDir)
           }
 
-          // Wrapper so each reload is a new object and always triggers state updates
-          class Listing(val files: List<File>)
+          // ---------- Entries and listings (read once, reused) ----------
+          // Every file's size, folder flag and date are read once here, not on each draw.
+          class Entry(val file: File, val name: String, val isDir: Boolean, val size: Long, val modified: Long)
 
-          // ---------- Thumbnail cache ----------
+          // Wrapper so every reload is a new object and always triggers state updates
+          class Listing(val entries: List<Entry>)
+
+          fun readEntries(dir: File): List<Entry> {
+              val arr = dir.listFiles() ?: return emptyList()
+              return arr.map { f ->
+                  val isDir = f.isDirectory
+                  Entry(f, f.name, isDir, if (isDir) 0L else f.length(), f.lastModified())
+              }
+          }
+
+          fun sortEntries(list: List<Entry>, mode: SortMode): List<Entry> {
+              val cmp: Comparator<Entry> = when (mode) {
+                  SortMode.NAME_AZ -> Comparator { a, b -> naturalOrderComparator.compare(a.name, b.name) }
+                  SortMode.NAME_ZA -> Comparator { a, b -> naturalOrderComparator.compare(b.name, a.name) }
+                  SortMode.NEWEST -> compareByDescending { it.modified }
+                  SortMode.OLDEST -> compareBy { it.modified }
+              }
+              // Folders always first, then files, both sorted by the chosen mode
+              return list.filter { it.isDir }.sortedWith(cmp) + list.filter { !it.isDir }.sortedWith(cmp)
+          }
+
+          // Memory cache of recent folder listings, so going back is instant
+          object DirCache {
+              private val map = LinkedHashMap<String, Listing>()
+
+              @Synchronized
+              fun get(path: String): Listing? = map[path]
+
+              @Synchronized
+              fun put(path: String, listing: Listing) {
+                  map.remove(path)
+                  map[path] = listing
+                  while (map.size > 40) map.remove(map.keys.first())
+              }
+          }
+
+          // Folder item counts, read in the background and remembered
+          object FolderCount {
+              private val map = HashMap<String, Int>()
+
+              @Synchronized
+              fun cached(path: String): Int? = map[path]
+
+              fun load(dir: File): Int {
+                  val n = dir.listFiles()?.size ?: 0
+                  synchronized(this) { map[dir.absolutePath] = n }
+                  return n
+              }
+          }
+
+          // ---------- Thumbnail cache (disk + memory) ----------
           object ThumbnailCache {
               private const val MAX_THUMBS = 500
               private const val THUMB_SIZE = 240
+
+              private val memory = object : LruCache<String, Bitmap>(12 * 1024 * 1024) {
+                  override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+              }
 
               private fun thumbDir(context: Context): File {
                   val dir = File(context.cacheDir, "thumbs")
@@ -418,28 +501,20 @@ jobs:
                   return ext in setOf("mp4", "mkv", "webm", "3gp", "mov", "avi", "m4v")
               }
 
-              suspend fun getThumbnail(context: Context, file: File): Bitmap? = withContext(Dispatchers.IO) {
-                  if (!file.isFile) return@withContext null
+              suspend fun getThumbnail(context: Context, file: File, modified: Long): Bitmap? = withContext(Dispatchers.IO) {
                   val name = file.name
                   if (!isImage(name) && !isVideo(name)) return@withContext null
-                  loadOrGenerate(context, keyFor("${file.absolutePath}:${file.lastModified()}")) {
+                  val key = keyFor("${file.absolutePath}:$modified")
+                  memory.get(key)?.let { return@withContext it }
+                  val bmp = loadOrGenerate(context, key) {
                       when {
                           isImage(name) -> decodeSampledImage(file.absolutePath, THUMB_SIZE)
                           isVideo(name) -> extractVideoFrame(file.absolutePath)
                           else -> null
                       }
                   }
-              }
-
-              suspend fun getFolderThumbnail(context: Context, dir: File): Bitmap? = withContext(Dispatchers.IO) {
-                  val firstImage = try {
-                      dir.listFiles()?.filter { it.isFile && isImage(it.name) }
-                          ?.minByOrNull { it.name.lowercase() }
-                  } catch (e: Exception) { null } ?: return@withContext null
-
-                  loadOrGenerate(context, keyFor("folder:${dir.absolutePath}:${firstImage.name}:${firstImage.lastModified()}")) {
-                      decodeSampledImage(firstImage.absolutePath, THUMB_SIZE)
-                  }
+                  if (bmp != null) memory.put(key, bmp)
+                  bmp
               }
 
               private fun loadOrGenerate(context: Context, key: String, generate: () -> Bitmap?): Bitmap? {
@@ -604,10 +679,29 @@ jobs:
               return roots.distinctBy { it.second.absolutePath }
           }
 
+          // Storage roots are looked up once and reused; cleared when the app resumes
+          object StorageRoots {
+              private var cache: List<Pair<String, File>>? = null
+
+              @Synchronized
+              fun get(context: Context): List<Pair<String, File>> =
+                  cache ?: getStorageRoots(context).also { cache = it }
+
+              @Synchronized
+              fun clear() { cache = null }
+          }
+
           // Returns true when a path lives on internal storage (used for bookmark icons)
           fun isInternalPath(context: Context, path: String): Boolean {
-              val root = getStorageRoots(context).firstOrNull { path.startsWith(it.second.absolutePath) }
+              val root = StorageRoots.get(context).firstOrNull { path.startsWith(it.second.absolutePath) }
               return root == null || root.first == "Internal Storage"
+          }
+
+          // Tab and breadcrumb names: storage roots use their label (so "0" becomes "Internal Storage")
+          fun tabTitle(context: Context, dir: File?): String {
+              if (dir == null) return "Home"
+              val root = StorageRoots.get(context).firstOrNull { it.second.absolutePath == dir.absolutePath }
+              return root?.first ?: dir.name.ifEmpty { dir.absolutePath }
           }
 
           @Composable
@@ -615,6 +709,7 @@ jobs:
               val context = LocalContext.current
               var hasPermission by remember { mutableStateOf(hasStoragePermission(context)) }
               var refreshTrigger by remember { mutableStateOf(0) }
+              var sortMode by remember { mutableStateOf(SortPrefs.load(context)) }
 
               // Tabs
               val tabs = remember { mutableStateListOf<TabState>() }
@@ -673,6 +768,7 @@ jobs:
                   val observer = LifecycleEventObserver { _, event ->
                       if (event == Lifecycle.Event.ON_RESUME) {
                           hasPermission = hasStoragePermission(context)
+                          StorageRoots.clear()
                           refreshTrigger++
                       }
                   }
@@ -690,7 +786,7 @@ jobs:
                           val d = tab.dir
                           if (d != null) {
                               val parent = d.parentFile
-                              val isRoot = getStorageRoots(context).any { it.second.absolutePath == d.absolutePath }
+                              val isRoot = StorageRoots.get(context).any { it.second.absolutePath == d.absolutePath }
                               tab.dir = if (parent != null && !isRoot) parent else null
                           }
                       }
@@ -755,10 +851,24 @@ jobs:
                                           Toast.makeText(context, "Tabs saved", Toast.LENGTH_SHORT).show()
                                           close()
                                       }
+                                      Text(
+                                          text = "Sort",
+                                          color = Color.White.copy(alpha = 0.55f),
+                                          fontSize = 11.sp,
+                                          modifier = Modifier.padding(start = 16.dp, top = 8.dp, bottom = 2.dp)
+                                      )
+                                      SortMode.values().forEach { mode ->
+                                          MenuRow(text = (if (mode == sortMode) "✓  " else "     ") + mode.label) {
+                                              sortMode = mode
+                                              SortPrefs.save(context, mode)
+                                              close()
+                                          }
+                                      }
                                   }
                               )
 
                               TabRow(
+                                  context = context,
                                   tabs = tabs,
                                   activeIndex = activeIndex,
                                   onSelect = { activeIndex = it },
@@ -808,12 +918,16 @@ jobs:
                                           if (dir == null) {
                                               HomeScreen(
                                                   refreshKey = refreshTrigger,
-                                                  onRefresh = { refreshTrigger++ },
+                                                  onRefresh = {
+                                                      StorageRoots.clear()
+                                                      refreshTrigger++
+                                                  },
                                                   onRootClick = { root -> tab.dir = root }
                                               )
                                           } else {
                                               FileListScreen(
                                                   directory = dir,
+                                                  sortMode = sortMode,
                                                   onNavigate = { d -> tab.dir = d },
                                                   onOpenImage = { images, index ->
                                                       viewerImages = images
@@ -832,7 +946,7 @@ jobs:
                               AlertDialog(
                                   onDismissRequest = { pendingCloseIndex = -1 },
                                   title = { Text("Close tab?") },
-                                  text = { Text("Close \"${tabTitle(tabs[idx].dir)}\"?") },
+                                  text = { Text("Close \"${tabTitle(context, tabs[idx].dir)}\"?") },
                                   confirmButton = {
                                       TextButton(onClick = {
                                           tabs.removeAt(idx)
@@ -856,6 +970,7 @@ jobs:
                           }
                       }
 
+                      // Bookmarks panel: opens and closes with no animation
                       BookmarksPanel(
                           visible = panelOpen,
                           listVersion = bookmarkListVersion,
@@ -877,14 +992,10 @@ jobs:
               }
           }
 
-          fun tabTitle(dir: File?): String {
-              return if (dir == null) "Home" else (dir.name.ifEmpty { dir.absolutePath })
-          }
-
           fun activeBreadcrumbs(context: Context, dir: File?, tab: TabState?): List<Pair<String, () -> Unit>> {
               if (dir == null) return listOf("Home" to {})
               val list = mutableListOf<Pair<String, () -> Unit>>()
-              val storageRoots = getStorageRoots(context)
+              val storageRoots = StorageRoots.get(context)
               val matchingRoot = storageRoots.firstOrNull { dir.absolutePath.startsWith(it.second.absolutePath) }
               list.add("Home" to { tab?.dir = null })
               if (matchingRoot != null) {
@@ -905,16 +1016,31 @@ jobs:
               return list
           }
 
-          // Tabs: no boxes. Current tab has a thick white line under it.
+          // Tabs: a thick white line slides under the current tab. The + sits on the same line as the titles.
           @Composable
           fun TabRow(
+              context: Context,
               tabs: List<TabState>,
               activeIndex: Int,
               onSelect: (Int) -> Unit,
               onRequestClose: (Int) -> Unit,
               onSwipeAddTab: () -> Unit
           ) {
+              val density = LocalDensity.current
               var swipeTotal by remember { mutableStateOf(0f) }
+              // Position and width of each tab, in pixels, measured after layout
+              val bounds = remember { mutableStateMapOf<Int, Pair<Float, Float>>() }
+              val indicatorX = remember { Animatable(0f) }
+              val indicatorW = remember { Animatable(0f) }
+
+              val target = bounds[activeIndex]
+              LaunchedEffect(target) {
+                  if (target != null) {
+                      launch { indicatorX.animateTo(target.first, tween(260)) }
+                      launch { indicatorW.animateTo(target.second, tween(260)) }
+                  }
+              }
+
               Row(
                   modifier = Modifier
                       .fillMaxWidth()
@@ -928,54 +1054,89 @@ jobs:
                                   swipeTotal += dragAmount
                               }
                           )
-                      }
-                      .horizontalScroll(rememberScrollState()),
-                  verticalAlignment = Alignment.CenterVertically
+                      },
+                  verticalAlignment = Alignment.Top
               ) {
-                  tabs.forEachIndexed { index, tab ->
-                      val selected = index == activeIndex
-                      Column(
-                          modifier = Modifier
-                              .clickable { onSelect(index) }
-                              .padding(start = 12.dp, end = 8.dp, top = 8.dp)
-                      ) {
-                          Row(verticalAlignment = Alignment.CenterVertically) {
-                              Text(
-                                  text = tabTitle(tab.dir),
-                                  color = if (selected) Color.White else Color(0xFF9A9A9A),
-                                  fontSize = 13.sp,
-                                  fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                                  maxLines = 1,
-                                  modifier = Modifier.widthIn(max = 140.dp)
-                              )
-                              Spacer(Modifier.width(8.dp))
-                              Icon(
-                                  imageVector = Icons.Filled.Close,
-                                  contentDescription = "Close tab",
-                                  tint = Color(0xFF9A9A9A),
-                                  modifier = Modifier
-                                      .size(16.dp)
-                                      .clickable { onRequestClose(index) }
-                              )
-                          }
-                          Spacer(Modifier.height(8.dp))
-                          Box(
-                              modifier = Modifier
-                                  .fillMaxWidth()
-                                  .height(4.dp)
-                                  .background(if (selected) Color.White else Color.Transparent)
-                          )
-                      }
-                  }
-                  Icon(
-                      imageVector = Icons.Filled.Add,
-                      contentDescription = "New tab",
-                      tint = Color(0xFF90CAF9),
+                  Box(
                       modifier = Modifier
-                          .padding(start = 8.dp, top = 8.dp)
-                          .size(22.dp)
+                          .weight(1f)
+                          .horizontalScroll(rememberScrollState())
+                  ) {
+                      Row(verticalAlignment = Alignment.Top) {
+                          tabs.forEachIndexed { index, tab ->
+                              val selected = index == activeIndex
+                              Column(
+                                  modifier = Modifier
+                                      .widthIn(min = 96.dp)
+                                      .onGloballyPositioned { coords ->
+                                          bounds[index] = coords.positionInParent().x to coords.size.width.toFloat()
+                                      }
+                                      .padding(start = 12.dp, end = 4.dp, top = 8.dp)
+                              ) {
+                                  Row(
+                                      modifier = Modifier.height(28.dp),
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      Text(
+                                          text = tabTitle(context, tab.dir),
+                                          color = if (selected) Color.White else Color(0xFF9A9A9A),
+                                          fontSize = 13.sp,
+                                          fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                          maxLines = 1,
+                                          overflow = TextOverflow.Ellipsis,
+                                          modifier = Modifier
+                                              .weight(1f, fill = false)
+                                              .widthIn(max = 140.dp)
+                                              .clickable { onSelect(index) }
+                                      )
+                                      Spacer(Modifier.width(6.dp))
+                                      // Larger tap area for the x, so it is hard to hit by accident
+                                      Box(
+                                          modifier = Modifier
+                                              .size(32.dp)
+                                              .clickable { onRequestClose(index) },
+                                          contentAlignment = Alignment.Center
+                                      ) {
+                                          Icon(
+                                              imageVector = Icons.Filled.Close,
+                                              contentDescription = "Close tab",
+                                              tint = Color(0xFF9A9A9A),
+                                              modifier = Modifier.size(16.dp)
+                                          )
+                                      }
+                                  }
+                                  Spacer(Modifier.height(6.dp))
+                              }
+                          }
+                      }
+
+                      // Sliding indicator under the current tab
+                      Box(
+                          modifier = Modifier
+                              .align(Alignment.BottomStart)
+                              .offset { IntOffset(indicatorX.value.roundToInt(), 0) }
+                              .width(with(density) { indicatorW.value.toDp() })
+                              .height(4.dp)
+                              .background(Color.White)
+                      )
+                  }
+
+                  // + button on the same line as the tab titles
+                  Box(
+                      modifier = Modifier
+                          .padding(top = 8.dp)
+                          .height(28.dp)
                           .clickable { onSwipeAddTab() }
-                  )
+                          .padding(horizontal = 10.dp),
+                      contentAlignment = Alignment.Center
+                  ) {
+                      Icon(
+                          imageVector = Icons.Filled.Add,
+                          contentDescription = "New tab",
+                          tint = Color(0xFF90CAF9),
+                          modifier = Modifier.size(22.dp)
+                      )
+                  }
               }
           }
 
@@ -1150,7 +1311,7 @@ jobs:
           ) {
               val context = LocalContext.current
               var refreshing by remember { mutableStateOf(false) }
-              val roots = remember(refreshKey) { getStorageRoots(context) }
+              val roots = remember(refreshKey) { StorageRoots.get(context) }
 
               LaunchedEffect(refreshKey) {
                   if (refreshing) {
@@ -1219,33 +1380,50 @@ jobs:
 
           // File list: edge to edge, 15 rows fill the screen at minimum height,
           // rows grow up to 3 name lines. Shows skeleton rows while loading.
+          // Uses the memory cache first, so revisiting a folder is instant.
           @OptIn(ExperimentalMaterial3Api::class)
           @Composable
           fun FileListScreen(
               directory: File,
+              sortMode: SortMode,
               onNavigate: (File) -> Unit,
               onOpenImage: (images: List<File>, index: Int) -> Unit
           ) {
               val context = LocalContext.current
               var loadKey by remember { mutableStateOf(0) }
               var refreshing by remember { mutableStateOf(false) }
+              var listing by remember(directory) { mutableStateOf(DirCache.get(directory.absolutePath)) }
 
-              val listing by produceState<Listing?>(initialValue = null, directory, loadKey) {
-                  value = withContext(Dispatchers.IO) {
-                      Listing(
-                          directory.listFiles()
-                              ?.sortedWith(compareBy<File> { it.isFile }.thenBy(naturalOrderComparator) { it.name })
-                              ?: emptyList()
-                      )
+              // Read in the background; the cached copy (if any) stays on screen until the fresh one arrives
+              LaunchedEffect(directory, loadKey) {
+                  val fresh = withContext(Dispatchers.IO) {
+                      Listing(readEntries(directory)).also { DirCache.put(directory.absolutePath, it) }
                   }
+                  listing = fresh
               }
 
               LaunchedEffect(listing) {
                   if (listing != null) refreshing = false
               }
 
-              val files = listing?.files
-              val imagesInDir = remember(files) { files?.filter { it.isFile && ThumbnailCache.isImage(it.name) } ?: emptyList() }
+              // Preload the first few sub-folders so opening them is faster
+              LaunchedEffect(listing) {
+                  val subs = listing?.entries?.filter { it.isDir }?.take(3) ?: emptyList()
+                  subs.forEach { e ->
+                      withContext(Dispatchers.IO) {
+                          if (DirCache.get(e.file.absolutePath) == null) {
+                              DirCache.put(e.file.absolutePath, Listing(readEntries(e.file)))
+                          }
+                      }
+                  }
+              }
+
+              val sorted = remember(listing, sortMode) {
+                  listing?.let { sortEntries(it.entries, sortMode) }
+              }
+              val imagesInDir = remember(sorted) {
+                  sorted?.filter { !it.isDir && ThumbnailCache.isImage(it.name) }?.map { it.file } ?: emptyList()
+              }
 
               PullToRefreshBox(
                   isRefreshing = refreshing,
@@ -1258,27 +1436,27 @@ jobs:
                   BoxWithConstraints(Modifier.fillMaxSize()) {
                       val rowMin: Dp = maxHeight / 15
 
-                      if (files == null) {
+                      if (sorted == null) {
                           SkeletonRows(count = 15, rowHeight = rowMin)
-                      } else if (files.isEmpty()) {
+                      } else if (sorted.isEmpty()) {
                           Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                               Text("Empty folder", color = Color.White, fontSize = 16.sp)
                           }
                       } else {
                           LazyColumn(modifier = Modifier.fillMaxSize()) {
-                              items(files, key = { it.absolutePath }) { file ->
+                              items(sorted, key = { it.file.absolutePath }) { entry ->
                                   FileRow(
-                                      file = file,
+                                      entry = entry,
                                       rowMinHeight = rowMin,
                                       modifier = Modifier.animateItem(),
                                       onClick = {
                                           when {
-                                              file.isDirectory -> onNavigate(file)
-                                              ThumbnailCache.isImage(file.name) -> {
-                                                  val idx = imagesInDir.indexOf(file).coerceAtLeast(0)
+                                              entry.isDir -> onNavigate(entry.file)
+                                              ThumbnailCache.isImage(entry.name) -> {
+                                                  val idx = imagesInDir.indexOf(entry.file).coerceAtLeast(0)
                                                   onOpenImage(imagesInDir, idx)
                                               }
-                                              else -> openFile(context, file)
+                                              else -> openFile(context, entry.file)
                                           }
                                       }
                                   )
@@ -1289,18 +1467,17 @@ jobs:
               }
           }
 
+          // Folders always use the same amber folder icon. Only image and video files show a thumbnail.
           @Composable
           fun FileThumbBox(isDirectory: Boolean, thumb: Bitmap?) {
               Box(
                   modifier = Modifier
                       .size(42.dp)
                       .clip(RoundedCornerShape(8.dp))
-                      .background(
-                          if (isDirectory && thumb == null) Color(0xFF3A3A3A) else Color.Transparent
-                      ),
+                      .background(if (isDirectory) Color(0xFF3A3A3A) else Color.Transparent),
                   contentAlignment = Alignment.Center
               ) {
-                  if (thumb != null) {
+                  if (thumb != null && !isDirectory) {
                       Image(
                           bitmap = thumb.asImageBitmap(),
                           contentDescription = null,
@@ -1310,9 +1487,9 @@ jobs:
                   } else if (isDirectory) {
                       Icon(
                           imageVector = Icons.Filled.Folder,
-                          contentDescription = null,
-                          tint = Color(0xFF9A9A9A),
-                          modifier = Modifier.size(24.dp)
+                          contentDescription = "Folder",
+                          tint = Color(0xFFE0B04F),
+                          modifier = Modifier.size(28.dp)
                       )
                   } else {
                       Icon(
@@ -1327,24 +1504,27 @@ jobs:
 
           // One row: thumb | name (up to 3 lines) above size (left) and date (right) | optional Copy pill
           @Composable
-          fun FileRow(file: File, rowMinHeight: Dp, modifier: Modifier = Modifier, onClick: () -> Unit) {
+          fun FileRow(entry: Entry, rowMinHeight: Dp, modifier: Modifier = Modifier, onClick: () -> Unit) {
               val context = LocalContext.current
-              val hasFileThumb = file.isFile && (ThumbnailCache.isImage(file.name) || ThumbnailCache.isVideo(file.name))
+              val file = entry.file
+              val hasFileThumb = !entry.isDir && (ThumbnailCache.isImage(entry.name) || ThumbnailCache.isVideo(entry.name))
               val muted = Color.White.copy(alpha = 0.55f)
 
-              val thumb by produceState<Bitmap?>(initialValue = null, key1 = file.absolutePath, key2 = file.lastModified()) {
-                  value = when {
-                      hasFileThumb -> ThumbnailCache.getThumbnail(context, file)
-                      file.isDirectory -> ThumbnailCache.getFolderThumbnail(context, file)
-                      else -> null
+              val thumb by produceState<Bitmap?>(initialValue = null, key1 = file.absolutePath, key2 = entry.modified) {
+                  value = if (hasFileThumb) ThumbnailCache.getThumbnail(context, file, entry.modified) else null
+              }
+
+              // Folder item counts come from a background read, remembered after the first time
+              val folderCount by produceState<Int?>(initialValue = if (entry.isDir) FolderCount.cached(file.absolutePath) else null, key1 = file.absolutePath) {
+                  if (entry.isDir && value == null) {
+                      value = withContext(Dispatchers.IO) { FolderCount.load(file) }
                   }
               }
 
-              val sizeText = if (file.isDirectory) {
-                  val count = file.listFiles()?.size ?: 0
-                  "$count items"
+              val sizeText = if (entry.isDir) {
+                  folderCount?.let { "$it items" } ?: "Folder"
               } else {
-                  formatSize(file.length())
+                  formatSize(entry.size)
               }
 
               val interactionSource = remember { MutableInteractionSource() }
@@ -1359,11 +1539,11 @@ jobs:
                       .padding(horizontal = 8.dp, vertical = 6.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
-                  FileThumbBox(isDirectory = file.isDirectory, thumb = thumb)
+                  FileThumbBox(isDirectory = entry.isDir, thumb = thumb)
                   Spacer(Modifier.width(12.dp))
                   Column(modifier = Modifier.weight(1f)) {
                       Text(
-                          text = file.name,
+                          text = entry.name,
                           color = if (pressed) Color.Black else Color.White,
                           fontSize = 15.sp,
                           maxLines = 3,
@@ -1378,7 +1558,7 @@ jobs:
                               maxLines = 1
                           )
                           Text(
-                              text = formatDate(file.lastModified()),
+                              text = formatDate(entry.modified),
                               color = if (pressed) Color.Black.copy(alpha = 0.6f) else muted,
                               fontSize = 11.sp,
                               maxLines = 1
@@ -1387,7 +1567,7 @@ jobs:
                   }
 
                   // Copy pill for text-based files: copies the whole content, no opening needed
-                  if (isTextFile(file)) {
+                  if (!entry.isDir && isTextName(entry.name)) {
                       Spacer(Modifier.width(8.dp))
                       Box(
                           modifier = Modifier
@@ -1418,6 +1598,7 @@ jobs:
           }
 
           // ---------- Bookmarks side panel ----------
+          // No animation: it appears and disappears at once.
           // Press and hold the WHOLE row to drag; it follows the finger until release.
           // Each row shows an internal or SD card icon (same icons as Home).
           @Composable
@@ -1438,128 +1619,116 @@ jobs:
               if (!visible && draggingIndex == -1) return
 
               Box(modifier = Modifier.fillMaxSize()) {
-                  AnimatedVisibility(
-                      visible = visible,
-                      enter = fadeIn(),
-                      exit = fadeOut()
-                  ) {
-                      Box(
-                          modifier = Modifier
-                              .fillMaxSize()
-                              .background(Color(0x99000000))
-                              .clickable(
-                                  interactionSource = remember { MutableInteractionSource() },
-                                  indication = null,
-                                  onClick = onDismiss
-                              )
-                      )
-                  }
-
-                  AnimatedVisibility(
-                      visible = visible,
-                      enter = slideInHorizontally(initialOffsetX = { -it }),
-                      exit = slideOutHorizontally(targetOffsetX = { -it }),
-                      modifier = Modifier.align(Alignment.CenterStart)
-                  ) {
-                      Column(
-                          modifier = Modifier
-                              .fillMaxHeight()
-                              .width(240.dp)
-                              .background(Color(0xFF232323))
-                              .windowInsetsPadding(WindowInsets.systemBars)
-                              .padding(vertical = 12.dp)
-                      ) {
-                          Text(
-                              text = "Bookmarks",
-                              color = Color(0xFF888888),
-                              fontSize = 11.sp,
-                              fontWeight = FontWeight.Medium,
-                              modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                  Box(
+                      modifier = Modifier
+                          .fillMaxSize()
+                          .background(Color(0x99000000))
+                          .clickable(
+                              interactionSource = remember { MutableInteractionSource() },
+                              indication = null,
+                              onClick = onDismiss
                           )
+                  )
 
-                          // Home: pinned, first, not draggable
-                          TappableRow(onClick = onNavigateHome) {
+                  Column(
+                      modifier = Modifier
+                          .align(Alignment.CenterStart)
+                          .fillMaxHeight()
+                          .width(240.dp)
+                          .background(Color(0xFF232323))
+                          .windowInsetsPadding(WindowInsets.systemBars)
+                          .padding(vertical = 12.dp)
+                  ) {
+                      Text(
+                          text = "Bookmarks",
+                          color = Color(0xFF888888),
+                          fontSize = 11.sp,
+                          fontWeight = FontWeight.Medium,
+                          modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                      )
+
+                      // Home: pinned, first, not draggable
+                      TappableRow(onClick = onNavigateHome) {
+                          Icon(
+                              imageVector = Icons.Filled.Home,
+                              contentDescription = null,
+                              tint = Color(0xFF4FC3F7),
+                              modifier = Modifier.size(20.dp)
+                          )
+                          Spacer(Modifier.width(10.dp))
+                          Text("Home", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                      }
+
+                      Spacer(Modifier.height(4.dp))
+
+                      order.forEachIndexed { index, path ->
+                          val name = File(path).name.ifEmpty { path }
+                          val isDragging = index == draggingIndex
+                          val internal = isInternalPath(context, path)
+                          Row(
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .graphicsLayer {
+                                      translationY = if (isDragging) dragOffsetY else 0f
+                                  }
+                                  .background(if (isDragging) Color(0xFF2F2F2F) else Color.Transparent)
+                                  .pointerInput(order) {
+                                      detectDragGesturesAfterLongPress(
+                                          onDragStart = {
+                                              draggingIndex = index
+                                              dragOffsetY = 0f
+                                          },
+                                          onDrag = { change, dragAmount ->
+                                              change.consume()
+                                              dragOffsetY += dragAmount.y
+                                              if (draggingIndex >= 0) {
+                                                  val moveBy = (dragOffsetY / rowHeightPx).toInt()
+                                                  if (moveBy != 0) {
+                                                      val newIndex = (draggingIndex + moveBy).coerceIn(0, order.size - 1)
+                                                      if (newIndex != draggingIndex) {
+                                                          val mutable = order.toMutableList()
+                                                          val item = mutable.removeAt(draggingIndex)
+                                                          mutable.add(newIndex, item)
+                                                          order = mutable
+                                                          draggingIndex = newIndex
+                                                          dragOffsetY -= moveBy * rowHeightPx
+                                                      }
+                                                  }
+                                              }
+                                          },
+                                          onDragEnd = {
+                                              draggingIndex = -1
+                                              dragOffsetY = 0f
+                                              onReorder(order)
+                                          },
+                                          onDragCancel = {
+                                              draggingIndex = -1
+                                              dragOffsetY = 0f
+                                          }
+                                      )
+                                  }
+                                  .clickable { onNavigateTo(path) }
+                                  .padding(horizontal = 16.dp, vertical = 10.dp),
+                              verticalAlignment = Alignment.CenterVertically
+                          ) {
                               Icon(
-                                  imageVector = Icons.Filled.Home,
-                                  contentDescription = null,
-                                  tint = Color(0xFF4FC3F7),
+                                  imageVector = if (internal) Icons.Filled.PhoneAndroid else Icons.Filled.SdCard,
+                                  contentDescription = if (internal) "Internal storage" else "SD card",
+                                  tint = Color(0xFF90CAF9),
                                   modifier = Modifier.size(20.dp)
                               )
                               Spacer(Modifier.width(10.dp))
-                              Text("Home", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                              Text(name, color = Color.White, fontSize = 14.sp, maxLines = 1, modifier = Modifier.weight(1f))
                           }
+                      }
 
-                          Spacer(Modifier.height(4.dp))
-
-                          order.forEachIndexed { index, path ->
-                              val name = File(path).name.ifEmpty { path }
-                              val isDragging = index == draggingIndex
-                              val internal = isInternalPath(context, path)
-                              Row(
-                                  modifier = Modifier
-                                      .fillMaxWidth()
-                                      .graphicsLayer {
-                                          translationY = if (isDragging) dragOffsetY else 0f
-                                      }
-                                      .background(if (isDragging) Color(0xFF2F2F2F) else Color.Transparent)
-                                      .pointerInput(order) {
-                                          detectDragGesturesAfterLongPress(
-                                              onDragStart = {
-                                                  draggingIndex = index
-                                                  dragOffsetY = 0f
-                                              },
-                                              onDrag = { change, dragAmount ->
-                                                  change.consume()
-                                                  dragOffsetY += dragAmount.y
-                                                  if (draggingIndex >= 0) {
-                                                      val moveBy = (dragOffsetY / rowHeightPx).toInt()
-                                                      if (moveBy != 0) {
-                                                          val newIndex = (draggingIndex + moveBy).coerceIn(0, order.size - 1)
-                                                          if (newIndex != draggingIndex) {
-                                                              val mutable = order.toMutableList()
-                                                              val item = mutable.removeAt(draggingIndex)
-                                                              mutable.add(newIndex, item)
-                                                              order = mutable
-                                                              draggingIndex = newIndex
-                                                              dragOffsetY -= moveBy * rowHeightPx
-                                                          }
-                                                      }
-                                                  }
-                                              },
-                                              onDragEnd = {
-                                                  draggingIndex = -1
-                                                  dragOffsetY = 0f
-                                                  onReorder(order)
-                                              },
-                                              onDragCancel = {
-                                                  draggingIndex = -1
-                                                  dragOffsetY = 0f
-                                              }
-                                          )
-                                      }
-                                      .clickable { onNavigateTo(path) }
-                                      .padding(horizontal = 16.dp, vertical = 10.dp),
-                                  verticalAlignment = Alignment.CenterVertically
-                              ) {
-                                  Icon(
-                                      imageVector = if (internal) Icons.Filled.PhoneAndroid else Icons.Filled.SdCard,
-                                      contentDescription = if (internal) "Internal storage" else "SD card",
-                                      tint = Color(0xFF90CAF9),
-                                      modifier = Modifier.size(20.dp)
-                                  )
-                                  Spacer(Modifier.width(10.dp))
-                                  Text(name, color = Color.White, fontSize = 14.sp, maxLines = 1, modifier = Modifier.weight(1f))
-                              }
-                          }
-
-                          if (order.isEmpty()) {
-                              Text(
-                                  text = "No bookmarks yet",
-                                  color = Color(0xFF666666),
-                                  fontSize = 12.sp,
-                                  modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
-                              )
-                          }
+                      if (order.isEmpty()) {
+                          Text(
+                              text = "No bookmarks yet",
+                              color = Color(0xFF666666),
+                              fontSize = 12.sp,
+                              modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                          )
                       }
                   }
               }
