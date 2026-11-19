@@ -170,6 +170,7 @@ jobs:
           import androidx.compose.foundation.gestures.calculateZoom
           import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
           import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+          import androidx.compose.foundation.gestures.detectTapGestures
           import androidx.compose.foundation.horizontalScroll
           import androidx.compose.foundation.interaction.MutableInteractionSource
           import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -211,7 +212,10 @@ jobs:
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.asImageBitmap
           import androidx.compose.ui.graphics.graphicsLayer
+          import androidx.compose.ui.input.pointer.PointerEventPass
           import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.input.pointer.positionChange
+          import androidx.compose.ui.graphics.vector.ImageVector
           import androidx.compose.ui.input.pointer.util.VelocityTracker
           import androidx.compose.ui.input.pointer.util.addPointerInputChange
           import androidx.compose.ui.layout.ContentScale
@@ -235,6 +239,7 @@ jobs:
           import androidx.lifecycle.LifecycleEventObserver
           import androidx.lifecycle.compose.LocalLifecycleOwner
           import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.coroutineScope
           import kotlinx.coroutines.delay
           import kotlinx.coroutines.launch
           import kotlinx.coroutines.withContext
@@ -246,6 +251,7 @@ jobs:
           import java.text.SimpleDateFormat
           import java.util.Date
           import java.util.Locale
+          import kotlin.math.abs
           import kotlin.math.roundToInt
 
           class MainActivity : ComponentActivity() {
@@ -342,7 +348,7 @@ jobs:
           }
 
           private val dateFormat = ThreadLocal.withInitial {
-              SimpleDateFormat("d MMM yyyy, HH:mm", Locale.getDefault())
+              SimpleDateFormat("d MMM yyyy, h:mm a", Locale.getDefault())
           }
 
           fun formatDate(millis: Long): String = dateFormat.get()!!.format(Date(millis))
@@ -896,21 +902,38 @@ jobs:
                                   modifier = Modifier
                                       .fillMaxSize()
                                       .pointerInput(tabs.size, activeIndex) {
-                                          var total = 0f
-                                          detectHorizontalDragGestures(
-                                              onDragStart = { total = 0f },
-                                              onDragEnd = {
-                                                  if (total < -120f && activeIndex < tabs.size - 1) {
+                                          // Swipe to switch tabs. It watches the touch BEFORE the list does
+                                          // (Initial pass), so it works even when the finger starts on a list item.
+                                          // It triggers after about 48 dp of mostly-horizontal movement.
+                                          awaitEachGesture {
+                                              val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                              val slop = viewConfiguration.touchSlop
+                                              val trigger = 48.dp.toPx()
+                                              var totalX = 0f
+                                              var totalY = 0f
+                                              var decided = false
+                                              var horizontal = false
+                                              while (true) {
+                                                  val event = awaitPointerEvent(PointerEventPass.Initial)
+                                                  val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                  val delta = change.positionChange()
+                                                  totalX += delta.x
+                                                  totalY += delta.y
+                                                  if (!decided && (abs(totalX) > slop || abs(totalY) > slop)) {
+                                                      decided = true
+                                                      horizontal = abs(totalX) > abs(totalY)
+                                                  }
+                                                  if (decided && horizontal) change.consume()
+                                                  if (!change.pressed) break
+                                              }
+                                              if (decided && horizontal) {
+                                                  if (totalX < -trigger && activeIndex < tabs.size - 1) {
                                                       activeIndex++
-                                                  } else if (total > 120f && activeIndex > 0) {
+                                                  } else if (totalX > trigger && activeIndex > 0) {
                                                       activeIndex--
                                                   }
-                                              },
-                                              onHorizontalDrag = { change, dragAmount ->
-                                                  change.consume()
-                                                  total += dragAmount
                                               }
-                                          )
+                                          }
                                       }
                               ) {
                                   AnimatedContent(
@@ -1047,6 +1070,7 @@ jobs:
               val bounds = remember { mutableStateMapOf<Int, Pair<Float, Float>>() }
               val indicatorX = remember { Animatable(0f) }
               val indicatorW = remember { Animatable(0f) }
+              val plusPressed = remember { mutableStateOf(false) }
 
               val target = bounds[activeIndex]
               LaunchedEffect(target) {
@@ -1080,6 +1104,8 @@ jobs:
                       Row(verticalAlignment = Alignment.Top) {
                           tabs.forEachIndexed { index, tab ->
                               val selected = index == activeIndex
+                              val titlePressed = remember { mutableStateOf(false) }
+                              val closePressed = remember { mutableStateOf(false) }
                               Column(
                                   modifier = Modifier
                                       .widthIn(min = 96.dp)
@@ -1094,27 +1120,32 @@ jobs:
                                   ) {
                                       Text(
                                           text = tabTitle(context, tab.dir),
-                                          color = if (selected) Color.White else Color(0xFF9A9A9A),
+                                          color = if (titlePressed.value) Color.Black else if (selected) Color.White else Color(0xFF9A9A9A),
                                           fontSize = 13.sp,
                                           fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
                                           maxLines = 1,
                                           overflow = TextOverflow.Ellipsis,
                                           modifier = Modifier
-                                              .widthIn(max = 140.dp)
-                                              .clickable { onSelect(index) }
+                                              .widthIn(min = 48.dp, max = 140.dp)
+                                              .height(28.dp)
+                                              .background(if (titlePressed.value) Color.White else Color.Transparent)
+                                              .pressFlash(titlePressed) { onSelect(index) }
+                                              .wrapContentHeight(Alignment.CenterVertically)
+                                              .padding(horizontal = 4.dp)
                                       )
                                       Spacer(Modifier.width(6.dp))
                                       // Larger tap area for the x, so it is hard to hit by accident
                                       Box(
                                           modifier = Modifier
                                               .size(32.dp)
-                                              .clickable { onRequestClose(index) },
+                                              .background(if (closePressed.value) Color.White else Color.Transparent)
+                                              .pressFlash(closePressed) { onRequestClose(index) },
                                           contentAlignment = Alignment.Center
                                       ) {
                                           Icon(
                                               imageVector = Icons.Filled.Close,
                                               contentDescription = "Close tab",
-                                              tint = Color(0xFF9A9A9A),
+                                              tint = if (closePressed.value) Color.Black else Color(0xFF9A9A9A),
                                               modifier = Modifier.size(16.dp)
                                           )
                                       }
@@ -1140,14 +1171,15 @@ jobs:
                       modifier = Modifier
                           .padding(top = 8.dp)
                           .height(28.dp)
-                          .clickable { onSwipeAddTab() }
+                          .background(if (plusPressed.value) Color.White else Color.Transparent)
+                          .pressFlash(plusPressed) { onSwipeAddTab() }
                           .padding(horizontal = 10.dp),
                       contentAlignment = Alignment.Center
                   ) {
                       Icon(
                           imageVector = Icons.Filled.Add,
                           contentDescription = "New tab",
-                          tint = Color(0xFF90CAF9),
+                          tint = if (plusPressed.value) Color.Black else Color(0xFF90CAF9),
                           modifier = Modifier.size(22.dp)
                       )
                   }
@@ -1171,6 +1203,82 @@ jobs:
               }
           }
 
+          // =====================================================================
+          // PRESS FEEDBACK: white background + black text while a finger is down.
+          // NOTE FOR FUTURE: use pressFlash() on EVERY tappable area (rows, buttons, icons)
+          // instead of clickable(), so the effect is the same everywhere.
+          // - It appears after 60 ms of holding, so scrolling does not flash.
+          // - A short tap is held visible for 140 ms, so quick taps also show it.
+          // Plain clickable() delays or skips the press state on quick taps, which is why it is not used.
+          // =====================================================================
+          @Composable
+          fun Modifier.pressFlash(pressed: MutableState<Boolean>, onClick: () -> Unit): Modifier {
+              val currentClick by rememberUpdatedState(onClick)
+              return this.pointerInput(Unit) {
+                  detectTapGestures(
+                      onPress = {
+                          coroutineScope {
+                              val showJob = launch {
+                                  delay(60)
+                                  pressed.value = true
+                              }
+                              val released = tryAwaitRelease()
+                              showJob.cancel()
+                              if (released) {
+                                  pressed.value = true
+                                  delay(140)
+                              }
+                              pressed.value = false
+                          }
+                      },
+                      onTap = { currentClick() }
+                  )
+              }
+          }
+
+          // Icon button with a 40 dp touch area and the press effect
+          @Composable
+          fun IconFlashButton(
+              icon: ImageVector,
+              description: String,
+              boxSize: Dp = 40.dp,
+              iconSize: Dp = 26.dp,
+              onClick: () -> Unit
+          ) {
+              val pressed = remember { mutableStateOf(false) }
+              Box(
+                  modifier = Modifier
+                      .size(boxSize)
+                      .clip(CircleShape)
+                      .background(if (pressed.value) Color.White else Color.Transparent)
+                      .pressFlash(pressed, onClick),
+                  contentAlignment = Alignment.Center
+              ) {
+                  Icon(
+                      imageVector = icon,
+                      contentDescription = description,
+                      tint = if (pressed.value) Color.Black else Color.White,
+                      modifier = Modifier.size(iconSize)
+                  )
+              }
+          }
+
+          // One breadcrumb segment with a bigger touch area and the press effect
+          @Composable
+          fun BreadcrumbText(label: String, onClick: () -> Unit) {
+              val pressed = remember { mutableStateOf(false) }
+              Text(
+                  text = label,
+                  color = if (pressed.value) Color.Black else Color.White,
+                  fontSize = 14.4.sp,
+                  maxLines = 1,
+                  modifier = Modifier
+                      .background(if (pressed.value) Color.White else Color.Transparent)
+                      .pressFlash(pressed, onClick)
+                      .padding(horizontal = 3.dp, vertical = 8.dp)
+              )
+          }
+
           // Header: 10% taller than before. Icons and breadcrumbs 20% bigger.
           @Composable
           fun ScreenHeader(
@@ -1191,16 +1299,11 @@ jobs:
                   modifier = Modifier
                       .fillMaxWidth()
                       .background(Color(0xFF2A2A2A))
-                      .padding(horizontal = 12.dp, vertical = 13.dp),
+                      .padding(horizontal = 5.dp, vertical = 6.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
-                  Icon(
-                      imageVector = Icons.Filled.List,
-                      contentDescription = "Bookmarks",
-                      tint = Color.White,
-                      modifier = Modifier.size(26.dp).clickable { onOpenPanel() }
-                  )
-                  Spacer(Modifier.width(12.dp))
+                  IconFlashButton(Icons.Filled.List, "Bookmarks") { onOpenPanel() }
+                  Spacer(Modifier.width(5.dp))
 
                   Row(
                       modifier = Modifier
@@ -1216,25 +1319,14 @@ jobs:
                                   fontSize = 14.4.sp
                               )
                           }
-                          Text(
-                              text = label,
-                              color = Color.White,
-                              fontSize = 14.4.sp,
-                              maxLines = 1,
-                              modifier = Modifier.clickable { onClick() }
-                          )
+                          BreadcrumbText(label = label, onClick = onClick)
                       }
                   }
 
                   if (menuContent != null) {
                       Spacer(Modifier.width(8.dp))
                       Box {
-                          Icon(
-                              imageVector = Icons.Filled.MoreVert,
-                              contentDescription = "Menu",
-                              tint = Color.White,
-                              modifier = Modifier.size(26.dp).clickable { onMenuToggle() }
-                          )
+                          IconFlashButton(Icons.Filled.MoreVert, "Menu") { onMenuToggle() }
                           if (menuOpen) {
                               // Full-screen scrim: any touch outside the menu closes it
                               Popup(
@@ -1254,7 +1346,9 @@ jobs:
                                           modifier = Modifier
                                               .align(Alignment.TopEnd)
                                               .padding(top = 56.dp, end = 8.dp)
-                                              .background(Color(0xFF333333), RoundedCornerShape(8.dp))
+                                              .width(220.dp)
+                                              .clip(RoundedCornerShape(8.dp))
+                                              .background(Color(0xFF333333))
                                               .padding(vertical = 4.dp)
                                               .clickable(
                                                   interactionSource = remember { MutableInteractionSource() },
@@ -1272,16 +1366,31 @@ jobs:
               }
           }
 
+          // =====================================================================
+          // NOTE FOR FUTURE: every row in the top-right menu MUST be a MenuRow.
+          // MenuRow is full width with the same minimum height, so every touch area
+          // is the same size, even for short text like "Sort" or "Save tabs".
+          // Do NOT use a bare Text with clickable here: its touch area would only
+          // be as big as the text.
+          // =====================================================================
           @Composable
           fun MenuRow(text: String, onClick: () -> Unit) {
-              Text(
-                  text = text,
-                  color = Color.White,
-                  fontSize = 14.sp,
+              val pressed = remember { mutableStateOf(false) }
+              Box(
                   modifier = Modifier
-                      .clickable { onClick() }
-                      .padding(horizontal = 16.dp, vertical = 12.dp)
-              )
+                      .fillMaxWidth()
+                      .heightIn(min = 48.dp)
+                      .background(if (pressed.value) Color.White else Color.Transparent)
+                      .pressFlash(pressed, onClick)
+                      .padding(horizontal = 16.dp),
+                  contentAlignment = Alignment.CenterStart
+              ) {
+                  Text(
+                      text = text,
+                      color = if (pressed.value) Color.Black else Color.White,
+                      fontSize = 14.sp
+                  )
+              }
           }
 
           // Skeleton placeholder rows with a soft pulse while content loads
@@ -1360,7 +1469,7 @@ jobs:
                                       modifier = Modifier.size(56.dp)
                                   )
                                   Spacer(Modifier.width(16.dp))
-                                  Text(text = label, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                                  Text(text = label, fontSize = 16.sp, fontWeight = FontWeight.Medium)
                               }
                           }
                       }
@@ -1370,23 +1479,18 @@ jobs:
 
           @Composable
           fun TappableRow(onClick: () -> Unit, content: @Composable RowScope.() -> Unit) {
-              val interactionSource = remember { MutableInteractionSource() }
-              val pressed by interactionSource.collectIsPressedAsState()
-              val bg = if (pressed) Color.White else Color.Transparent
+              val pressed = remember { mutableStateOf(false) }
+              val bg = if (pressed.value) Color.White else Color.Transparent
 
               Row(
                   modifier = Modifier
                       .fillMaxWidth()
                       .background(bg)
-                      .clickable(
-                          interactionSource = interactionSource,
-                          indication = null,
-                          onClick = onClick
-                      )
+                      .pressFlash(pressed, onClick)
                       .padding(horizontal = 16.dp, vertical = 10.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
-                  CompositionLocalProvider(androidx.compose.material3.LocalContentColor provides if (pressed) Color.Black else Color.White) {
+                  CompositionLocalProvider(androidx.compose.material3.LocalContentColor provides if (pressed.value) Color.Black else Color.White) {
                       content()
                   }
               }
@@ -1560,15 +1664,16 @@ jobs:
                   formatSize(entry.size)
               }
 
-              val interactionSource = remember { MutableInteractionSource() }
-              val pressed by interactionSource.collectIsPressedAsState()
+              val pressedState = remember { mutableStateOf(false) }
+              val pressed = pressedState.value
+              val copyPressed = remember { mutableStateOf(false) }
 
               Row(
                   modifier = modifier
                       .fillMaxWidth()
                       .heightIn(min = rowMinHeight)
                       .background(if (pressed) Color.White else Color.Transparent)
-                      .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+                      .pressFlash(pressedState, onClick)
                       .padding(horizontal = 8.dp, vertical = 6.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
@@ -1605,11 +1710,11 @@ jobs:
                       Box(
                           modifier = Modifier
                               .clip(CircleShape)
-                              .background(Color.White)
-                              .clickable { copyFileContent(context, file) }
+                              .background(if (copyPressed.value || pressed) Color.Black else Color.White)
+                              .pressFlash(copyPressed) { copyFileContent(context, file) }
                               .padding(horizontal = 12.dp, vertical = 6.dp)
                       ) {
-                          Text("Copy", color = Color.Black, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                          Text("Copy", color = if (copyPressed.value || pressed) Color.White else Color.Black, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                       }
                   }
               }
@@ -1698,13 +1803,18 @@ jobs:
                           val name = File(path).name.ifEmpty { path }
                           val isDragging = index == draggingIndex
                           val internal = isInternalPath(context, path)
+                          val rowPressed = remember { mutableStateOf(false) }
                           Row(
                               modifier = Modifier
                                   .fillMaxWidth()
                                   .graphicsLayer {
                                       translationY = if (isDragging) dragOffsetY else 0f
                                   }
-                                  .background(if (isDragging) Color(0xFF2F2F2F) else Color.Transparent)
+                                  .background(
+                                      if (isDragging) Color(0xFF2F2F2F)
+                                      else if (rowPressed.value) Color.White
+                                      else Color.Transparent
+                                  )
                                   .pointerInput(order) {
                                       detectDragGesturesAfterLongPress(
                                           onDragStart = {
@@ -1740,7 +1850,7 @@ jobs:
                                           }
                                       )
                                   }
-                                  .clickable { onNavigateTo(path) }
+                                  .pressFlash(rowPressed) { onNavigateTo(path) }
                                   .padding(horizontal = 16.dp, vertical = 10.dp),
                               verticalAlignment = Alignment.CenterVertically
                           ) {
@@ -1751,7 +1861,7 @@ jobs:
                                   modifier = Modifier.size(20.dp)
                               )
                               Spacer(Modifier.width(10.dp))
-                              Text(name, color = Color.White, fontSize = 14.sp, maxLines = 1, modifier = Modifier.weight(1f))
+                              Text(name, color = if (rowPressed.value) Color.Black else Color.White, fontSize = 14.sp, maxLines = 1, modifier = Modifier.weight(1f))
                           }
                       }
 
@@ -1805,16 +1915,11 @@ jobs:
                               .fillMaxWidth()
                               .background(Color(0xAA000000))
                               .windowInsetsPadding(WindowInsets.statusBars)
-                              .padding(horizontal = 16.dp, vertical = 16.dp),
+                              .padding(horizontal = 8.dp, vertical = 6.dp),
                           verticalAlignment = Alignment.CenterVertically
                       ) {
-                          Icon(
-                              imageVector = Icons.Filled.Close,
-                              contentDescription = "Close",
-                              tint = Color.White,
-                              modifier = Modifier.size(24.dp).clickable { onClose() }
-                          )
-                          Spacer(Modifier.width(14.dp))
+                          IconFlashButton(Icons.Filled.Close, "Close", iconSize = 24.dp) { onClose() }
+                          Spacer(Modifier.width(8.dp))
                           Text(
                               text = images.getOrNull(pagerState.currentPage)?.name ?: "",
                               color = Color.White,
