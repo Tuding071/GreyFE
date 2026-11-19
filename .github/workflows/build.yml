@@ -147,6 +147,7 @@ jobs:
           import androidx.activity.enableEdgeToEdge
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.compose.animation.AnimatedContent
+          import androidx.compose.animation.AnimatedVisibility
           import androidx.compose.animation.core.Animatable
           import androidx.compose.animation.core.RepeatMode
           import androidx.compose.animation.core.animateDecay
@@ -216,6 +217,7 @@ jobs:
           import androidx.compose.ui.layout.ContentScale
           import androidx.compose.ui.layout.layout
           import androidx.compose.ui.layout.onGloballyPositioned
+          import androidx.compose.ui.layout.positionInParent
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.platform.LocalDensity
           import androidx.compose.ui.text.font.FontWeight
@@ -861,7 +863,6 @@ jobs:
                                           MenuRow(text = (if (mode == sortMode) "✓  " else "     ") + mode.label) {
                                               sortMode = mode
                                               SortPrefs.save(context, mode)
-                                              close()
                                           }
                                       }
                                   }
