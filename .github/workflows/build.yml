@@ -519,6 +519,20 @@ jobs:
                   bmp
               }
 
+              // Preview of a folder: its first image (by name), shown as a small badge
+              suspend fun getFolderThumbnail(context: Context, dir: File): Bitmap? = withContext(Dispatchers.IO) {
+                  val firstImage = try {
+                      dir.listFiles()?.filter { it.isFile && isImage(it.name) }
+                          ?.minByOrNull { it.name.lowercase() }
+                  } catch (e: Exception) { null } ?: return@withContext null
+
+                  val key = keyFor("folder:${dir.absolutePath}:${firstImage.name}:${firstImage.lastModified()}")
+                  memory.get(key)?.let { return@withContext it }
+                  val bmp = loadOrGenerate(context, key) { decodeSampledImage(firstImage.absolutePath, THUMB_SIZE) }
+                  if (bmp != null) memory.put(key, bmp)
+                  bmp
+              }
+
               private fun loadOrGenerate(context: Context, key: String, generate: () -> Bitmap?): Bitmap? {
                   val cacheFile = File(thumbDir(context), "$key.jpg")
                   if (cacheFile.exists()) {
@@ -1469,7 +1483,7 @@ jobs:
 
           // Folders always use the same amber folder icon. Only image and video files show a thumbnail.
           @Composable
-          fun FileThumbBox(isDirectory: Boolean, thumb: Bitmap?) {
+          fun FileThumbBox(isDirectory: Boolean, thumb: Bitmap?, folderThumb: Bitmap? = null) {
               Box(
                   modifier = Modifier
                       .size(42.dp)
@@ -1491,6 +1505,21 @@ jobs:
                           tint = Color(0xFFE0B04F),
                           modifier = Modifier.size(28.dp)
                       )
+                      // Small preview badge on the bottom-right corner
+                      if (folderThumb != null) {
+                          Image(
+                              bitmap = folderThumb.asImageBitmap(),
+                              contentDescription = null,
+                              contentScale = ContentScale.Crop,
+                              modifier = Modifier
+                                  .align(Alignment.BottomEnd)
+                                  .size(20.dp)
+                                  .clip(RoundedCornerShape(4.dp))
+                                  .background(Color.White)
+                                  .padding(1.dp)
+                                  .clip(RoundedCornerShape(3.dp))
+                          )
+                      }
                   } else {
                       Icon(
                           imageVector = Icons.Filled.InsertDriveFile,
@@ -1512,6 +1541,10 @@ jobs:
 
               val thumb by produceState<Bitmap?>(initialValue = null, key1 = file.absolutePath, key2 = entry.modified) {
                   value = if (hasFileThumb) ThumbnailCache.getThumbnail(context, file, entry.modified) else null
+              }
+
+              val folderThumb by produceState<Bitmap?>(initialValue = null, key1 = file.absolutePath, key2 = entry.modified) {
+                  value = if (entry.isDir) ThumbnailCache.getFolderThumbnail(context, file) else null
               }
 
               // Folder item counts come from a background read, remembered after the first time
@@ -1539,7 +1572,7 @@ jobs:
                       .padding(horizontal = 8.dp, vertical = 6.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
-                  FileThumbBox(isDirectory = entry.isDir, thumb = thumb)
+                  FileThumbBox(isDirectory = entry.isDir, thumb = thumb, folderThumb = folderThumb)
                   Spacer(Modifier.width(12.dp))
                   Column(modifier = Modifier.weight(1f)) {
                       Text(
