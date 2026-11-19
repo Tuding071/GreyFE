@@ -208,6 +208,7 @@ jobs:
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
           import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.draw.clipToBounds
           import androidx.compose.ui.geometry.Offset
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.asImageBitmap
@@ -246,6 +247,7 @@ jobs:
           import kotlinx.coroutines.withTimeoutOrNull
           import java.io.File
           import java.io.FileOutputStream
+          import java.io.InputStream
           import java.lang.reflect.Method
           import java.security.MessageDigest
           import java.text.SimpleDateFormat
@@ -375,12 +377,14 @@ jobs:
 
               fun isBookmarked(context: Context, path: String): Boolean = getAll(context).contains(path)
 
-              fun add(context: Context, path: String) {
+              // Returns true when added, false when the list is full
+              fun add(context: Context, path: String): Boolean {
                   val current = getAll(context).toMutableList()
-                  if (!current.contains(path) && current.size < MAX_ITEMS) {
-                      current.add(path)
-                      save(context, current)
-                  }
+                  if (current.contains(path)) return true
+                  if (current.size >= MAX_ITEMS) return false
+                  current.add(path)
+                  save(context, current)
+                  return true
               }
 
               fun remove(context: Context, path: String) {
@@ -603,33 +607,77 @@ jobs:
           }
 
           // ---------- Full-resolution image cache for the viewer ----------
+          // (merged from GreyIV) Uses ImageDecoder.setTargetSize so large sources (9000-10000px+) are
+          // downsampled DURING decode rather than decoded full-res then discarded.
           object FullImageCache {
-              suspend fun decodeForViewer(path: String, maxDimension: Int): Bitmap? = withContext(Dispatchers.IO) {
+              suspend fun probeSize(context: Context, uri: Uri): Pair<Int, Int>? = withContext(Dispatchers.IO) {
                   try {
                       val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                      BitmapFactory.decodeFile(path, options)
-                      if (options.outWidth <= 0 || options.outHeight <= 0) return@withContext null
-                      var sample = 1
-                      while (options.outWidth / (sample * 2) >= maxDimension && options.outHeight / (sample * 2) >= maxDimension) {
-                          sample *= 2
-                      }
-                      val opts2 = BitmapFactory.Options().apply {
-                          inSampleSize = sample
-                          inPreferredConfig = Bitmap.Config.ARGB_8888
-                      }
-                      BitmapFactory.decodeFile(path, opts2)
+                      openStream(context, uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+                      if (options.outWidth > 0 && options.outHeight > 0) {
+                          options.outWidth to options.outHeight
+                      } else null
                   } catch (e: Exception) { null }
               }
 
-              fun loadAnimatedDrawable(context: Context, path: String): Any? {
+              suspend fun decodeForViewer(context: Context, uri: Uri, maxDimension: Int): Bitmap? = withContext(Dispatchers.IO) {
+                  try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                          val source = ImageDecoder.createSource(context.contentResolver, uri)
+                          ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                              val w = info.size.width
+                              val h = info.size.height
+                              val longSide = maxOf(w, h)
+                              if (longSide > maxDimension) {
+                                  val scale = maxDimension.toFloat() / longSide
+                                  decoder.setTargetSize(
+                                      (w * scale).toInt().coerceAtLeast(1),
+                                      (h * scale).toInt().coerceAtLeast(1)
+                                  )
+                              }
+                              decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                              decoder.isMutableRequired = false
+                          }
+                      } else {
+                          decodeLegacy(context, uri, maxDimension)
+                      }
+                  } catch (e: Exception) {
+                      try { decodeLegacy(context, uri, maxDimension) } catch (e2: Exception) { null }
+                  }
+              }
+
+              private fun decodeLegacy(context: Context, uri: Uri, maxDimension: Int): Bitmap? {
+                  val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  openStream(context, uri)?.use { BitmapFactory.decodeStream(it, null, boundsOptions) }
+                  if (boundsOptions.outWidth <= 0 || boundsOptions.outHeight <= 0) return null
+
+                  var sample = 1
+                  while (boundsOptions.outWidth / (sample * 2) >= maxDimension &&
+                      boundsOptions.outHeight / (sample * 2) >= maxDimension) {
+                      sample *= 2
+                  }
+                  val opts = BitmapFactory.Options().apply {
+                      inSampleSize = sample
+                      inPreferredConfig = Bitmap.Config.ARGB_8888
+                  }
+                  return openStream(context, uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+              }
+
+              fun loadAnimatedDrawable(context: Context, uri: Uri): Any? {
                   return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                       try {
-                          val source = ImageDecoder.createSource(File(path))
+                          val source = ImageDecoder.createSource(context.contentResolver, uri)
                           ImageDecoder.decodeDrawable(source)
                       } catch (e: Exception) { null }
                   } else {
-                      try { BitmapFactory.decodeFile(path) } catch (e: Exception) { null }
+                      try {
+                          openStream(context, uri)?.use { BitmapFactory.decodeStream(it) }
+                      } catch (e: Exception) { null }
                   }
+              }
+
+              private fun openStream(context: Context, uri: Uri): InputStream? {
+                  return try { context.contentResolver.openInputStream(uri) } catch (e: Exception) { null }
               }
           }
 
@@ -861,8 +909,14 @@ jobs:
                                       if (activeDir != null) {
                                           val bookmarked = Bookmarks.isBookmarked(context, activeDir.absolutePath)
                                           MenuRow(text = if (bookmarked) "Remove bookmark" else "Add to bookmarks") {
-                                              if (bookmarked) Bookmarks.remove(context, activeDir.absolutePath)
-                                              else Bookmarks.add(context, activeDir.absolutePath)
+                                              if (bookmarked) {
+                                                  Bookmarks.remove(context, activeDir.absolutePath)
+                                                  Toast.makeText(context, "Removed from bookmarks", Toast.LENGTH_SHORT).show()
+                                              } else if (Bookmarks.add(context, activeDir.absolutePath)) {
+                                                  Toast.makeText(context, "Added to bookmarks", Toast.LENGTH_SHORT).show()
+                                              } else {
+                                                  Toast.makeText(context, "Bookmarks full (max ${Bookmarks.MAX_ITEMS})", Toast.LENGTH_SHORT).show()
+                                              }
                                               bookmarkListVersion++
                                               close()
                                           }
@@ -908,7 +962,9 @@ jobs:
                                           awaitEachGesture {
                                               val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
                                               val slop = viewConfiguration.touchSlop
-                                              val trigger = 48.dp.toPx()
+                                              val startTime = System.currentTimeMillis()
+                                              val trigger = 32.dp.toPx()
+                                              val quickTrigger = 18.dp.toPx()
                                               var totalX = 0f
                                               var totalY = 0f
                                               var decided = false
@@ -927,9 +983,11 @@ jobs:
                                                   if (!change.pressed) break
                                               }
                                               if (decided && horizontal) {
-                                                  if (totalX < -trigger && activeIndex < tabs.size - 1) {
+                                                  // A quick flick needs even less distance
+                                                  val needed = if (System.currentTimeMillis() - startTime < 250) quickTrigger else trigger
+                                                  if (totalX < -needed && activeIndex < tabs.size - 1) {
                                                       activeIndex++
-                                                  } else if (totalX > trigger && activeIndex > 0) {
+                                                  } else if (totalX > needed && activeIndex > 0) {
                                                       activeIndex--
                                                   }
                                               }
@@ -939,12 +997,13 @@ jobs:
                                   AnimatedContent(
                                       targetState = activeIndex,
                                       transitionSpec = {
+                                          // Fast switch: 150 ms
                                           if (targetState > initialState) {
-                                              (slideInHorizontally { it / 4 } + fadeIn()) togetherWith
-                                                  (slideOutHorizontally { -it / 4 } + fadeOut())
+                                              (slideInHorizontally(tween(150)) { it / 4 } + fadeIn(tween(150))) togetherWith
+                                                  (slideOutHorizontally(tween(150)) { -it / 4 } + fadeOut(tween(150)))
                                           } else {
-                                              (slideInHorizontally { -it / 4 } + fadeIn()) togetherWith
-                                                  (slideOutHorizontally { it / 4 } + fadeOut())
+                                              (slideInHorizontally(tween(150)) { -it / 4 } + fadeIn(tween(150))) togetherWith
+                                                  (slideOutHorizontally(tween(150)) { it / 4 } + fadeOut(tween(150)))
                                           }
                                       },
                                       modifier = Modifier.fillMaxSize(),
@@ -1075,8 +1134,8 @@ jobs:
               val target = bounds[activeIndex]
               LaunchedEffect(target) {
                   if (target != null) {
-                      launch { indicatorX.animateTo(target.first, tween(260)) }
-                      launch { indicatorW.animateTo(target.second, tween(260)) }
+                      launch { indicatorX.animateTo(target.first, tween(150)) }
+                      launch { indicatorW.animateTo(target.second, tween(150)) }
                   }
               }
 
@@ -1118,21 +1177,38 @@ jobs:
                                       modifier = Modifier.height(28.dp),
                                       verticalAlignment = Alignment.CenterVertically
                                   ) {
-                                      Text(
-                                          text = tabTitle(context, tab.dir),
-                                          color = if (titlePressed.value) Color.Black else if (selected) Color.White else Color(0xFF9A9A9A),
-                                          fontSize = 13.sp,
-                                          fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                                          maxLines = 1,
-                                          overflow = TextOverflow.Ellipsis,
+                                      // Icon + title share one touch area. Icon: Home, phone (internal) or SD card (external).
+                                      Row(
                                           modifier = Modifier
-                                              .widthIn(min = 48.dp, max = 140.dp)
                                               .height(28.dp)
+                                              .widthIn(min = 56.dp)
                                               .background(if (titlePressed.value) Color.White else Color.Transparent)
                                               .pressFlash(titlePressed) { onSelect(index) }
-                                              .wrapContentHeight(Alignment.CenterVertically)
-                                              .padding(horizontal = 4.dp)
-                                      )
+                                              .padding(horizontal = 4.dp),
+                                          verticalAlignment = Alignment.CenterVertically
+                                      ) {
+                                          val tabDir = tab.dir
+                                          Icon(
+                                              imageVector = when {
+                                                  tabDir == null -> Icons.Filled.Home
+                                                  isInternalPath(context, tabDir.absolutePath) -> Icons.Filled.PhoneAndroid
+                                                  else -> Icons.Filled.SdCard
+                                              },
+                                              contentDescription = null,
+                                              tint = if (titlePressed.value) Color.Black else if (selected) Color(0xFF90CAF9) else Color(0xFF6E8FA3),
+                                              modifier = Modifier.size(15.dp)
+                                          )
+                                          Spacer(Modifier.width(5.dp))
+                                          Text(
+                                              text = tabTitle(context, tab.dir),
+                                              color = if (titlePressed.value) Color.Black else if (selected) Color.White else Color(0xFF9A9A9A),
+                                              fontSize = 13.sp,
+                                              fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                              maxLines = 1,
+                                              overflow = TextOverflow.Ellipsis,
+                                              modifier = Modifier.widthIn(max = 120.dp)
+                                          )
+                                      }
                                       Spacer(Modifier.width(6.dp))
                                       // Larger tap area for the x, so it is hard to hit by accident
                                       Box(
@@ -1877,12 +1953,70 @@ jobs:
               }
           }
 
+          // ---------- Marquee filename (merged from GreyIV) ----------
+          // Static "..." view, pauses, pans to reveal the full name, then snaps back and repeats.
+          // Never relies on the text layout engine's line-break/wrap decisions, so it is unaffected by
+          // punctuation like fullwidth colon or other Unicode chars.
+          @Composable
+          fun MarqueeFilename(name: String, modifier: Modifier = Modifier) {
+              var containerWidthPx by remember { mutableStateOf(0f) }
+              var textWidthPx by remember(name) { mutableStateOf(0f) }
+              val offsetAnim = remember(name) { Animatable(0f) }
+
+              val overflowAmount = (textWidthPx - containerWidthPx).coerceAtLeast(0f)
+              val needsMarquee = overflowAmount > 1f
+
+              LaunchedEffect(name, containerWidthPx, textWidthPx, needsMarquee) {
+                  if (!needsMarquee) return@LaunchedEffect
+                  while (true) {
+                      offsetAnim.snapTo(0f)
+                      delay(1800)
+                      offsetAnim.animateTo(
+                          targetValue = -overflowAmount,
+                          animationSpec = tween(
+                              durationMillis = (overflowAmount * 12).toInt().coerceIn(800, 6000)
+                          )
+                      )
+                      delay(1200)
+                      offsetAnim.animateTo(
+                          targetValue = 0f,
+                          animationSpec = tween(400)
+                      )
+                      delay(600)
+                  }
+              }
+
+              Box(
+                  modifier = modifier
+                      .fillMaxWidth()
+                      .clipToBounds()
+                      .onSizeChangedCompat { w, _ -> containerWidthPx = w.toFloat() }
+              ) {
+                  Text(
+                      text = name,
+                      color = Color.White,
+                      fontSize = 15.sp,
+                      maxLines = 1,
+                      softWrap = false,
+                      overflow = TextOverflow.Visible,
+                      modifier = Modifier
+                          .onSizeChangedCompat { w, _ -> textWidthPx = w.toFloat() }
+                          .graphicsLayer { translationX = offsetAnim.value }
+                  )
+              }
+          }
+
           // ---------- Image viewer ----------
+          // Merged from GreyIV: marquee filename, true-resolution label, large-image decoding.
           @Composable
           fun ImageViewerScreen(images: List<File>, startIndex: Int, onClose: () -> Unit) {
               val pagerState = rememberPagerState(initialPage = startIndex) { images.size }
               var controlsVisible by remember { mutableStateOf(true) }
               var currentPageZoomed by remember { mutableStateOf(false) }
+
+              // Tracks resolution per page index once known, so the label can
+              // appear as soon as it's available and persists across swipes.
+              val resolutions = remember { mutableStateMapOf<Int, Pair<Int, Int>>() }
 
               Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
                   HorizontalPager(
@@ -1891,15 +2025,21 @@ jobs:
                       userScrollEnabled = !currentPageZoomed
                   ) { page ->
                       val file = images[page]
+                      val uri = remember(file) { Uri.fromFile(file) }
                       if (ThumbnailCache.isGif(file.name)) {
-                          GifPage(file = file, onTap = { controlsVisible = !controlsVisible })
+                          GifPage(
+                              uri = uri,
+                              onTap = { controlsVisible = !controlsVisible },
+                              onSizeKnown = { w, h -> resolutions[page] = w to h }
+                          )
                       } else {
                           ZoomableImagePage(
-                              file = file,
+                              uri = uri,
                               onTap = { controlsVisible = !controlsVisible },
                               onZoomStateChanged = { zoomed ->
                                   if (page == pagerState.currentPage) currentPageZoomed = zoomed
-                              }
+                              },
+                              onSizeKnown = { w, h -> resolutions[page] = w to h }
                           )
                       }
                   }
@@ -1920,18 +2060,27 @@ jobs:
                       ) {
                           IconFlashButton(Icons.Filled.Close, "Close", iconSize = 24.dp) { onClose() }
                           Spacer(Modifier.width(8.dp))
-                          Text(
-                              text = images.getOrNull(pagerState.currentPage)?.name ?: "",
-                              color = Color.White,
-                              fontSize = 15.sp,
-                              maxLines = 1,
-                              modifier = Modifier.weight(1f)
-                          )
+                          Column(modifier = Modifier.weight(1f)) {
+                              MarqueeFilename(
+                                  name = images.getOrNull(pagerState.currentPage)?.name ?: ""
+                              )
+                              val res = resolutions[pagerState.currentPage]
+                              if (res != null) {
+                                  Text(
+                                      text = "(${res.first}x${res.second})",
+                                      color = Color.White.copy(alpha = 0.6f),
+                                      fontSize = 12.sp,
+                                      maxLines = 1
+                                  )
+                              }
+                          }
+                          Spacer(Modifier.width(8.dp))
                           Text(
                               text = "${pagerState.currentPage + 1}/${images.size}",
                               color = Color.White.copy(alpha = 0.7f),
                               fontSize = 13.sp
                           )
+                          Spacer(Modifier.width(8.dp))
                       }
                   }
               }
@@ -1939,10 +2088,8 @@ jobs:
               BackHandler { onClose() }
           }
 
-          // GIFs get a dedicated page using an Android ImageView driven by
-          // AnimatedImageDrawable so they actually play
           @Composable
-          fun GifPage(file: File, onTap: () -> Unit) {
+          fun GifPage(uri: Uri, onTap: () -> Unit, onSizeKnown: (Int, Int) -> Unit) {
               val context = LocalContext.current
               Box(
                   modifier = Modifier
@@ -1958,13 +2105,17 @@ jobs:
                       factory = { ctx ->
                           android.widget.ImageView(ctx).apply {
                               scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
-                              val drawable = FullImageCache.loadAnimatedDrawable(ctx, file.absolutePath)
+                              val drawable = FullImageCache.loadAnimatedDrawable(ctx, uri)
                               when (drawable) {
                                   is AnimatedImageDrawable -> {
                                       setImageDrawable(drawable)
                                       drawable.start()
+                                      onSizeKnown(drawable.intrinsicWidth, drawable.intrinsicHeight)
                                   }
-                                  is Bitmap -> setImageBitmap(drawable)
+                                  is Bitmap -> {
+                                      setImageBitmap(drawable)
+                                      onSizeKnown(drawable.width, drawable.height)
+                                  }
                               }
                           }
                       },
@@ -1975,26 +2126,40 @@ jobs:
 
           @Composable
           fun ZoomableImagePage(
-              file: File,
+              uri: Uri,
               onTap: () -> Unit,
-              onZoomStateChanged: (Boolean) -> Unit
+              onZoomStateChanged: (Boolean) -> Unit,
+              onSizeKnown: (Int, Int) -> Unit
           ) {
+              val context = LocalContext.current
               val density = LocalDensity.current
               var containerSize by remember { mutableStateOf(Offset.Zero) }
               val decayAnimationSpec = rememberSplineBasedDecay<Float>()
 
               val targetDimension = with(density) { (2200.dp.toPx()).toInt() }
-              var bitmap by remember(file.absolutePath) { mutableStateOf<Bitmap?>(null) }
-              LaunchedEffect(file.absolutePath) {
-                  bitmap = FullImageCache.decodeForViewer(file.absolutePath, targetDimension)
+              var bitmap by remember(uri) { mutableStateOf<Bitmap?>(null) }
+              var decodeFailed by remember(uri) { mutableStateOf(false) }
+
+              LaunchedEffect(uri) {
+                  // Cheap bounds-only probe first so the resolution label shows the
+                  // TRUE source size, not the downsampled render size.
+                  val size = FullImageCache.probeSize(context, uri)
+                  if (size != null) onSizeKnown(size.first, size.second)
+
+                  val result = FullImageCache.decodeForViewer(context, uri, targetDimension)
+                  if (result != null) {
+                      bitmap = result
+                  } else {
+                      decodeFailed = true
+                  }
               }
 
               val minScale = 1f
               val maxScale = 6f
 
-              val scaleAnim = remember(file.absolutePath) { Animatable(1f) }
-              val offsetXAnim = remember(file.absolutePath) { Animatable(0f) }
-              val offsetYAnim = remember(file.absolutePath) { Animatable(0f) }
+              val scaleAnim = remember(uri) { Animatable(1f) }
+              val offsetXAnim = remember(uri) { Animatable(0f) }
+              val offsetYAnim = remember(uri) { Animatable(0f) }
               val scope = rememberCoroutineScope()
 
               LaunchedEffect(scaleAnim.value) {
@@ -2018,7 +2183,7 @@ jobs:
                   modifier = Modifier
                       .fillMaxSize()
                       .onSizeChangedCompat { w, h -> containerSize = Offset(w.toFloat(), h.toFloat()) }
-                      .pointerInput(file.absolutePath) {
+                      .pointerInput(uri) {
                           awaitEachGesture {
                               val down = awaitFirstDown(requireUnconsumed = false)
                               val downTime = System.currentTimeMillis()
@@ -2122,6 +2287,12 @@ jobs:
                                   translationX = offsetXAnim.value * scaleAnim.value,
                                   translationY = offsetYAnim.value * scaleAnim.value
                               )
+                      )
+                  } else if (decodeFailed) {
+                      Text(
+                          "Couldn't load this image",
+                          color = Color.White.copy(alpha = 0.6f),
+                          fontSize = 14.sp
                       )
                   } else {
                       CircularProgressIndicator(color = Color.White.copy(alpha = 0.6f))
