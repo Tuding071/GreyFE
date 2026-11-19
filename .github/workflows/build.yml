@@ -173,6 +173,7 @@ jobs:
           import androidx.compose.foundation.gestures.detectHorizontalDragGestures
           import androidx.compose.foundation.gestures.detectTapGestures
           import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.verticalScroll
           import androidx.compose.foundation.interaction.MutableInteractionSource
           import androidx.compose.foundation.interaction.collectIsPressedAsState
           import androidx.compose.foundation.layout.*
@@ -827,6 +828,8 @@ jobs:
                               if (token == SavedTabs.HOME_TOKEN) newTab(null)
                               else newTab(File(token))
                           }
+                          // After reopening the app, the first (leftmost) saved tab is the one that is open
+                          activeIndex = 0
                       } else {
                           newTab(null)
                       }
@@ -967,6 +970,9 @@ jobs:
                                   onRequestClose = { pendingCloseIndex = it },
                                   onSwipeAddTab = { newTab(null) }
                               )
+
+                              // Small gap between the tabs and the list
+                              Spacer(Modifier.height(8.dp))
 
                               // Content: swipe left/right switches tabs, with motion between them
                               Box(
@@ -1406,11 +1412,12 @@ jobs:
               val base = when (kind) {
                   CrumbKind.CURRENT -> Color.White
                   CrumbKind.BEFORE -> Color.White.copy(alpha = 0.75f)
-                  CrumbKind.TRAIL -> Color.White.copy(alpha = 0.5f)
+                  CrumbKind.TRAIL -> Color.White.copy(alpha = 0.32f)
               }
               Text(
                   text = label,
                   color = if (pressed.value) Color.Black else base,
+                  fontWeight = if (kind == CrumbKind.CURRENT) FontWeight.Bold else FontWeight.Normal,
                   fontSize = 14.4.sp,
                   maxLines = 1,
                   modifier = modifier
@@ -1465,7 +1472,7 @@ jobs:
                           if (index > 0) {
                               Text(
                                   text = " / ",
-                                  color = Color.White.copy(alpha = if (crumb.kind == CrumbKind.TRAIL) 0.4f else 0.6f),
+                                  color = Color.White.copy(alpha = if (crumb.kind == CrumbKind.TRAIL) 0.25f else 0.6f),
                                   fontSize = 14.4.sp
                               )
                           }
@@ -1986,6 +1993,8 @@ jobs:
 
                       Spacer(Modifier.height(4.dp))
 
+                      // The bookmark list scrolls (Home stays pinned on top), so any number of bookmarks fits
+                      Column(modifier = Modifier.weight(1f).verticalScroll(rememberScrollState())) {
                       order.forEachIndexed { index, path ->
                           val name = File(path).name.ifEmpty { path }
                           val isDragging = index == draggingIndex
@@ -2059,6 +2068,7 @@ jobs:
                               fontSize = 12.sp,
                               modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
                           )
+                      }
                       }
                   }
               }
