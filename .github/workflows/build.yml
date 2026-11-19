@@ -119,6 +119,8 @@ jobs:
           package com.greyb.explorer
 
           import android.Manifest
+          import android.content.ClipData
+          import android.content.ClipboardManager
           import android.content.Context
           import android.content.Intent
           import android.content.pm.PackageManager
@@ -143,15 +145,21 @@ jobs:
           import androidx.activity.compose.setContent
           import androidx.activity.enableEdgeToEdge
           import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.animation.AnimatedContent
           import androidx.compose.animation.AnimatedVisibility
           import androidx.compose.animation.core.Animatable
+          import androidx.compose.animation.core.RepeatMode
           import androidx.compose.animation.core.animateDecay
+          import androidx.compose.animation.core.animateFloat
+          import androidx.compose.animation.core.infiniteRepeatable
+          import androidx.compose.animation.core.rememberInfiniteTransition
           import androidx.compose.animation.core.tween
           import androidx.compose.animation.fadeIn
           import androidx.compose.animation.fadeOut
           import androidx.compose.animation.rememberSplineBasedDecay
           import androidx.compose.animation.slideInHorizontally
           import androidx.compose.animation.slideOutHorizontally
+          import androidx.compose.animation.togetherWith
           import androidx.compose.foundation.Image
           import androidx.compose.foundation.background
           import androidx.compose.foundation.clickable
@@ -170,11 +178,11 @@ jobs:
           import androidx.compose.foundation.pager.HorizontalPager
           import androidx.compose.foundation.pager.rememberPagerState
           import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
           import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.material.icons.Icons
           import androidx.compose.material.icons.filled.Add
           import androidx.compose.material.icons.filled.Close
-          import androidx.compose.material.icons.filled.DragHandle
           import androidx.compose.material.icons.filled.Folder
           import androidx.compose.material.icons.filled.Home
           import androidx.compose.material.icons.filled.InsertDriveFile
@@ -182,7 +190,18 @@ jobs:
           import androidx.compose.material.icons.filled.MoreVert
           import androidx.compose.material.icons.filled.PhoneAndroid
           import androidx.compose.material.icons.filled.SdCard
-          import androidx.compose.material3.*
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.ButtonDefaults
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.CircularProgressIndicator
+          import androidx.compose.material3.ExperimentalMaterial3Api
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.material3.pulltorefresh.PullToRefreshBox
           import androidx.compose.runtime.*
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
@@ -199,6 +218,8 @@ jobs:
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.platform.LocalDensity
           import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.Dp
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
           import androidx.compose.ui.viewinterop.AndroidView
@@ -210,6 +231,7 @@ jobs:
           import androidx.lifecycle.LifecycleEventObserver
           import androidx.lifecycle.compose.LocalLifecycleOwner
           import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
           import kotlinx.coroutines.launch
           import kotlinx.coroutines.withContext
           import kotlinx.coroutines.withTimeoutOrNull
@@ -217,6 +239,9 @@ jobs:
           import java.io.FileOutputStream
           import java.lang.reflect.Method
           import java.security.MessageDigest
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
 
           class MainActivity : ComponentActivity() {
               override fun onCreate(savedInstanceState: Bundle?) {
@@ -277,7 +302,32 @@ jobs:
               return parts
           }
 
-          // ---------- Bookmarks (max 15) ----------
+          // ---------- Formatting helpers ----------
+          fun formatSize(bytes: Long): String {
+              val units = arrayOf("B", "KB", "MB", "GB")
+              var value = bytes.toDouble()
+              var idx = 0
+              while (value >= 1024 && idx < units.size - 1) {
+                  value /= 1024
+                  idx++
+              }
+              return if (idx == 0) "$bytes B" else String.format(Locale.US, "%.1f %s", value, units[idx])
+          }
+
+          fun formatDate(millis: Long): String =
+              SimpleDateFormat("d MMM yyyy, HH:mm", Locale.getDefault()).format(Date(millis))
+
+          val textExtensions = setOf(
+              "txt", "yml", "yaml", "java", "kt", "kts", "xml", "json", "md", "csv", "tsv",
+              "gradle", "properties", "py", "js", "ts", "html", "css", "c", "cpp", "h", "hpp",
+              "sh", "log", "ini", "cfg", "conf", "toml", "sql", "go", "rs", "swift", "dart",
+              "php", "rb", "bat", "ps1", "lua", "srt", "vtt"
+          )
+
+          fun isTextFile(file: File): Boolean =
+              file.isFile && file.extension.lowercase() in textExtensions
+
+          // ---------- Bookmarks (shown list capped at 15 items) ----------
           object Bookmarks {
               private const val PREFS = "bookmarks_prefs"
               private const val KEY = "bookmark_paths"
@@ -305,7 +355,7 @@ jobs:
               }
 
               fun reorder(context: Context, newOrder: List<String>) {
-                  save(context, newOrder.take(MAX_ITEMS))
+                  save(context, newOrder)
               }
 
               private fun save(context: Context, list: List<String>) {
@@ -336,6 +386,9 @@ jobs:
           class TabState(val id: Long, initialDir: File?) {
               var dir by mutableStateOf(initialDir)
           }
+
+          // Wrapper so each reload is a new object and always triggers state updates
+          class Listing(val files: List<File>)
 
           // ---------- Thumbnail cache ----------
           object ThumbnailCache {
@@ -551,6 +604,12 @@ jobs:
               return roots.distinctBy { it.second.absolutePath }
           }
 
+          // Returns true when a path lives on internal storage (used for bookmark icons)
+          fun isInternalPath(context: Context, path: String): Boolean {
+              val root = getStorageRoots(context).firstOrNull { path.startsWith(it.second.absolutePath) }
+              return root == null || root.first == "Internal Storage"
+          }
+
           @Composable
           fun FileExplorerApp() {
               val context = LocalContext.current
@@ -707,7 +766,7 @@ jobs:
                                   onSwipeAddTab = { newTab(null) }
                               )
 
-                              // Content: swipe left/right switches tabs
+                              // Content: swipe left/right switches tabs, with motion between them
                               Box(
                                   modifier = Modifier
                                       .fillMaxSize()
@@ -729,26 +788,39 @@ jobs:
                                           )
                                       }
                               ) {
-                                  val tab = tabs.getOrNull(activeIndex)
-                                  if (tab != null) {
-                                      val dir = tab.dir
-                                      if (dir == null) {
-                                          HomeScreen(
-                                              refreshKey = refreshTrigger,
-                                              onRootClick = { root -> tab.dir = root }
-                                          )
-                                      } else {
-                                          FileListScreen(
-                                              directory = dir,
-                                              onNavigate = { d -> tab.dir = d },
-                                              onJumpTo = { target -> tab.dir = target },
-                                              onNavigateHome = { tab.dir = null },
-                                              onOpenImage = { images, index ->
-                                                  viewerImages = images
-                                                  viewerStartIndex = index
-                                              },
-                                              bookmarkListVersion = bookmarkListVersion
-                                          )
+                                  AnimatedContent(
+                                      targetState = activeIndex,
+                                      transitionSpec = {
+                                          if (targetState > initialState) {
+                                              (slideInHorizontally { it / 4 } + fadeIn()) togetherWith
+                                                  (slideOutHorizontally { -it / 4 } + fadeOut())
+                                          } else {
+                                              (slideInHorizontally { -it / 4 } + fadeIn()) togetherWith
+                                                  (slideOutHorizontally { it / 4 } + fadeOut())
+                                          }
+                                      },
+                                      modifier = Modifier.fillMaxSize(),
+                                      label = "tabSwitch"
+                                  ) { idx ->
+                                      val tab = tabs.getOrNull(idx)
+                                      if (tab != null) {
+                                          val dir = tab.dir
+                                          if (dir == null) {
+                                              HomeScreen(
+                                                  refreshKey = refreshTrigger,
+                                                  onRefresh = { refreshTrigger++ },
+                                                  onRootClick = { root -> tab.dir = root }
+                                              )
+                                          } else {
+                                              FileListScreen(
+                                                  directory = dir,
+                                                  onNavigate = { d -> tab.dir = d },
+                                                  onOpenImage = { images, index ->
+                                                      viewerImages = images
+                                                      viewerStartIndex = index
+                                                  }
+                                              )
+                                          }
                                       }
                                   }
                               }
@@ -760,7 +832,7 @@ jobs:
                               AlertDialog(
                                   onDismissRequest = { pendingCloseIndex = -1 },
                                   title = { Text("Close tab?") },
-                                  text = { Text("Close \"${tabTitle(context, tabs[idx].dir)}\"?") },
+                                  text = { Text("Close \"${tabTitle(tabs[idx].dir)}\"?") },
                                   confirmButton = {
                                       TextButton(onClick = {
                                           tabs.removeAt(idx)
@@ -805,7 +877,7 @@ jobs:
               }
           }
 
-          fun tabTitle(context: Context, dir: File?): String {
+          fun tabTitle(dir: File?): String {
               return if (dir == null) "Home" else (dir.name.ifEmpty { dir.absolutePath })
           }
 
@@ -833,6 +905,7 @@ jobs:
               return list
           }
 
+          // Tabs: no boxes. Current tab has a thick white line under it.
           @Composable
           fun TabRow(
               tabs: List<TabState>,
@@ -841,7 +914,6 @@ jobs:
               onRequestClose: (Int) -> Unit,
               onSwipeAddTab: () -> Unit
           ) {
-              val context = LocalContext.current
               var swipeTotal by remember { mutableStateOf(0f) }
               Row(
                   modifier = Modifier
@@ -857,34 +929,41 @@ jobs:
                               }
                           )
                       }
-                      .horizontalScroll(rememberScrollState())
-                      .padding(horizontal = 6.dp, vertical = 6.dp),
+                      .horizontalScroll(rememberScrollState()),
                   verticalAlignment = Alignment.CenterVertically
               ) {
                   tabs.forEachIndexed { index, tab ->
                       val selected = index == activeIndex
-                      Row(
+                      Column(
                           modifier = Modifier
-                              .padding(end = 6.dp)
-                              .clip(RoundedCornerShape(8.dp))
-                              .background(if (selected) Color(0xFF3A3A3A) else Color(0xFF2A2A2A))
                               .clickable { onSelect(index) }
-                              .padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
-                          verticalAlignment = Alignment.CenterVertically
+                              .padding(start = 12.dp, end = 8.dp, top = 8.dp)
                       ) {
-                          Text(
-                              text = tabTitle(context, tab.dir),
-                              color = if (selected) Color.White else Color(0xFFB0B0B0),
-                              fontSize = 13.sp,
-                              maxLines = 1,
-                              modifier = Modifier.widthIn(max = 140.dp)
-                          )
-                          Spacer(Modifier.width(6.dp))
-                          Icon(
-                              imageVector = Icons.Filled.Close,
-                              contentDescription = "Close tab",
-                              tint = Color(0xFFB0B0B0),
-                              modifier = Modifier.size(16.dp).clickable { onRequestClose(index) }
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Text(
+                                  text = tabTitle(tab.dir),
+                                  color = if (selected) Color.White else Color(0xFF9A9A9A),
+                                  fontSize = 13.sp,
+                                  fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                  maxLines = 1,
+                                  modifier = Modifier.widthIn(max = 140.dp)
+                              )
+                              Spacer(Modifier.width(8.dp))
+                              Icon(
+                                  imageVector = Icons.Filled.Close,
+                                  contentDescription = "Close tab",
+                                  tint = Color(0xFF9A9A9A),
+                                  modifier = Modifier
+                                      .size(16.dp)
+                                      .clickable { onRequestClose(index) }
+                              )
+                          }
+                          Spacer(Modifier.height(8.dp))
+                          Box(
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .height(4.dp)
+                                  .background(if (selected) Color.White else Color.Transparent)
                           )
                       }
                   }
@@ -892,7 +971,10 @@ jobs:
                       imageVector = Icons.Filled.Add,
                       contentDescription = "New tab",
                       tint = Color(0xFF90CAF9),
-                      modifier = Modifier.size(22.dp).clickable { onSwipeAddTab() }
+                      modifier = Modifier
+                          .padding(start = 8.dp, top = 8.dp)
+                          .size(22.dp)
+                          .clickable { onSwipeAddTab() }
                   )
               }
           }
@@ -914,6 +996,7 @@ jobs:
               }
           }
 
+          // Header: 10% taller than before. Icons and breadcrumbs 20% bigger.
           @Composable
           fun ScreenHeader(
               breadcrumbs: List<Pair<String, () -> Unit>>,
@@ -933,14 +1016,14 @@ jobs:
                   modifier = Modifier
                       .fillMaxWidth()
                       .background(Color(0xFF2A2A2A))
-                      .padding(horizontal = 12.dp, vertical = 12.dp),
+                      .padding(horizontal = 12.dp, vertical = 13.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
                   Icon(
                       imageVector = Icons.Filled.List,
                       contentDescription = "Bookmarks",
                       tint = Color.White,
-                      modifier = Modifier.size(22.dp).clickable { onOpenPanel() }
+                      modifier = Modifier.size(26.dp).clickable { onOpenPanel() }
                   )
                   Spacer(Modifier.width(12.dp))
 
@@ -953,18 +1036,17 @@ jobs:
                       breadcrumbs.forEachIndexed { index, (label, onClick) ->
                           if (index > 0) {
                               Text(
-                                  text = " › ",
-                                  color = Color(0xFF777777),
-                                  fontSize = 12.sp
+                                  text = " / ",
+                                  color = Color.White,
+                                  fontSize = 14.4.sp
                               )
                           }
-                          val isLast = index == breadcrumbs.lastIndex
                           Text(
                               text = label,
-                              color = if (isLast) Color.White else Color(0xFF4FC3F7),
-                              fontSize = 12.sp,
+                              color = Color.White,
+                              fontSize = 14.4.sp,
                               maxLines = 1,
-                              modifier = Modifier.clickable(enabled = !isLast) { onClick() }
+                              modifier = Modifier.clickable { onClick() }
                           )
                       }
                   }
@@ -976,10 +1058,10 @@ jobs:
                               imageVector = Icons.Filled.MoreVert,
                               contentDescription = "Menu",
                               tint = Color.White,
-                              modifier = Modifier.size(22.dp).clickable { onMenuToggle() }
+                              modifier = Modifier.size(26.dp).clickable { onMenuToggle() }
                           )
                           if (menuOpen) {
-                              // Full-screen transparent scrim: any touch outside the menu closes it
+                              // Full-screen scrim: any touch outside the menu closes it
                               Popup(
                                   onDismissRequest = onMenuDismiss,
                                   properties = PopupProperties(focusable = true, dismissOnBackPress = true, dismissOnClickOutside = true)
@@ -1005,7 +1087,7 @@ jobs:
                                                   onClick = {}
                                               )
                                       ) {
-                                          menuContent?.invoke(onMenuDismiss)
+                                          menuContent.invoke(onMenuDismiss)
                                       }
                                   }
                               }
@@ -1027,15 +1109,64 @@ jobs:
               )
           }
 
+          // Skeleton placeholder rows with a soft pulse while content loads
+          @Composable
+          fun SkeletonRows(count: Int, rowHeight: Dp) {
+              val transition = rememberInfiniteTransition(label = "shimmer")
+              val alpha by transition.animateFloat(
+                  initialValue = 0.15f,
+                  targetValue = 0.35f,
+                  animationSpec = infiniteRepeatable(tween(900), RepeatMode.Reverse),
+                  label = "shimmerAlpha"
+              )
+              val block = Color.White.copy(alpha = alpha)
+              Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
+                  repeat(count) {
+                      Row(
+                          modifier = Modifier
+                              .fillMaxWidth()
+                              .heightIn(min = rowHeight)
+                              .padding(vertical = 6.dp),
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          Box(Modifier.size(42.dp).clip(RoundedCornerShape(8.dp)).background(block))
+                          Spacer(Modifier.width(12.dp))
+                          Column(Modifier.weight(1f)) {
+                              Box(Modifier.fillMaxWidth(0.7f).height(12.dp).clip(RoundedCornerShape(4.dp)).background(block))
+                              Spacer(Modifier.height(6.dp))
+                              Box(Modifier.fillMaxWidth(0.4f).height(9.dp).clip(RoundedCornerShape(4.dp)).background(block))
+                          }
+                      }
+                  }
+              }
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class)
           @Composable
           fun HomeScreen(
               refreshKey: Int,
+              onRefresh: () -> Unit,
               onRootClick: (File) -> Unit
           ) {
               val context = LocalContext.current
+              var refreshing by remember { mutableStateOf(false) }
               val roots = remember(refreshKey) { getStorageRoots(context) }
 
-              Column(Modifier.fillMaxSize()) {
+              LaunchedEffect(refreshKey) {
+                  if (refreshing) {
+                      delay(400)
+                      refreshing = false
+                  }
+              }
+
+              PullToRefreshBox(
+                  isRefreshing = refreshing,
+                  onRefresh = {
+                      refreshing = true
+                      onRefresh()
+                  },
+                  modifier = Modifier.fillMaxSize()
+              ) {
                   if (roots.isEmpty()) {
                       Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                           Text("No storage found", color = Color.White, fontSize = 16.sp)
@@ -1043,7 +1174,7 @@ jobs:
                   } else {
                       LazyColumn(
                           modifier = Modifier.fillMaxSize(),
-                          contentPadding = PaddingValues(16.dp)
+                          contentPadding = PaddingValues(vertical = 8.dp)
                       ) {
                           items(roots) { (label, root) ->
                               TappableRow(onClick = { onRootClick(root) }) {
@@ -1086,44 +1217,72 @@ jobs:
               }
           }
 
+          // File list: edge to edge, 15 rows fill the screen at minimum height,
+          // rows grow up to 3 name lines. Shows skeleton rows while loading.
+          @OptIn(ExperimentalMaterial3Api::class)
           @Composable
           fun FileListScreen(
               directory: File,
               onNavigate: (File) -> Unit,
-              onJumpTo: (File) -> Unit,
-              onNavigateHome: () -> Unit,
-              onOpenImage: (images: List<File>, index: Int) -> Unit,
-              bookmarkListVersion: Int
+              onOpenImage: (images: List<File>, index: Int) -> Unit
           ) {
               val context = LocalContext.current
-              val files = remember(directory) {
-                  directory.listFiles()
-                      ?.sortedWith(compareBy<File> { it.isFile }.thenBy(naturalOrderComparator) { it.name })
-                      ?: emptyList()
-              }
-              val imagesInDir = remember(files) { files.filter { it.isFile && ThumbnailCache.isImage(it.name) } }
+              var loadKey by remember { mutableStateOf(0) }
+              var refreshing by remember { mutableStateOf(false) }
 
-              Column(Modifier.fillMaxSize()) {
-                  if (files.isEmpty()) {
-                      Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                          Text("Empty folder", color = Color.White, fontSize = 16.sp)
-                      }
-                  } else {
-                      LazyColumn(
-                          modifier = Modifier.fillMaxSize(),
-                          contentPadding = PaddingValues(8.dp)
-                      ) {
-                          items(files) { file ->
-                              FileRow(file = file, onClick = {
-                                  when {
-                                      file.isDirectory -> onNavigate(file)
-                                      ThumbnailCache.isImage(file.name) -> {
-                                          val idx = imagesInDir.indexOf(file).coerceAtLeast(0)
-                                          onOpenImage(imagesInDir, idx)
+              val listing by produceState<Listing?>(initialValue = null, directory, loadKey) {
+                  value = withContext(Dispatchers.IO) {
+                      Listing(
+                          directory.listFiles()
+                              ?.sortedWith(compareBy<File> { it.isFile }.thenBy(naturalOrderComparator) { it.name })
+                              ?: emptyList()
+                      )
+                  }
+              }
+
+              LaunchedEffect(listing) {
+                  if (listing != null) refreshing = false
+              }
+
+              val files = listing?.files
+              val imagesInDir = remember(files) { files?.filter { it.isFile && ThumbnailCache.isImage(it.name) } ?: emptyList() }
+
+              PullToRefreshBox(
+                  isRefreshing = refreshing,
+                  onRefresh = {
+                      refreshing = true
+                      loadKey++
+                  },
+                  modifier = Modifier.fillMaxSize()
+              ) {
+                  BoxWithConstraints(Modifier.fillMaxSize()) {
+                      val rowMin: Dp = maxHeight / 15
+
+                      if (files == null) {
+                          SkeletonRows(count = 15, rowHeight = rowMin)
+                      } else if (files.isEmpty()) {
+                          Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                              Text("Empty folder", color = Color.White, fontSize = 16.sp)
+                          }
+                      } else {
+                          LazyColumn(modifier = Modifier.fillMaxSize()) {
+                              items(files, key = { it.absolutePath }) { file ->
+                                  FileRow(
+                                      file = file,
+                                      rowMinHeight = rowMin,
+                                      modifier = Modifier.animateItem(),
+                                      onClick = {
+                                          when {
+                                              file.isDirectory -> onNavigate(file)
+                                              ThumbnailCache.isImage(file.name) -> {
+                                                  val idx = imagesInDir.indexOf(file).coerceAtLeast(0)
+                                                  onOpenImage(imagesInDir, idx)
+                                              }
+                                              else -> openFile(context, file)
+                                          }
                                       }
-                                      else -> openFile(context, file)
-                                  }
-                              })
+                                  )
+                              }
                           }
                       }
                   }
@@ -1134,7 +1293,7 @@ jobs:
           fun FileThumbBox(isDirectory: Boolean, thumb: Bitmap?) {
               Box(
                   modifier = Modifier
-                      .size(56.dp)
+                      .size(42.dp)
                       .clip(RoundedCornerShape(8.dp))
                       .background(
                           if (isDirectory && thumb == null) Color(0xFF3A3A3A) else Color.Transparent
@@ -1148,54 +1307,30 @@ jobs:
                           contentScale = ContentScale.Crop,
                           modifier = Modifier.fillMaxSize()
                       )
-                  } else if (!isDirectory) {
+                  } else if (isDirectory) {
+                      Icon(
+                          imageVector = Icons.Filled.Folder,
+                          contentDescription = null,
+                          tint = Color(0xFF9A9A9A),
+                          modifier = Modifier.size(24.dp)
+                      )
+                  } else {
                       Icon(
                           imageVector = Icons.Filled.InsertDriveFile,
                           contentDescription = null,
                           tint = Color(0xFFB0BEC5),
-                          modifier = Modifier.size(34.dp)
+                          modifier = Modifier.size(26.dp)
                       )
-                  }
-
-                  if (isDirectory) {
-                      if (thumb != null) {
-                          Box(
-                              modifier = Modifier
-                                  .background(Color(0x99000000), RoundedCornerShape(6.dp))
-                                  .padding(horizontal = 8.dp, vertical = 3.dp)
-                          ) {
-                              Text(
-                                  text = "Folder",
-                                  color = Color.White,
-                                  fontSize = 9.sp,
-                                  fontWeight = FontWeight.Medium
-                              )
-                          }
-                      } else {
-                          Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                              Icon(
-                                  imageVector = Icons.Filled.Folder,
-                                  contentDescription = null,
-                                  tint = Color(0xFF9A9A9A),
-                                  modifier = Modifier.size(28.dp)
-                              )
-                              Spacer(Modifier.height(2.dp))
-                              Text(
-                                  text = "Folder",
-                                  color = Color(0xFFCCCCCC),
-                                  fontSize = 8.sp,
-                                  fontWeight = FontWeight.Medium
-                              )
-                          }
-                      }
                   }
               }
           }
 
+          // One row: thumb | name (up to 3 lines) above size (left) and date (right) | optional Copy pill
           @Composable
-          fun FileRow(file: File, onClick: () -> Unit) {
+          fun FileRow(file: File, rowMinHeight: Dp, modifier: Modifier = Modifier, onClick: () -> Unit) {
               val context = LocalContext.current
               val hasFileThumb = file.isFile && (ThumbnailCache.isImage(file.name) || ThumbnailCache.isVideo(file.name))
+              val muted = Color.White.copy(alpha = 0.55f)
 
               val thumb by produceState<Bitmap?>(initialValue = null, key1 = file.absolutePath, key2 = file.lastModified()) {
                   value = when {
@@ -1205,15 +1340,86 @@ jobs:
                   }
               }
 
-              TappableRow(onClick = onClick) {
+              val sizeText = if (file.isDirectory) {
+                  val count = file.listFiles()?.size ?: 0
+                  "$count items"
+              } else {
+                  formatSize(file.length())
+              }
+
+              val interactionSource = remember { MutableInteractionSource() }
+              val pressed by interactionSource.collectIsPressedAsState()
+
+              Row(
+                  modifier = modifier
+                      .fillMaxWidth()
+                      .heightIn(min = rowMinHeight)
+                      .background(if (pressed) Color.White else Color.Transparent)
+                      .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+                      .padding(horizontal = 8.dp, vertical = 6.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
                   FileThumbBox(isDirectory = file.isDirectory, thumb = thumb)
-                  Spacer(Modifier.width(16.dp))
-                  Text(file.name, fontSize = 15.sp, maxLines = 1)
+                  Spacer(Modifier.width(12.dp))
+                  Column(modifier = Modifier.weight(1f)) {
+                      Text(
+                          text = file.name,
+                          color = if (pressed) Color.Black else Color.White,
+                          fontSize = 15.sp,
+                          maxLines = 3,
+                          overflow = TextOverflow.Ellipsis
+                      )
+                      Spacer(Modifier.height(2.dp))
+                      Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                          Text(
+                              text = sizeText,
+                              color = if (pressed) Color.Black.copy(alpha = 0.6f) else muted,
+                              fontSize = 11.sp,
+                              maxLines = 1
+                          )
+                          Text(
+                              text = formatDate(file.lastModified()),
+                              color = if (pressed) Color.Black.copy(alpha = 0.6f) else muted,
+                              fontSize = 11.sp,
+                              maxLines = 1
+                          )
+                      }
+                  }
+
+                  // Copy pill for text-based files: copies the whole content, no opening needed
+                  if (isTextFile(file)) {
+                      Spacer(Modifier.width(8.dp))
+                      Box(
+                          modifier = Modifier
+                              .clip(CircleShape)
+                              .background(Color.White)
+                              .clickable { copyFileContent(context, file) }
+                              .padding(horizontal = 12.dp, vertical = 6.dp)
+                      ) {
+                          Text("Copy", color = Color.Black, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                      }
+                  }
+              }
+          }
+
+          fun copyFileContent(context: Context, file: File) {
+              if (file.length() > 2_000_000L) {
+                  Toast.makeText(context, "File too large to copy", Toast.LENGTH_SHORT).show()
+                  return
+              }
+              try {
+                  val text = file.readText()
+                  val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                  cm.setPrimaryClip(ClipData.newPlainText(file.name, text))
+                  Toast.makeText(context, "Copied ${file.name}", Toast.LENGTH_SHORT).show()
+              } catch (e: Exception) {
+                  Toast.makeText(context, "Could not read file", Toast.LENGTH_SHORT).show()
               }
           }
 
           // ---------- Bookmarks side panel ----------
           // Press and hold the WHOLE row to drag; it follows the finger until release.
+          // Each row shows an internal or SD card icon (same icons as Home).
           @Composable
           fun BookmarksPanel(
               visible: Boolean,
@@ -1288,6 +1494,7 @@ jobs:
                           order.forEachIndexed { index, path ->
                               val name = File(path).name.ifEmpty { path }
                               val isDragging = index == draggingIndex
+                              val internal = isInternalPath(context, path)
                               Row(
                                   modifier = Modifier
                                       .fillMaxWidth()
@@ -1335,12 +1542,12 @@ jobs:
                                   verticalAlignment = Alignment.CenterVertically
                               ) {
                                   Icon(
-                                      imageVector = Icons.Filled.DragHandle,
-                                      contentDescription = null,
-                                      tint = Color(0xFF666666),
-                                      modifier = Modifier.size(18.dp)
+                                      imageVector = if (internal) Icons.Filled.PhoneAndroid else Icons.Filled.SdCard,
+                                      contentDescription = if (internal) "Internal storage" else "SD card",
+                                      tint = Color(0xFF90CAF9),
+                                      modifier = Modifier.size(20.dp)
                                   )
-                                  Spacer(Modifier.width(8.dp))
+                                  Spacer(Modifier.width(10.dp))
                                   Text(name, color = Color.White, fontSize = 14.sp, maxLines = 1, modifier = Modifier.weight(1f))
                               }
                           }
