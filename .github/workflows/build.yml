@@ -204,6 +204,7 @@ jobs:
           import androidx.compose.material3.Surface
           import androidx.compose.material3.Text
           import androidx.compose.material3.TextButton
+          import androidx.compose.material3.OutlinedTextField
           import androidx.compose.material3.darkColorScheme
           import androidx.compose.material3.pulltorefresh.PullToRefreshBox
           import androidx.compose.runtime.*
@@ -228,6 +229,12 @@ jobs:
           import androidx.compose.ui.layout.positionInParent
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.platform.LocalDensity
+          import androidx.compose.ui.platform.LocalHapticFeedback
+          import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+          import androidx.compose.ui.focus.FocusRequester
+          import androidx.compose.ui.focus.focusRequester
+          import androidx.compose.ui.text.TextRange
+          import androidx.compose.ui.text.input.TextFieldValue
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.Dp
@@ -484,6 +491,10 @@ jobs:
                   map[path] = listing
                   while (map.size > 40) map.remove(map.keys.first())
               }
+
+              // Forget everything (used after copy / move / rename / delete)
+              @Synchronized
+              fun clear() { map.clear() }
           }
 
           // Folder item counts, read in the background and remembered
@@ -493,10 +504,90 @@ jobs:
               @Synchronized
               fun cached(path: String): Int? = map[path]
 
+              @Synchronized
+              fun clear() { map.clear() }
+
               fun load(dir: File): Int {
                   val n = dir.listFiles()?.size ?: 0
                   synchronized(this) { map[dir.absolutePath] = n }
                   return n
+              }
+          }
+
+          // ---------- Pulse ----------
+          // While something is marked or waiting to be pasted, this flips every 500 ms.
+          // Marked items, the top-right menu button and the Cancel Mark / Paste here / Move here rows
+          // read it to blink white background + black text (about once every second).
+          val LocalPulse = compositionLocalOf<State<Boolean>?> { null }
+
+          // ---------- File operations (always run on a background thread) ----------
+          object FileOps {
+              // A name that does not exist in dir yet: "name (1).ext", "name (2).ext" ...
+              fun uniqueTarget(dir: File, name: String, isDir: Boolean): File {
+                  val first = File(dir, name)
+                  if (!first.exists()) return first
+                  val dot = name.lastIndexOf('.')
+                  val hasExt = !isDir && dot > 0
+                  val base = if (hasExt) name.substring(0, dot) else name
+                  val ext = if (hasExt) name.substring(dot) else ""
+                  var i = 1
+                  var candidate = File(dir, "$base ($i)$ext")
+                  while (candidate.exists()) {
+                      i++
+                      candidate = File(dir, "$base ($i)$ext")
+                  }
+                  return candidate
+              }
+
+              // Copy or move items into destDir. Returns a short message for a toast.
+              fun paste(paths: List<String>, destDir: File, move: Boolean): String {
+                  var ok = 0
+                  var failed = 0
+                  val destPath = destDir.absolutePath
+                  for (p in paths) {
+                      val src = File(p)
+                      if (!src.exists()) { failed++; continue }
+                      // A folder can not go into itself or into one of its own subfolders
+                      if (src.isDirectory && (destPath == src.absolutePath || destPath.startsWith(src.absolutePath + "/"))) {
+                          failed++
+                          continue
+                      }
+                      // Moving into the folder it is already in: nothing to do
+                      if (move && src.parentFile?.absolutePath == destPath) { ok++; continue }
+                      val target = uniqueTarget(destDir, src.name, src.isDirectory)
+                      val success = try {
+                          if (move) {
+                              // Same storage: instant rename. Other storage: copy, then delete the original.
+                              src.renameTo(target) || (src.copyRecursively(target) && src.deleteRecursively())
+                          } else {
+                              src.copyRecursively(target)
+                          }
+                      } catch (e: Exception) { false }
+                      if (success) ok++ else failed++
+                  }
+                  val verb = if (move) "Moved" else "Copied"
+                  return if (failed == 0) "$verb $ok item(s)" else "$verb $ok, $failed failed"
+              }
+
+              fun delete(paths: List<String>): String {
+                  var ok = 0
+                  var failed = 0
+                  for (p in paths) {
+                      val done = try { File(p).deleteRecursively() } catch (e: Exception) { false }
+                      if (done) ok++ else failed++
+                  }
+                  return if (failed == 0) "Deleted $ok item(s)" else "Deleted $ok, $failed failed"
+              }
+
+              // Returns an error message, or null when renamed
+              fun rename(src: File, newName: String): String? {
+                  val name = newName.trim()
+                  if (name.isEmpty()) return "Name can't be empty"
+                  if (name.contains('/')) return "Name can't contain /"
+                  if (name == src.name) return null
+                  val target = File(src.parentFile, name)
+                  if (target.exists()) return "\"$name\" already exists"
+                  return if (src.renameTo(target)) null else "Could not rename"
               }
           }
 
@@ -813,6 +904,87 @@ jobs:
               var menuOpen by remember { mutableStateOf(false) }
               var bookmarkListVersion by remember { mutableStateOf(0) }
 
+              // ---- Marking, copy / move, rename, delete ----
+              val scope = rememberCoroutineScope()
+              val marked = remember { mutableStateListOf<String>() }
+              val markedSet by remember { derivedStateOf { marked.toSet() } }
+              var clipPaths by remember { mutableStateOf<List<String>>(emptyList()) }
+              var clipMove by remember { mutableStateOf(false) }
+              var contextTarget by remember { mutableStateOf<File?>(null) }
+              var renameTarget by remember { mutableStateOf<File?>(null) }
+              var deleteTargets by remember { mutableStateOf<List<String>?>(null) }
+              var busy by remember { mutableStateOf(false) }
+
+              // Something is marked or waiting to be pasted: blink white bg / black text every second
+              val pending = marked.isNotEmpty() || clipPaths.isNotEmpty()
+              val cancelLabel = when {
+                  marked.isNotEmpty() -> "Cancel Mark"
+                  clipMove -> "Cancel Move"
+                  else -> "Cancel Copy"
+              }
+              val pulseOn = remember { mutableStateOf(false) }
+              LaunchedEffect(pending) {
+                  if (pending) {
+                      while (true) {
+                          pulseOn.value = true
+                          delay(500)
+                          pulseOn.value = false
+                          delay(500)
+                      }
+                  } else {
+                      pulseOn.value = false
+                  }
+              }
+
+              fun toggleMark(file: File) {
+                  val p = file.absolutePath
+                  if (marked.contains(p)) marked.remove(p) else marked.add(p)
+              }
+
+              // The items an action applies to: all marked items if this one is marked, else just this one
+              fun targetsFor(file: File): List<String> =
+                  if (markedSet.contains(file.absolutePath)) marked.toList() else listOf(file.absolutePath)
+
+              fun cancelPending() {
+                  marked.clear()
+                  clipPaths = emptyList()
+              }
+
+              fun afterFileOp() {
+                  DirCache.clear()
+                  FolderCount.clear()
+                  // A tab that was inside a deleted / moved / renamed folder goes up to the nearest folder that still exists
+                  tabs.forEach { t ->
+                      val d = t.dir
+                      if (d != null && !d.exists()) {
+                          var p = d.parentFile
+                          while (p != null && !p.exists()) p = p.parentFile
+                          t.dir = p
+                      }
+                  }
+                  refreshTrigger++
+              }
+
+              fun runOp(block: () -> String) {
+                  scope.launch {
+                      busy = true
+                      val msg = withContext(Dispatchers.IO) {
+                          try { block() } catch (e: Exception) { "Failed: ${e.message}" }
+                      }
+                      busy = false
+                      afterFileOp()
+                      Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              fun doPaste() {
+                  val dest = tabs.getOrNull(activeIndex)?.dir ?: return
+                  val paths = clipPaths
+                  val move = clipMove
+                  clipPaths = emptyList()
+                  runOp { FileOps.paste(paths, dest, move) }
+              }
+
               fun newTab(dir: File?) {
                   tabs.add(TabState(nextTabId, dir))
                   nextTabId++
@@ -867,9 +1039,10 @@ jobs:
                   onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
               }
 
-              BackHandler(enabled = viewerImages != null || panelOpen || menuOpen || tabs.size > 1 || tabs.getOrNull(activeIndex)?.dir != null) {
+              BackHandler(enabled = viewerImages != null || contextTarget != null || panelOpen || menuOpen || tabs.size > 1 || tabs.getOrNull(activeIndex)?.dir != null) {
                   when {
                       viewerImages != null -> viewerImages = null
+                      contextTarget != null -> contextTarget = null
                       menuOpen -> menuOpen = false
                       panelOpen -> panelOpen = false
                       else -> {
@@ -884,6 +1057,7 @@ jobs:
                   }
               }
 
+              CompositionLocalProvider(LocalPulse provides pulseOn) {
               Surface(
                   modifier = Modifier.fillMaxSize(),
                   color = Color(0xFF1E1E1E)
@@ -925,8 +1099,22 @@ jobs:
                                   menuOpen = menuOpen,
                                   onMenuToggle = { menuOpen = !menuOpen },
                                   onMenuDismiss = { menuOpen = false },
+                                  menuPulse = pending,
                                   menuContent = { close ->
                                       val activeDir = tabs.getOrNull(activeIndex)?.dir
+                                      // Pending actions pulse (white bg / black text) so they are not forgotten
+                                      if (pending) {
+                                          MenuRow(text = cancelLabel, pulse = true) {
+                                              cancelPending()
+                                              close()
+                                          }
+                                      }
+                                      if (activeDir != null && clipPaths.isNotEmpty()) {
+                                          MenuRow(text = if (clipMove) "Move here" else "Paste here", pulse = true) {
+                                              doPaste()
+                                              close()
+                                          }
+                                      }
                                       if (activeDir != null) {
                                           val bookmarked = Bookmarks.isBookmarked(context, activeDir.absolutePath)
                                           MenuRow(text = if (bookmarked) "Remove bookmark" else "Add to bookmarks") {
@@ -1048,6 +1236,10 @@ jobs:
                                               FileListScreen(
                                                   directory = dir,
                                                   sortMode = sortMode,
+                                                  refreshKey = refreshTrigger,
+                                                  marked = markedSet,
+                                                  onToggleMark = { f -> toggleMark(f) },
+                                                  onLongPress = { f -> contextTarget = f },
                                                   onNavigate = { d -> tab.dir = d },
                                                   onOpenImage = { images, index ->
                                                       viewerImages = images
@@ -1090,6 +1282,121 @@ jobs:
                           }
                       }
 
+                      // Long-press menu for an item (Rename, Mark, Copy, Move, Delete + pending actions)
+                      val ctx = contextTarget
+                      if (ctx != null) {
+                          val targets = targetsFor(ctx)
+                          val multi = targets.size > 1
+                          FileContextMenu(
+                              title = if (multi) "${targets.size} items marked" else ctx.name,
+                              isMarked = markedSet.contains(ctx.absolutePath),
+                              cancelLabel = if (pending) cancelLabel else null,
+                              pasteLabel = if (clipPaths.isNotEmpty() && tabs.getOrNull(activeIndex)?.dir != null) {
+                                  if (clipMove) "Move here" else "Paste here"
+                              } else null,
+                              onRename = {
+                                  contextTarget = null
+                                  renameTarget = ctx
+                              },
+                              onMark = {
+                                  toggleMark(ctx)
+                                  contextTarget = null
+                              },
+                              onCopy = {
+                                  clipPaths = targets
+                                  clipMove = false
+                                  marked.clear()
+                                  contextTarget = null
+                                  Toast.makeText(context, "${targets.size} item(s) ready to paste", Toast.LENGTH_SHORT).show()
+                              },
+                              onMove = {
+                                  clipPaths = targets
+                                  clipMove = true
+                                  marked.clear()
+                                  contextTarget = null
+                                  Toast.makeText(context, "${targets.size} item(s) ready to move", Toast.LENGTH_SHORT).show()
+                              },
+                              onDelete = {
+                                  contextTarget = null
+                                  deleteTargets = targets
+                              },
+                              onCancel = {
+                                  cancelPending()
+                                  contextTarget = null
+                              },
+                              onPaste = {
+                                  contextTarget = null
+                                  doPaste()
+                              },
+                              onDismiss = { contextTarget = null }
+                          )
+                      }
+
+                      // Rename
+                      val rt = renameTarget
+                      if (rt != null) {
+                          RenameDialog(
+                              file = rt,
+                              onConfirm = { newName ->
+                                  val err = FileOps.rename(rt, newName)
+                                  if (err != null) {
+                                      Toast.makeText(context, err, Toast.LENGTH_SHORT).show()
+                                  } else {
+                                      marked.remove(rt.absolutePath)
+                                      renameTarget = null
+                                      afterFileOp()
+                                      Toast.makeText(context, "Renamed", Toast.LENGTH_SHORT).show()
+                                  }
+                              },
+                              onDismiss = { renameTarget = null }
+                          )
+                      }
+
+                      // Delete with confirmation
+                      val dt = deleteTargets
+                      if (dt != null) {
+                          AlertDialog(
+                              onDismissRequest = { deleteTargets = null },
+                              title = { Text("Delete?") },
+                              text = {
+                                  Text(
+                                      if (dt.size == 1) "Delete \"${File(dt[0]).name}\"? This can't be undone."
+                                      else "Delete ${dt.size} items? This can't be undone."
+                                  )
+                              },
+                              confirmButton = {
+                                  TextButton(onClick = {
+                                      deleteTargets = null
+                                      marked.clear()
+                                      runOp { FileOps.delete(dt) }
+                                  }) { Text("Delete", color = Color(0xFFEF9A9A)) }
+                              },
+                              dismissButton = {
+                                  TextButton(onClick = { deleteTargets = null }) { Text("Cancel") }
+                              },
+                              containerColor = Color(0xFF2A2A2A),
+                              titleContentColor = Color.White,
+                              textContentColor = Color.White
+                          )
+                      }
+
+                      // Working: blocks touches until the copy / move / delete is done
+                      if (busy) {
+                          Box(
+                              modifier = Modifier
+                                  .fillMaxSize()
+                                  .background(Color(0x88000000))
+                                  .clickable(
+                                      interactionSource = remember { MutableInteractionSource() },
+                                      indication = null,
+                                      onClick = {}
+                                  ),
+                              contentAlignment = Alignment.Center
+                          ) {
+                              CircularProgressIndicator(color = Color.White)
+                          }
+                      }
+
                       // Bookmarks panel: opens and closes with no animation
                       BookmarksPanel(
                           visible = panelOpen,
@@ -1109,6 +1416,7 @@ jobs:
                           }
                       )
                   }
+              }
               }
           }
 
