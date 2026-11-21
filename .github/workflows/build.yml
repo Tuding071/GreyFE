@@ -563,6 +563,28 @@ jobs:
               fun isInside(context: Context, f: File): Boolean =
                   f.absolutePath.startsWith(root(context).absolutePath + "/")
 
+              // For the top folder of an opened archive: the real folder the zip file is in (else null)
+              fun originFolder(context: Context, d: File): File? {
+                  val r = root(context)
+                  val p = d.parentFile ?: return null
+                  if (p.parentFile?.absolutePath != r.absolutePath) return null
+                  val s = File(r, p.name + ".src")
+                  if (!s.exists()) return null
+                  val path = s.readText()
+                  return if (path.isEmpty()) null else File(path)
+              }
+
+              // Delete extracted archives that no tab is inside any more (keeps storage use small)
+              fun cleanup(context: Context, tabPaths: List<String>) {
+                  val r = root(context)
+                  val rootPath = r.absolutePath + "/"
+                  r.listFiles()?.forEach { f ->
+                      val key = f.name.removeSuffix(".ok").removeSuffix(".src")
+                      val used = tabPaths.any { it.startsWith(rootPath + key + "/") }
+                      if (!used) f.deleteRecursively()
+                  }
+              }
+
               // null = not a readable zip, true = needs a password
               fun isEncrypted(file: File): Boolean? = try {
                   val z = ZipFile(file)
@@ -579,6 +601,9 @@ jobs:
                       val destRoot = File(rootDir, key)
                       val dest = File(destRoot, file.name)
                       val marker = File(rootDir, "$key.ok")
+                      // Remember which folder the zip lives in, so Back from the archive returns there
+                      rootDir.mkdirs()
+                      File(rootDir, "$key.src").writeText(file.parentFile?.absolutePath ?: "")
                       // Already opened before (and not password protected): reuse
                       if (password == null && marker.exists() && dest.isDirectory) return ExtractResult(dest, false, null)
                       marker.delete()
@@ -1238,6 +1263,12 @@ jobs:
                   runOp("Zipping") { p -> ZipOps.zip(items, dest, password.ifEmpty { null }, p) }
               }
 
+              // Free the extracted copy as soon as no tab is inside the archive any more
+              val tabPaths = tabs.map { it.dir?.absolutePath ?: "" }
+              LaunchedEffect(tabPaths, op == null) {
+                  if (op == null) withContext(Dispatchers.IO) { ArchiveSupport.cleanup(context, tabPaths) }
+              }
+
               fun newTab(dir: File?) {
                   tabs.add(TabState(nextTabId, dir))
                   nextTabId++
@@ -1304,7 +1335,8 @@ jobs:
                           val tab = tabs.getOrNull(activeIndex) ?: return@BackHandler
                           val d = tab.dir
                           if (d != null) {
-                              val parent = d.parentFile
+                              // Back from the top of an opened archive goes to the folder holding the zip
+                              val parent = ArchiveSupport.originFolder(context, d) ?: d.parentFile
                               val isRoot = StorageRoots.get(context).any { it.second.absolutePath == d.absolutePath }
                               tab.dir = if (parent != null && !isRoot) parent else null
                           }
