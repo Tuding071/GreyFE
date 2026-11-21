@@ -350,6 +350,13 @@ jobs:
               }
           }
 
+          // ---------- Last opened item ----------
+          // The folder / file opened last gets a faint white highlight (only one, whole app).
+          // It moves when another item is opened. Pressed / marked rows (solid white) win over it.
+          object LastOpened {
+              var path by mutableStateOf<String?>(null)
+          }
+
           // ---------- Scroll memory ----------
           // Entering or leaving a folder always starts at the top. Only after opening a FILE
           // (image, zip, other app) the list goes back to where it was, via markRestore().
@@ -2514,6 +2521,8 @@ jobs:
                                           onLongPress(entry.file)
                                       },
                                       onClick = {
+                                          // Opening (not selecting while items are marked) leaves the faint highlight on this row
+                                          if (marked.isEmpty()) LastOpened.path = entry.file.absolutePath
                                           when {
                                               // While items are marked, a tap toggles the mark (multi-select)
                                               marked.isNotEmpty() -> onToggleMark(entry.file)
@@ -2634,13 +2643,26 @@ jobs:
               val pressedState = remember { mutableStateOf(false) }
               // Marked rows stay white background + black text (static, no pulsing)
               val pressed = pressedState.value || marked
+              // Faint highlight for the last opened item; its size/date text is brighter so it stays readable
+              val lastOpened = !pressed && LastOpened.path == file.absolutePath
+              val secondary = when {
+                  pressed -> Color.Black.copy(alpha = 0.6f)
+                  lastOpened -> Color.White.copy(alpha = 0.8f)
+                  else -> muted
+              }
               val copyPressed = remember { mutableStateOf(false) }
 
               Row(
                   modifier = modifier
                       .fillMaxWidth()
                       .heightIn(min = rowMinHeight)
-                      .background(if (pressed) Color.White else Color.Transparent)
+                      .background(
+                          when {
+                              pressed -> Color.White
+                              lastOpened -> Color.White.copy(alpha = 0.12f)
+                              else -> Color.Transparent
+                          }
+                      )
                       .pressFlashLong(pressedState, onLongClick, onClick)
                       .padding(horizontal = 8.dp, vertical = 6.dp),
                   verticalAlignment = Alignment.CenterVertically
@@ -2659,13 +2681,13 @@ jobs:
                       Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                           Text(
                               text = sizeText,
-                              color = if (pressed) Color.Black.copy(alpha = 0.6f) else muted,
+                              color = secondary,
                               fontSize = 11.sp,
                               maxLines = 1
                           )
                           Text(
                               text = formatDate(entry.modified),
-                              color = if (pressed) Color.Black.copy(alpha = 0.6f) else muted,
+                              color = secondary,
                               fontSize = 11.sp,
                               maxLines = 1
                           )
