@@ -243,6 +243,7 @@ jobs:
           import androidx.compose.ui.unit.sp
           import androidx.compose.ui.viewinterop.AndroidView
           import androidx.compose.ui.window.Dialog
+          import androidx.compose.ui.window.DialogProperties
           import androidx.compose.material3.OutlinedTextFieldDefaults
           import androidx.compose.ui.window.Popup
           import androidx.compose.ui.window.PopupProperties
@@ -258,6 +259,15 @@ jobs:
           import kotlinx.coroutines.withContext
           import kotlinx.coroutines.withTimeoutOrNull
           import java.io.File
+          import java.util.concurrent.atomic.AtomicBoolean
+          import net.lingala.zip4j.ZipFile
+          import net.lingala.zip4j.model.ZipParameters
+          import net.lingala.zip4j.model.enums.AesKeyStrength
+          import net.lingala.zip4j.model.enums.CompressionMethod
+          import net.lingala.zip4j.model.enums.EncryptionMethod
+          import net.lingala.zip4j.progress.ProgressMonitor
+          import androidx.compose.material3.LinearProgressIndicator
+          import androidx.compose.ui.text.input.PasswordVisualTransformation
           import java.io.FileOutputStream
           import java.io.InputStream
           import java.lang.reflect.Method
@@ -518,9 +528,132 @@ jobs:
 
           // ---------- Pulse ----------
           // While something is marked or waiting to be pasted, this flips every 500 ms.
-          // Marked items, the top-right menu button and the Cancel Mark / Paste here / Move here rows
-          // read it to blink white background + black text (about once every second).
+          // ONLY the top-right menu button reads it (blinks white bg + black text, about once a second).
+          // Marked rows are static white/black; pending menu rows show a white dot instead.
           val LocalPulse = compositionLocalOf<State<Boolean>?> { null }
+
+          // =====================================================================
+          // PROGRESS POPUP (reusable): NOTE FOR FUTURE - every long task (copy, move, delete, zip,
+          // opening an archive, ...) must go through runOp(...) in FileExplorerApp. It shows
+          // ProgressDialog with the title, the current item, a progress bar and a Cancel button.
+          // The task gets an OpProgress and reports with op.detail / op.fraction (0..1, null = unknown),
+          // and checks op.cancelled regularly.
+          // =====================================================================
+          class OpProgress(val title: String) {
+              var detail by mutableStateOf("")
+              var fraction by mutableStateOf<Float?>(null)
+              val cancelled = AtomicBoolean(false)
+          }
+
+          class OpCancelled : RuntimeException()
+
+          // ---------- Archives (zip) ----------
+          // Opening a zip: it is extracted into the app cache and shown as a normal folder, so every
+          // feature works inside it (image viewer, copy out = extract). The cache is cleared at app start.
+          class ExtractResult(val dest: File?, val wrongPassword: Boolean, val message: String?)
+
+          object ArchiveSupport {
+              fun isArchiveName(name: String): Boolean {
+                  val n = name.lowercase()
+                  return n.endsWith(".zip") || n.endsWith(".cbz") || n.endsWith(".jar")
+              }
+
+              fun root(context: Context): File = File(context.cacheDir, "archives")
+
+              fun isInside(context: Context, f: File): Boolean =
+                  f.absolutePath.startsWith(root(context).absolutePath + "/")
+
+              // null = not a readable zip, true = needs a password
+              fun isEncrypted(file: File): Boolean? = try {
+                  val z = ZipFile(file)
+                  if (!z.isValidZipFile) null else z.isEncrypted
+              } catch (e: Exception) { null }
+
+              fun extract(context: Context, file: File, password: String?, op: OpProgress): ExtractResult {
+                  try {
+                      val zip = ZipFile(file)
+                      if (password != null) zip.setPassword(password.toCharArray())
+                      val headers = zip.fileHeaders
+                      val key = Integer.toHexString((file.absolutePath + file.lastModified() + file.length()).hashCode())
+                      val rootDir = root(context)
+                      val destRoot = File(rootDir, key)
+                      val dest = File(destRoot, file.name)
+                      val marker = File(rootDir, "$key.ok")
+                      // Already opened before (and not password protected): reuse
+                      if (password == null && marker.exists() && dest.isDirectory) return ExtractResult(dest, false, null)
+                      marker.delete()
+                      destRoot.deleteRecursively()
+                      dest.mkdirs()
+                      val total = headers.filter { !it.isDirectory }.sumOf { it.uncompressedSize }.coerceAtLeast(1L)
+                      var done = 0L
+                      try {
+                          for (h in headers) {
+                              if (op.cancelled.get()) {
+                                  destRoot.deleteRecursively()
+                                  return ExtractResult(null, false, "Cancelled")
+                              }
+                              op.detail = h.fileName.trimEnd('/').substringAfterLast('/')
+                              zip.extractFile(h, dest.absolutePath)
+                              done += if (h.isDirectory) 0L else h.uncompressedSize
+                              op.fraction = (done.toDouble() / total).toFloat().coerceIn(0f, 1f)
+                          }
+                      } catch (e: net.lingala.zip4j.exception.ZipException) {
+                          destRoot.deleteRecursively()
+                          val type = e.type?.name ?: ""
+                          if (password != null && (type == "WRONG_PASSWORD" || type == "CHECKSUM_MISMATCH")) {
+                              return ExtractResult(null, true, null)
+                          }
+                          if (type == "WRONG_PASSWORD") return ExtractResult(null, true, null)
+                          return ExtractResult(null, false, "Couldn't open: ${e.message}")
+                      }
+                      if (password == null) marker.writeText("ok")
+                      return ExtractResult(dest, false, null)
+                  } catch (e: Exception) {
+                      return ExtractResult(null, false, "Couldn't open: ${e.message}")
+                  }
+              }
+          }
+
+          // Zip writing: STORE only (no compression, fast). With a password the files are AES-256 encrypted.
+          object ZipOps {
+              fun zip(items: List<File>, dest: File, password: String?, op: OpProgress): String {
+                  try {
+                      val zip = if (password.isNullOrEmpty()) ZipFile(dest) else ZipFile(dest, password.toCharArray())
+                      zip.isRunInThread = true
+                      val params = ZipParameters().apply {
+                          compressionMethod = CompressionMethod.STORE
+                          if (!password.isNullOrEmpty()) {
+                              isEncryptFiles = true
+                              encryptionMethod = EncryptionMethod.AES
+                              aesKeyStrength = AesKeyStrength.KEY_STRENGTH_256
+                          }
+                      }
+                      for ((i, item) in items.withIndex()) {
+                          op.detail = "${i + 1}/${items.size}  ${item.name}"
+                          if (item.isDirectory) zip.addFolder(item, params) else zip.addFile(item, params)
+                          val monitor = zip.progressMonitor
+                          while (monitor.state == ProgressMonitor.State.BUSY) {
+                              if (op.cancelled.get()) monitor.isCancelAllTasks = true
+                              op.fraction = ((i + monitor.percentDone / 100f) / items.size).coerceIn(0f, 1f)
+                              Thread.sleep(80)
+                          }
+                          if (op.cancelled.get()) {
+                              dest.delete()
+                              return "Cancelled"
+                          }
+                          if (monitor.result == ProgressMonitor.Result.ERROR) {
+                              dest.delete()
+                              return "Zip failed: ${monitor.exception?.message ?: "error"}"
+                          }
+                          op.fraction = (i + 1).toFloat() / items.size
+                      }
+                      return "Created ${dest.name}"
+                  } catch (e: Exception) {
+                      dest.delete()
+                      return "Zip failed: ${e.message}"
+                  }
+              }
+          }
 
           // ---------- File operations (always run on a background thread) ----------
           object FileOps {
@@ -541,11 +674,43 @@ jobs:
                   return candidate
               }
 
+              fun items(n: Int): String = if (n == 1) "1 item" else "$n items"
+
+              private fun sizeOf(f: File): Long =
+                  if (f.isDirectory) (f.listFiles()?.sumOf { sizeOf(it) } ?: 0L) else f.length()
+
+              // Copies one file or folder with byte progress. The ORIGINAL date and time are kept
+              // (files and folders), so a copy does not look newer than the source.
+              private fun copyTree(src: File, dst: File, op: OpProgress, counter: LongArray, total: Long) {
+                  if (op.cancelled.get()) throw OpCancelled()
+                  if (src.isDirectory) {
+                      dst.mkdirs()
+                      src.listFiles()?.forEach { copyTree(it, File(dst, it.name), op, counter, total) }
+                      dst.setLastModified(src.lastModified())
+                  } else {
+                      src.inputStream().use { input ->
+                          dst.outputStream().use { output ->
+                              val buf = ByteArray(256 * 1024)
+                              while (true) {
+                                  if (op.cancelled.get()) throw OpCancelled()
+                                  val n = input.read(buf)
+                                  if (n < 0) break
+                                  output.write(buf, 0, n)
+                                  counter[0] += n
+                                  op.fraction = (counter[0].toDouble() / total).toFloat().coerceIn(0f, 1f)
+                              }
+                          }
+                      }
+                      dst.setLastModified(src.lastModified())
+                  }
+              }
+
               // Copy or move items into destDir. Returns a short message for a toast.
-              fun paste(paths: List<String>, destDir: File, move: Boolean): String {
+              fun paste(paths: List<String>, destDir: File, move: Boolean, op: OpProgress): String {
                   var ok = 0
                   var failed = 0
                   val destPath = destDir.absolutePath
+                  val toCopy = ArrayList<File>()
                   for (p in paths) {
                       val src = File(p)
                       if (!src.exists()) { failed++; continue }
@@ -556,29 +721,49 @@ jobs:
                       }
                       // Moving into the folder it is already in: nothing to do
                       if (move && src.parentFile?.absolutePath == destPath) { ok++; continue }
+                      // Move on the same storage is an instant rename (the date stays as it is)
+                      if (move && src.renameTo(uniqueTarget(destDir, src.name, src.isDirectory))) { ok++; continue }
+                      toCopy.add(src)
+                  }
+                  op.detail = "Preparing..."
+                  val total = toCopy.sumOf { sizeOf(it) }.coerceAtLeast(1L)
+                  val counter = LongArray(1)
+                  var cancelled = false
+                  for ((i, src) in toCopy.withIndex()) {
+                      op.detail = "${i + 1}/${toCopy.size}  ${src.name}"
                       val target = uniqueTarget(destDir, src.name, src.isDirectory)
-                      val success = try {
-                          if (move) {
-                              // Same storage: instant rename. Other storage: copy, then delete the original.
-                              src.renameTo(target) || (src.copyRecursively(target) && src.deleteRecursively())
-                          } else {
-                              src.copyRecursively(target)
-                          }
-                      } catch (e: Exception) { false }
-                      if (success) ok++ else failed++
+                      try {
+                          copyTree(src, target, op, counter, total)
+                          // Other storage move: the original goes away only after a complete copy
+                          if (move && !src.deleteRecursively()) { failed++ } else ok++
+                      } catch (e: OpCancelled) {
+                          target.deleteRecursively()
+                          cancelled = true
+                          break
+                      } catch (e: Exception) {
+                          target.deleteRecursively()
+                          failed++
+                      }
                   }
                   val verb = if (move) "Moved" else "Copied"
-                  return if (failed == 0) "$verb $ok item(s)" else "$verb $ok, $failed failed"
+                  return when {
+                      cancelled -> "Cancelled ($verb $ok)"
+                      failed == 0 -> "$verb ${items(ok)}"
+                      else -> "$verb $ok, $failed failed"
+                  }
               }
 
-              fun delete(paths: List<String>): String {
+              fun delete(paths: List<String>, op: OpProgress): String {
                   var ok = 0
                   var failed = 0
-                  for (p in paths) {
+                  for ((i, p) in paths.withIndex()) {
+                      if (op.cancelled.get()) break
+                      op.detail = "${i + 1}/${paths.size}  ${File(p).name}"
+                      op.fraction = i.toFloat() / paths.size
                       val done = try { File(p).deleteRecursively() } catch (e: Exception) { false }
                       if (done) ok++ else failed++
                   }
-                  return if (failed == 0) "Deleted $ok item(s)" else "Deleted $ok, $failed failed"
+                  return if (failed == 0) "Deleted ${items(ok)}" else "Deleted $ok, $failed failed"
               }
 
               // Returns an error message, or null when renamed
@@ -915,11 +1100,17 @@ jobs:
               var contextTarget by remember { mutableStateOf<File?>(null) }
               var renameTarget by remember { mutableStateOf<File?>(null) }
               var deleteTargets by remember { mutableStateOf<List<String>?>(null) }
-              var busy by remember { mutableStateOf(false) }
+              // The running long task (shows the progress popup), see OpProgress
+              var op by remember { mutableStateOf<OpProgress?>(null) }
+              var zipTargets by remember { mutableStateOf<List<String>?>(null) }
+              var newFolderOpen by remember { mutableStateOf(false) }
+              var archivePrompt by remember { mutableStateOf<File?>(null) }
+              var archiveWrongPassword by remember { mutableStateOf(false) }
 
-              // Something is marked or waiting to be pasted: blink white bg / black text every second
+              // Something is marked or waiting to be pasted: the menu button blinks, menu rows get a dot
               val pending = marked.isNotEmpty() || clipPaths.isNotEmpty()
               val cancelLabel = when {
+                  marked.size > 1 -> "Cancel Marks"
                   marked.isNotEmpty() -> "Cancel Mark"
                   clipMove -> "Cancel Move"
                   else -> "Cancel Copy"
@@ -967,24 +1158,84 @@ jobs:
                   refreshTrigger++
               }
 
-              fun runOp(block: () -> String) {
+              // Runs a long task in the background with the progress popup. The block returns the toast text
+              // (empty = no toast). `after` runs on the main thread when it is done.
+              fun runOp(title: String, after: () -> Unit = {}, block: (OpProgress) -> String) {
+                  if (op != null) return
+                  val progress = OpProgress(title)
+                  op = progress
                   scope.launch {
-                      busy = true
                       val msg = withContext(Dispatchers.IO) {
-                          try { block() } catch (e: Exception) { "Failed: ${e.message}" }
+                          try { block(progress) } catch (e: Exception) { "Failed: ${e.message}" }
                       }
-                      busy = false
+                      op = null
                       afterFileOp()
-                      Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                      after()
+                      if (msg.isNotEmpty()) Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                   }
+              }
+
+              // The archive view is read only: nothing can be pasted / created inside it
+              fun archiveBlocked(dir: File?): Boolean {
+                  if (dir != null && ArchiveSupport.isInside(context, dir)) {
+                      Toast.makeText(context, "Open a real folder first (copy out of the archive to extract)", Toast.LENGTH_SHORT).show()
+                      return true
+                  }
+                  return false
               }
 
               fun doPaste() {
                   val dest = tabs.getOrNull(activeIndex)?.dir ?: return
+                  if (archiveBlocked(dest)) return
                   val paths = clipPaths
                   val move = clipMove
                   clipPaths = emptyList()
-                  runOp { FileOps.paste(paths, dest, move) }
+                  runOp(if (move) "Moving" else "Copying") { p -> FileOps.paste(paths, dest, move, p) }
+              }
+
+              fun openArchive(file: File, password: String?) {
+                  val tab = tabs.getOrNull(activeIndex)
+                  var result: ExtractResult? = null
+                  runOp(
+                      title = "Opening ${file.name}",
+                      after = {
+                          val r = result
+                          if (r?.dest != null) {
+                              tab?.dir = r.dest
+                          } else if (r?.wrongPassword == true) {
+                              archiveWrongPassword = password != null
+                              archivePrompt = file
+                          }
+                      }
+                  ) { p ->
+                      val r = ArchiveSupport.extract(context, file, password, p)
+                      result = r
+                      r.message ?: ""
+                  }
+              }
+
+              fun startArchive(file: File) {
+                  scope.launch {
+                      val encrypted = withContext(Dispatchers.IO) { ArchiveSupport.isEncrypted(file) }
+                      when (encrypted) {
+                          null -> Toast.makeText(context, "Can't read this archive (only zip is supported)", Toast.LENGTH_SHORT).show()
+                          true -> {
+                              archiveWrongPassword = false
+                              archivePrompt = file
+                          }
+                          false -> openArchive(file, null)
+                      }
+                  }
+              }
+
+              fun doZip(targets: List<String>, name: String, password: String) {
+                  val dir = tabs.getOrNull(activeIndex)?.dir ?: return
+                  if (archiveBlocked(dir)) return
+                  val fileName = if (name.lowercase().endsWith(".zip")) name else "$name.zip"
+                  val dest = FileOps.uniqueTarget(dir, fileName, false)
+                  val items = targets.map { File(it) }.filter { it.exists() }
+                  marked.clear()
+                  runOp("Zipping") { p -> ZipOps.zip(items, dest, password.ifEmpty { null }, p) }
               }
 
               fun newTab(dir: File?) {
@@ -995,6 +1246,8 @@ jobs:
 
               // Restore saved tabs, or start with a single Home tab
               LaunchedEffect(Unit) {
+                  // Opened archives live in the cache only for one app session
+                  withContext(Dispatchers.IO) { ArchiveSupport.root(context).deleteRecursively() }
                   if (tabs.isEmpty()) {
                       val saved = SavedTabs.load(context)
                       if (saved.isNotEmpty()) {
@@ -1117,6 +1370,12 @@ jobs:
                                               close()
                                           }
                                       }
+                                      if (activeDir != null && !ArchiveSupport.isInside(context, activeDir)) {
+                                          MenuRow(text = "Add New Folder") {
+                                              newFolderOpen = true
+                                              close()
+                                          }
+                                      }
                                       if (activeDir != null) {
                                           val bookmarked = Bookmarks.isBookmarked(context, activeDir.absolutePath)
                                           MenuRow(text = if (bookmarked) "Remove bookmark" else "Add to bookmarks") {
@@ -1132,7 +1391,11 @@ jobs:
                                           }
                                       }
                                       MenuRow(text = "Save tabs") {
-                                          val tokens = tabs.map { it.dir?.absolutePath ?: SavedTabs.HOME_TOKEN }
+                                          // A tab inside an opened archive is temporary, so it is saved as Home
+                                          val tokens = tabs.map { t ->
+                                              val d = t.dir
+                                              if (d == null || ArchiveSupport.isInside(context, d)) SavedTabs.HOME_TOKEN else d.absolutePath
+                                          }
                                           SavedTabs.save(context, tokens)
                                           Toast.makeText(context, "Tabs saved", Toast.LENGTH_SHORT).show()
                                           close()
@@ -1243,6 +1506,7 @@ jobs:
                                                   onToggleMark = { f -> toggleMark(f) },
                                                   onLongPress = { f -> contextTarget = f },
                                                   onNavigate = { d -> tab.dir = d },
+                                                  onOpenArchive = { f -> startArchive(f) },
                                                   onOpenImage = { images, index ->
                                                       viewerImages = images
                                                       viewerStartIndex = index
@@ -1309,14 +1573,18 @@ jobs:
                                   clipMove = false
                                   marked.clear()
                                   contextTarget = null
-                                  Toast.makeText(context, "${targets.size} item(s) ready to paste", Toast.LENGTH_SHORT).show()
+                                  Toast.makeText(context, "${FileOps.items(targets.size)} ready to paste", Toast.LENGTH_SHORT).show()
                               },
                               onMove = {
                                   clipPaths = targets
                                   clipMove = true
                                   marked.clear()
                                   contextTarget = null
-                                  Toast.makeText(context, "${targets.size} item(s) ready to move", Toast.LENGTH_SHORT).show()
+                                  Toast.makeText(context, "${FileOps.items(targets.size)} ready to move", Toast.LENGTH_SHORT).show()
+                              },
+                              onArchive = {
+                                  contextTarget = null
+                                  if (!archiveBlocked(tabs.getOrNull(activeIndex)?.dir)) zipTargets = targets
                               },
                               onDelete = {
                                   contextTarget = null
@@ -1370,7 +1638,7 @@ jobs:
                                   TextButton(onClick = {
                                       deleteTargets = null
                                       marked.clear()
-                                      runOp { FileOps.delete(dt) }
+                                      runOp("Deleting") { p -> FileOps.delete(dt, p) }
                                   }) { Text("Delete", color = Color(0xFFEF9A9A)) }
                               },
                               dismissButton = {
@@ -1382,21 +1650,58 @@ jobs:
                           )
                       }
 
-                      // Working: blocks touches until the copy / move / delete is done
-                      if (busy) {
-                          Box(
-                              modifier = Modifier
-                                  .fillMaxSize()
-                                  .background(Color(0x88000000))
-                                  .clickable(
-                                      interactionSource = remember { MutableInteractionSource() },
-                                      indication = null,
-                                      onClick = {}
-                                  ),
-                              contentAlignment = Alignment.Center
-                          ) {
-                              CircularProgressIndicator(color = Color.White)
-                          }
+                      // Archive (Zip): name + optional password
+                      val zt = zipTargets
+                      if (zt != null) {
+                          ArchiveDialog(
+                              defaultName = if (zt.size == 1) File(zt[0]).let { f -> if (f.isDirectory) f.name else f.nameWithoutExtension.ifEmpty { f.name } } else "Archive",
+                              onZip = { name, password ->
+                                  zipTargets = null
+                                  doZip(zt, name, password)
+                              },
+                              onDismiss = { zipTargets = null }
+                          )
+                      }
+
+                      // Add New Folder (name pre-filled and selected)
+                      if (newFolderOpen) {
+                          NewFolderDialog(
+                              onConfirm = { name ->
+                                  val dir = tabs.getOrNull(activeIndex)?.dir
+                                  when {
+                                      dir == null -> newFolderOpen = false
+                                      name.contains('/') -> Toast.makeText(context, "Name can't contain /", Toast.LENGTH_SHORT).show()
+                                      File(dir, name).exists() -> Toast.makeText(context, "\"$name\" already exists", Toast.LENGTH_SHORT).show()
+                                      File(dir, name).mkdir() -> {
+                                          newFolderOpen = false
+                                          afterFileOp()
+                                          Toast.makeText(context, "Folder created", Toast.LENGTH_SHORT).show()
+                                      }
+                                      else -> Toast.makeText(context, "Could not create folder", Toast.LENGTH_SHORT).show()
+                                  }
+                              },
+                              onDismiss = { newFolderOpen = false }
+                          )
+                      }
+
+                      // Password for a protected archive
+                      val ap = archivePrompt
+                      if (ap != null) {
+                          PasswordDialog(
+                              title = ap.name,
+                              wrong = archiveWrongPassword,
+                              onConfirm = { pw ->
+                                  archivePrompt = null
+                                  openArchive(ap, pw)
+                              },
+                              onDismiss = { archivePrompt = null }
+                          )
+                      }
+
+                      // Progress popup for every long task (copy, move, delete, zip, open archive)
+                      val running = op
+                      if (running != null) {
+                          ProgressDialog(running)
                       }
 
                       // Bookmarks panel: opens and closes with no animation
@@ -1437,8 +1742,18 @@ jobs:
               val items = mutableListOf<Triple<String, File?, () -> Unit>>()
               items.add(Triple("Home", null, { tab.dir = null }))
               if (shown != null) {
+                  val archiveRoot = ArchiveSupport.root(context)
                   val matchingRoot = StorageRoots.get(context).firstOrNull { shown.absolutePath.startsWith(it.second.absolutePath) }
-                  if (matchingRoot != null) {
+                  if (ArchiveSupport.isInside(context, shown)) {
+                      // Opened archive: Home / archive.zip / folder ... (the hidden cache path is not shown)
+                      val parts = shown.absolutePath.removePrefix(archiveRoot.absolutePath + "/").split("/")
+                      var acc = File(archiveRoot, parts[0])
+                      parts.drop(1).forEach { segment ->
+                          acc = File(acc, segment)
+                          val target = acc
+                          items.add(Triple(segment, target, { tab.dir = target }))
+                      }
+                  } else if (matchingRoot != null) {
                       val rootFile = matchingRoot.second
                       val relative = shown.absolutePath.removePrefix(rootFile.absolutePath).trim('/')
                       items.add(Triple(matchingRoot.first, rootFile, { tab.dir = rootFile }))
@@ -2063,6 +2378,7 @@ jobs:
               onToggleMark: (File) -> Unit,
               onLongPress: (File) -> Unit,
               onNavigate: (File) -> Unit,
+              onOpenArchive: (File) -> Unit,
               onOpenImage: (images: List<File>, index: Int) -> Unit
           ) {
               val context = LocalContext.current
@@ -2140,6 +2456,7 @@ jobs:
                                                   val idx = imagesInDir.indexOf(entry.file).coerceAtLeast(0)
                                                   onOpenImage(imagesInDir, idx)
                                               }
+                                              ArchiveSupport.isArchiveName(entry.name) -> onOpenArchive(entry.file)
                                               else -> openFile(context, entry.file)
                                           }
                                       }
@@ -2306,6 +2623,7 @@ jobs:
               onMark: () -> Unit,
               onCopy: () -> Unit,
               onMove: () -> Unit,
+              onArchive: () -> Unit,
               onDelete: () -> Unit,
               onCancel: () -> Unit,
               onPaste: () -> Unit,
@@ -2336,6 +2654,7 @@ jobs:
                           MenuRow(text = if (isMarked) "Unmark" else "Mark") { onMark() }
                           MenuRow(text = "Copy") { onCopy() }
                           MenuRow(text = "Move") { onMove() }
+                          MenuRow(text = "Archive (Zip)") { onArchive() }
                           MenuRow(text = "Delete") { onDelete() }
                       }
                   }
@@ -2365,6 +2684,227 @@ jobs:
                   },
                   confirmButton = {
                       TextButton(onClick = { onConfirm(text.trim()) }) { Text("OK", color = Color.White) }
+                  },
+                  dismissButton = {
+                      TextButton(onClick = onDismiss) { Text("Cancel", color = Color.White) }
+                  }
+              )
+          }
+
+          @Composable
+          fun fieldColors() = OutlinedTextFieldDefaults.colors(
+              focusedTextColor = Color.White,
+              unfocusedTextColor = Color.White,
+              cursorColor = Color.White,
+              focusedBorderColor = Color.White,
+              unfocusedBorderColor = Color.White.copy(alpha = 0.5f),
+              focusedPlaceholderColor = Color.White.copy(alpha = 0.4f),
+              unfocusedPlaceholderColor = Color.White.copy(alpha = 0.4f)
+          )
+
+          // Big dialog button with the same press effect as everything else. primary = white pill.
+          @Composable
+          fun DialogButton(text: String, modifier: Modifier = Modifier, primary: Boolean = false, onClick: () -> Unit) {
+              val pressed = remember { mutableStateOf(false) }
+              val inverted = pressed.value != primary
+              Box(
+                  modifier = modifier
+                      .heightIn(min = 48.dp)
+                      .clip(RoundedCornerShape(10.dp))
+                      .background(if (inverted) Color.White else Color.Transparent)
+                      .pressFlash(pressed, onClick),
+                  contentAlignment = Alignment.Center
+              ) {
+                  Text(
+                      text = text,
+                      color = if (inverted) Color.Black else Color.White,
+                      fontSize = 14.sp,
+                      fontWeight = FontWeight.SemiBold
+                  )
+              }
+          }
+
+          // =====================================================================
+          // REUSABLE PROGRESS POPUP (see OpProgress). Same look as the long-press menu.
+          // Not dismissable: the only way out is the Cancel button or the task finishing.
+          // =====================================================================
+          @Composable
+          fun ProgressDialog(p: OpProgress) {
+              Dialog(
+                  onDismissRequest = {},
+                  properties = DialogProperties(dismissOnBackPress = false, dismissOnClickOutside = false)
+              ) {
+                  Column(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .clip(RoundedCornerShape(14.dp))
+                          .background(Color(0xFF2A2A2A))
+                          .padding(16.dp)
+                  ) {
+                      Text(
+                          text = p.title,
+                          color = Color.White,
+                          fontWeight = FontWeight.Bold,
+                          fontSize = 16.sp,
+                          maxLines = 2,
+                          overflow = TextOverflow.Ellipsis
+                      )
+                      Spacer(Modifier.height(4.dp))
+                      Text(
+                          text = p.detail.ifEmpty { "Working..." },
+                          color = Color.White.copy(alpha = 0.6f),
+                          fontSize = 13.sp,
+                          maxLines = 1,
+                          overflow = TextOverflow.Ellipsis
+                      )
+                      Spacer(Modifier.height(14.dp))
+                      val f = p.fraction
+                      if (f == null) {
+                          LinearProgressIndicator(
+                              modifier = Modifier.fillMaxWidth().height(6.dp).clip(CircleShape),
+                              color = Color.White,
+                              trackColor = Color.White.copy(alpha = 0.2f)
+                          )
+                      } else {
+                          LinearProgressIndicator(
+                              progress = { f },
+                              modifier = Modifier.fillMaxWidth().height(6.dp).clip(CircleShape),
+                              color = Color.White,
+                              trackColor = Color.White.copy(alpha = 0.2f)
+                          )
+                          Spacer(Modifier.height(6.dp))
+                          Text(
+                              text = "${(f * 100).toInt()}%",
+                              color = Color.White.copy(alpha = 0.6f),
+                              fontSize = 12.sp,
+                              modifier = Modifier.align(Alignment.End)
+                          )
+                      }
+                      Spacer(Modifier.height(8.dp))
+                      DialogButton(text = "Cancel", modifier = Modifier.fillMaxWidth()) { p.cancelled.set(true) }
+                  }
+              }
+          }
+
+          // Archive (Zip): name + optional password, Cancel / Zip. Stored only (no compression).
+          @Composable
+          fun ArchiveDialog(defaultName: String, onZip: (String, String) -> Unit, onDismiss: () -> Unit) {
+              var name by remember { mutableStateOf(defaultName) }
+              var password by remember { mutableStateOf("") }
+              var showPassword by remember { mutableStateOf(false) }
+              Dialog(onDismissRequest = onDismiss) {
+                  Column(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .clip(RoundedCornerShape(14.dp))
+                          .background(Color(0xFF2A2A2A))
+                          .padding(16.dp)
+                  ) {
+                      Text("Archive (Zip)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                      Spacer(Modifier.height(12.dp))
+                      OutlinedTextField(
+                          value = name,
+                          onValueChange = { name = it },
+                          singleLine = true,
+                          label = { Text("Name") },
+                          suffix = { Text(".zip", color = Color.White.copy(alpha = 0.6f)) },
+                          colors = fieldColors(),
+                          modifier = Modifier.fillMaxWidth()
+                      )
+                      Spacer(Modifier.height(10.dp))
+                      OutlinedTextField(
+                          value = password,
+                          onValueChange = { password = it },
+                          singleLine = true,
+                          label = { Text("Password (optional)") },
+                          visualTransformation = if (showPassword) androidx.compose.ui.text.input.VisualTransformation.None else PasswordVisualTransformation(),
+                          trailingIcon = {
+                              Text(
+                                  text = if (showPassword) "Hide" else "Show",
+                                  color = Color.White.copy(alpha = 0.7f),
+                                  fontSize = 12.sp,
+                                  modifier = Modifier
+                                      .padding(end = 12.dp)
+                                      .clip(RoundedCornerShape(6.dp))
+                                      .pointerInput(Unit) { detectTapGestures { showPassword = !showPassword } }
+                                      .padding(6.dp)
+                              )
+                          },
+                          colors = fieldColors(),
+                          modifier = Modifier.fillMaxWidth()
+                      )
+                      Spacer(Modifier.height(14.dp))
+                      Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                          DialogButton(text = "Cancel", modifier = Modifier.weight(1f)) { onDismiss() }
+                          DialogButton(text = "Zip", modifier = Modifier.weight(1f), primary = true) {
+                              val clean = name.trim().removeSuffix(".zip").replace("/", "_").ifEmpty { "Archive" }
+                              onZip(clean, password)
+                          }
+                      }
+                  }
+              }
+          }
+
+          // Add New Folder: "New Folder" is already selected, so typing replaces it. Blank = "New Folder".
+          @Composable
+          fun NewFolderDialog(onConfirm: (String) -> Unit, onDismiss: () -> Unit) {
+              val initial = "New Folder"
+              var value by remember { mutableStateOf(TextFieldValue(initial, TextRange(0, initial.length))) }
+              val focus = remember { FocusRequester() }
+              LaunchedEffect(Unit) { focus.requestFocus() }
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  containerColor = Color(0xFF2A2A2A),
+                  title = { Text("Add New Folder", color = Color.White) },
+                  text = {
+                      OutlinedTextField(
+                          value = value,
+                          onValueChange = { value = it },
+                          singleLine = true,
+                          placeholder = { Text(initial) },
+                          colors = fieldColors(),
+                          modifier = Modifier.focusRequester(focus)
+                      )
+                  },
+                  confirmButton = {
+                      TextButton(onClick = { onConfirm(value.text.trim().ifEmpty { initial }) }) { Text("OK", color = Color.White) }
+                  },
+                  dismissButton = {
+                      TextButton(onClick = onDismiss) { Text("Cancel", color = Color.White) }
+                  }
+              )
+          }
+
+          @Composable
+          fun PasswordDialog(title: String, wrong: Boolean, onConfirm: (String) -> Unit, onDismiss: () -> Unit) {
+              var password by remember { mutableStateOf("") }
+              val focus = remember { FocusRequester() }
+              LaunchedEffect(Unit) { focus.requestFocus() }
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  containerColor = Color(0xFF2A2A2A),
+                  title = { Text("Password needed", color = Color.White) },
+                  text = {
+                      Column {
+                          Text(title, color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                          Spacer(Modifier.height(10.dp))
+                          OutlinedTextField(
+                              value = password,
+                              onValueChange = { password = it },
+                              singleLine = true,
+                              placeholder = { Text("Password") },
+                              visualTransformation = PasswordVisualTransformation(),
+                              colors = fieldColors(),
+                              modifier = Modifier.focusRequester(focus)
+                          )
+                          if (wrong) {
+                              Spacer(Modifier.height(6.dp))
+                              Text("Wrong password, try again", color = Color(0xFFEF9A9A), fontSize = 12.sp)
+                          }
+                      }
+                  },
+                  confirmButton = {
+                      TextButton(onClick = { onConfirm(password) }) { Text("Open", color = Color.White) }
                   },
                   dismissButton = {
                       TextButton(onClick = onDismiss) { Text("Cancel", color = Color.White) }
@@ -3004,6 +3544,8 @@ jobs:
               implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
               implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
               implementation("androidx.documentfile:documentfile:1.0.1")
+              // Zip reading / writing with password support (AES + classic zip encryption)
+              implementation("net.lingala.zip4j:zip4j:2.11.5")
           }
           APPEOF
 
