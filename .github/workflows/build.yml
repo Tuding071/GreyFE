@@ -242,6 +242,8 @@ jobs:
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
           import androidx.compose.ui.viewinterop.AndroidView
+          import androidx.compose.ui.window.Dialog
+          import androidx.compose.material3.OutlinedTextFieldDefaults
           import androidx.compose.ui.window.Popup
           import androidx.compose.ui.window.PopupProperties
           import androidx.core.content.ContextCompat
@@ -1685,6 +1687,42 @@ jobs:
               }
           }
 
+          // Same as pressFlash but also reports a long press (used by file rows)
+          @Composable
+          fun Modifier.pressFlashLong(pressed: MutableState<Boolean>, onLongClick: () -> Unit, onClick: () -> Unit): Modifier {
+              val currentClick by rememberUpdatedState(onClick)
+              val currentLong by rememberUpdatedState(onLongClick)
+              return this.pointerInput(Unit) {
+                  detectTapGestures(
+                      onPress = {
+                          coroutineScope {
+                              val showJob = launch {
+                                  delay(60)
+                                  pressed.value = true
+                              }
+                              val released = tryAwaitRelease()
+                              showJob.cancel()
+                              if (released) {
+                                  pressed.value = true
+                                  delay(140)
+                              }
+                              pressed.value = false
+                          }
+                      },
+                      onLongPress = { currentLong() },
+                      onTap = { currentClick() }
+                  )
+              }
+          }
+
+          // True on every other half second while something is marked / waiting to paste.
+          // Used by rows that should pulse (white background, black text).
+          @Composable
+          fun rememberPulseOn(enabled: Boolean): Boolean {
+              val pulse = LocalPulse.current
+              return enabled && pulse?.value == true
+          }
+
           // Icon button with a 40 dp touch area and the press effect
           @Composable
           fun IconFlashButton(
@@ -1692,15 +1730,18 @@ jobs:
               description: String,
               boxSize: Dp = 40.dp,
               iconSize: Dp = 26.dp,
+              pulse: Boolean = false,
               onClick: () -> Unit
           ) {
-              val pressed = remember { mutableStateOf(false) }
+              val pressedState = remember { mutableStateOf(false) }
+              val pulseOn = rememberPulseOn(pulse)
+              val pressed = remember(pulseOn) { derivedStateOf { pressedState.value || pulseOn } }
               Box(
                   modifier = Modifier
                       .size(boxSize)
                       .clip(CircleShape)
                       .background(if (pressed.value) Color.White else Color.Transparent)
-                      .pressFlash(pressed, onClick),
+                      .pressFlash(pressedState, onClick),
                   contentAlignment = Alignment.Center
               ) {
                   Icon(
@@ -1743,6 +1784,7 @@ jobs:
               menuOpen: Boolean,
               onMenuToggle: () -> Unit,
               onMenuDismiss: () -> Unit,
+              menuPulse: Boolean = false,
               menuContent: (@Composable (closeMenu: () -> Unit) -> Unit)? = null
           ) {
               val scrollState = rememberScrollState()
@@ -1798,7 +1840,7 @@ jobs:
                   if (menuContent != null) {
                       Spacer(Modifier.width(8.dp))
                       Box {
-                          IconFlashButton(Icons.Filled.MoreVert, "Menu") { onMenuToggle() }
+                          IconFlashButton(Icons.Filled.MoreVert, "Menu", pulse = menuPulse) { onMenuToggle() }
                           if (menuOpen) {
                               // Full-screen scrim: any touch outside the menu closes it
                               Popup(
@@ -1846,14 +1888,16 @@ jobs:
           // be as big as the text.
           // =====================================================================
           @Composable
-          fun MenuRow(text: String, onClick: () -> Unit) {
-              val pressed = remember { mutableStateOf(false) }
+          fun MenuRow(text: String, pulse: Boolean = false, onClick: () -> Unit) {
+              val pressedState = remember { mutableStateOf(false) }
+              val pulseOn = rememberPulseOn(pulse)
+              val pressed = remember(pulseOn) { derivedStateOf { pressedState.value || pulseOn } }
               Box(
                   modifier = Modifier
                       .fillMaxWidth()
                       .heightIn(min = 48.dp)
                       .background(if (pressed.value) Color.White else Color.Transparent)
-                      .pressFlash(pressed, onClick)
+                      .pressFlash(pressedState, onClick)
                       .padding(horizontal = 16.dp),
                   contentAlignment = Alignment.CenterStart
               ) {
@@ -2006,16 +2050,21 @@ jobs:
           fun FileListScreen(
               directory: File,
               sortMode: SortMode,
+              refreshKey: Int,
+              marked: Set<String>,
+              onToggleMark: (File) -> Unit,
+              onLongPress: (File) -> Unit,
               onNavigate: (File) -> Unit,
               onOpenImage: (images: List<File>, index: Int) -> Unit
           ) {
               val context = LocalContext.current
+              val haptic = LocalHapticFeedback.current
               var loadKey by remember { mutableStateOf(0) }
               var refreshing by remember { mutableStateOf(false) }
               var listing by remember(directory) { mutableStateOf(DirCache.get(directory.absolutePath)) }
 
               // Read in the background; the cached copy (if any) stays on screen until the fresh one arrives
-              LaunchedEffect(directory, loadKey) {
+              LaunchedEffect(directory, loadKey, refreshKey) {
                   val fresh = withContext(Dispatchers.IO) {
                       Listing(readEntries(directory)).also { DirCache.put(directory.absolutePath, it) }
                   }
@@ -2069,8 +2118,15 @@ jobs:
                                       entry = entry,
                                       rowMinHeight = rowMin,
                                       modifier = Modifier.animateItem(),
+                                      marked = marked.contains(entry.file.absolutePath),
+                                      onLongClick = {
+                                          haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                          onLongPress(entry.file)
+                                      },
                                       onClick = {
                                           when {
+                                              // While items are marked, a tap toggles the mark (multi-select)
+                                              marked.isNotEmpty() -> onToggleMark(entry.file)
                                               entry.isDir -> onNavigate(entry.file)
                                               ThumbnailCache.isImage(entry.name) -> {
                                                   val idx = imagesInDir.indexOf(entry.file).coerceAtLeast(0)
@@ -2139,7 +2195,14 @@ jobs:
 
           // One row: thumb | name (up to 3 lines) above size (left) and date (right) | optional Copy pill
           @Composable
-          fun FileRow(entry: Entry, rowMinHeight: Dp, modifier: Modifier = Modifier, onClick: () -> Unit) {
+          fun FileRow(
+              entry: Entry,
+              rowMinHeight: Dp,
+              modifier: Modifier = Modifier,
+              marked: Boolean = false,
+              onLongClick: () -> Unit = {},
+              onClick: () -> Unit
+          ) {
               val context = LocalContext.current
               val file = entry.file
               val hasFileThumb = !entry.isDir && (ThumbnailCache.isImage(entry.name) || ThumbnailCache.isVideo(entry.name))
@@ -2167,7 +2230,9 @@ jobs:
               }
 
               val pressedState = remember { mutableStateOf(false) }
-              val pressed = pressedState.value
+              // Marked rows pulse every second: white background + black text
+              val pulseOn = rememberPulseOn(marked)
+              val pressed = pressedState.value || pulseOn
               val copyPressed = remember { mutableStateOf(false) }
 
               Row(
@@ -2175,7 +2240,7 @@ jobs:
                       .fillMaxWidth()
                       .heightIn(min = rowMinHeight)
                       .background(if (pressed) Color.White else Color.Transparent)
-                      .pressFlash(pressedState, onClick)
+                      .pressFlashLong(pressedState, onLongClick, onClick)
                       .padding(horizontal = 8.dp, vertical = 6.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
@@ -2220,6 +2285,84 @@ jobs:
                       }
                   }
               }
+          }
+
+          // Long-press menu. Normal rows use MenuRow (same touch area). The pending rows
+          // (Cancel, Paste here / Move here) pulse white bg / black text every second.
+          @Composable
+          fun FileContextMenu(
+              title: String,
+              isMarked: Boolean,
+              cancelLabel: String?,
+              pasteLabel: String?,
+              onRename: () -> Unit,
+              onMark: () -> Unit,
+              onCopy: () -> Unit,
+              onMove: () -> Unit,
+              onDelete: () -> Unit,
+              onCancel: () -> Unit,
+              onPaste: () -> Unit,
+              onDismiss: () -> Unit
+          ) {
+              Dialog(onDismissRequest = onDismiss) {
+                  Column(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .clip(RoundedCornerShape(14.dp))
+                          .background(Color(0xFF2A2A2A))
+                          .padding(vertical = 6.dp)
+                  ) {
+                      Text(
+                          text = title,
+                          color = Color.White,
+                          fontWeight = FontWeight.Bold,
+                          fontSize = 16.sp,
+                          maxLines = 2,
+                          overflow = TextOverflow.Ellipsis,
+                          modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                      )
+                      Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.15f)))
+                      Column(Modifier.verticalScroll(rememberScrollState())) {
+                          if (cancelLabel != null) MenuRow(text = cancelLabel, pulse = true) { onCancel() }
+                          if (pasteLabel != null) MenuRow(text = pasteLabel, pulse = true) { onPaste() }
+                          MenuRow(text = "Rename") { onRename() }
+                          MenuRow(text = if (isMarked) "Unmark" else "Mark") { onMark() }
+                          MenuRow(text = "Copy") { onCopy() }
+                          MenuRow(text = "Move") { onMove() }
+                          MenuRow(text = "Delete") { onDelete() }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun RenameDialog(file: File, onConfirm: (String) -> Unit, onDismiss: () -> Unit) {
+              var text by remember { mutableStateOf(file.name) }
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  containerColor = Color(0xFF2A2A2A),
+                  title = { Text("Rename", color = Color.White) },
+                  text = {
+                      OutlinedTextField(
+                          value = text,
+                          onValueChange = { text = it },
+                          singleLine = true,
+                          colors = OutlinedTextFieldDefaults.colors(
+                              focusedTextColor = Color.White,
+                              unfocusedTextColor = Color.White,
+                              cursorColor = Color.White,
+                              focusedBorderColor = Color.White,
+                              unfocusedBorderColor = Color.White.copy(alpha = 0.5f)
+                          )
+                      )
+                  },
+                  confirmButton = {
+                      TextButton(onClick = { onConfirm(text.trim()) }) { Text("OK", color = Color.White) }
+                  },
+                  dismissButton = {
+                      TextButton(onClick = onDismiss) { Text("Cancel", color = Color.White) }
+                  }
+              )
           }
 
           fun copyFileContent(context: Context, file: File) {
