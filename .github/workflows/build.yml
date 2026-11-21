@@ -178,6 +178,7 @@ jobs:
           import androidx.compose.foundation.interaction.collectIsPressedAsState
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.LazyListState
           import androidx.compose.foundation.lazy.items
           import androidx.compose.foundation.pager.HorizontalPager
           import androidx.compose.foundation.pager.rememberPagerState
@@ -345,8 +346,29 @@ jobs:
               OLDEST("Time (oldest first)", "oldest");
 
               companion object {
-                  fun fromKey(key: String?): SortMode = values().firstOrNull { it.key == key } ?: NAME_AZ
+                  fun fromKey(key: String?): SortMode = values().firstOrNull { it.key == key } ?: NEWEST
               }
+          }
+
+          // ---------- Scroll memory ----------
+          // Entering or leaving a folder always starts at the top. Only after opening a FILE
+          // (image, zip, other app) the list goes back to where it was, via markRestore().
+          object ScrollMemory {
+              private val saved = HashMap<String, IntArray>()
+              private val restore = HashSet<String>()
+
+              @Synchronized
+              fun save(path: String, index: Int, offset: Int) { saved[path] = intArrayOf(index, offset) }
+
+              @Synchronized
+              fun markRestore(path: String) { if (saved.containsKey(path)) restore.add(path) }
+
+              @Synchronized
+              fun clearRestore() { restore.clear() }
+
+              // Returns the position to go back to (once), or null = start at the top
+              @Synchronized
+              fun take(path: String): IntArray? = if (restore.remove(path)) saved[path] else null
           }
 
           object SortPrefs {
@@ -2415,6 +2437,18 @@ jobs:
           ) {
               val context = LocalContext.current
               val haptic = LocalHapticFeedback.current
+
+              // Each folder gets its own scroll state: it starts at the top, except when coming back
+              // from opening a file (image, zip, ...), then it returns to the remembered position
+              val dirPath = directory.absolutePath
+              val listState = remember(dirPath) {
+                  val s = ScrollMemory.take(dirPath)
+                  if (s != null) LazyListState(s[0], s[1]) else LazyListState()
+              }
+              LaunchedEffect(listState, dirPath) {
+                  snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
+                      .collect { (i, o) -> ScrollMemory.save(dirPath, i, o) }
+              }
               var loadKey by remember { mutableStateOf(0) }
               var refreshing by remember { mutableStateOf(false) }
               var listing by remember(directory) { mutableStateOf(DirCache.get(directory.absolutePath)) }
@@ -2468,7 +2502,7 @@ jobs:
                               Text("Empty folder", color = Color.White, fontSize = 16.sp)
                           }
                       } else {
-                          LazyColumn(modifier = Modifier.fillMaxSize()) {
+                          LazyColumn(modifier = Modifier.fillMaxSize(), state = listState) {
                               items(sorted, key = { it.file.absolutePath }) { entry ->
                                   FileRow(
                                       entry = entry,
@@ -2483,13 +2517,24 @@ jobs:
                                           when {
                                               // While items are marked, a tap toggles the mark (multi-select)
                                               marked.isNotEmpty() -> onToggleMark(entry.file)
-                                              entry.isDir -> onNavigate(entry.file)
+                                              entry.isDir -> {
+                                                  // Opening a folder: forget any pending "go back to position"
+                                                  if (!ArchiveSupport.isInside(context, directory)) ScrollMemory.clearRestore()
+                                                  onNavigate(entry.file)
+                                              }
                                               ThumbnailCache.isImage(entry.name) -> {
+                                                  ScrollMemory.markRestore(directory.absolutePath)
                                                   val idx = imagesInDir.indexOf(entry.file).coerceAtLeast(0)
                                                   onOpenImage(imagesInDir, idx)
                                               }
-                                              ArchiveSupport.isArchiveName(entry.name) -> onOpenArchive(entry.file)
-                                              else -> openFile(context, entry.file)
+                                              ArchiveSupport.isArchiveName(entry.name) -> {
+                                                  ScrollMemory.markRestore(directory.absolutePath)
+                                                  onOpenArchive(entry.file)
+                                              }
+                                              else -> {
+                                                  ScrollMemory.markRestore(directory.absolutePath)
+                                                  openFile(context, entry.file)
+                                              }
                                           }
                                       }
                                   )
