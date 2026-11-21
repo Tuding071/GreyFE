@@ -374,6 +374,11 @@ jobs:
               fun clearRestore() { restore.clear() }
 
               private var lastDir: String? = null
+              private var topNext = false
+
+              // Next folder shown starts at the top whatever happens (breadcrumb taps)
+              @Synchronized
+              fun forceTop() { topNext = true; restore.clear() }
 
               // Returns the position to go back to, or null = start at the top.
               //  - going UP (back / breadcrumb) from a folder inside this one: old position
@@ -383,6 +388,10 @@ jobs:
               fun take(path: String): IntArray? {
                   val prev = lastDir
                   lastDir = path
+                  if (topNext) {
+                      topNext = false
+                      return null
+                  }
                   val fromInside = prev != null && prev.startsWith("$path/")
                   val flagged = restore.remove(path)
                   return if (fromInside || flagged) saved[path] else null
@@ -1854,7 +1863,11 @@ jobs:
                       i == currentIdx -> CrumbKind.CURRENT
                       else -> CrumbKind.TRAIL
                   }
-                  Crumb(item.first, kind, item.third)
+                  // Tapping a breadcrumb counts as entering that folder: it starts at the top
+                  Crumb(item.first, kind, {
+                      if (kind != CrumbKind.CURRENT) ScrollMemory.forceTop()
+                      item.third()
+                  })
               }
           }
 
@@ -2533,7 +2546,8 @@ jobs:
                                       },
                                       onClick = {
                                           // Opening (not selecting while items are marked) leaves the faint highlight on this row
-                                          if (marked.isEmpty()) LastOpened.path = entry.file.absolutePath
+                                          // (inside an opened archive the highlight stays on the zip itself)
+                          if (marked.isEmpty() && !ArchiveSupport.isInside(context, directory)) LastOpened.path = entry.file.absolutePath
                                           when {
                                               // While items are marked, a tap toggles the mark (multi-select)
                                               marked.isNotEmpty() -> onToggleMark(entry.file)
@@ -2655,7 +2669,10 @@ jobs:
               // Marked rows stay white background + black text (static, no pulsing)
               val pressed = pressedState.value || marked
               // Faint highlight for the last opened item; its size/date text is brighter so it stays readable
-              val lastOpened = !pressed && LastOpened.path == file.absolutePath
+              // It follows the trail: the opened item itself AND every folder on the way to it
+              val lp = LastOpened.path
+              val lastOpened = !pressed && lp != null &&
+                  (lp == file.absolutePath || (entry.isDir && lp.startsWith(file.absolutePath + "/")))
               val secondary = when {
                   pressed -> Color.Black.copy(alpha = 0.6f)
                   lastOpened -> Color.White.copy(alpha = 0.8f)
