@@ -358,8 +358,8 @@ jobs:
           }
 
           // ---------- Scroll memory ----------
-          // Entering or leaving a folder always starts at the top. Only after opening a FILE
-          // (image, zip, other app) the list goes back to where it was, via markRestore().
+          // Entering a folder always starts at the top. Going back UP to a folder, or coming back
+          // after opening a FILE (image, zip, other app), returns to where that list was.
           object ScrollMemory {
               private val saved = HashMap<String, IntArray>()
               private val restore = HashSet<String>()
@@ -373,9 +373,20 @@ jobs:
               @Synchronized
               fun clearRestore() { restore.clear() }
 
-              // Returns the position to go back to (once), or null = start at the top
+              private var lastDir: String? = null
+
+              // Returns the position to go back to, or null = start at the top.
+              //  - going UP (back / breadcrumb) from a folder inside this one: old position
+              //  - coming back after opening a file (image, zip, other app): old position
+              //  - entering a folder: always the top
               @Synchronized
-              fun take(path: String): IntArray? = if (restore.remove(path)) saved[path] else null
+              fun take(path: String): IntArray? {
+                  val prev = lastDir
+                  lastDir = path
+                  val fromInside = prev != null && prev.startsWith("$path/")
+                  val flagged = restore.remove(path)
+                  return if (fromInside || flagged) saved[path] else null
+              }
           }
 
           object SortPrefs {
