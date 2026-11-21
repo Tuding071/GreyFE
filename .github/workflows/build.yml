@@ -1106,13 +1106,13 @@ jobs:
                                       val activeDir = tabs.getOrNull(activeIndex)?.dir
                                       // Pending actions pulse (white bg / black text) so they are not forgotten
                                       if (pending) {
-                                          MenuRow(text = cancelLabel, pulse = true) {
+                                          MenuRow(text = cancelLabel, dot = true) {
                                               cancelPending()
                                               close()
                                           }
                                       }
                                       if (activeDir != null && clipPaths.isNotEmpty()) {
-                                          MenuRow(text = if (clipMove) "Move here" else "Paste here", pulse = true) {
+                                          MenuRow(text = if (clipMove) "Move here" else "Paste here", dot = true) {
                                               doPaste()
                                               close()
                                           }
@@ -1888,16 +1888,15 @@ jobs:
           // be as big as the text.
           // =====================================================================
           @Composable
-          fun MenuRow(text: String, pulse: Boolean = false, onClick: () -> Unit) {
-              val pressedState = remember { mutableStateOf(false) }
-              val pulseOn = rememberPulseOn(pulse)
-              val pressed = remember(pulseOn) { derivedStateOf { pressedState.value || pulseOn } }
+          // dot = true shows a small white notification-style dot at the right end (pending actions)
+          fun MenuRow(text: String, dot: Boolean = false, onClick: () -> Unit) {
+              val pressed = remember { mutableStateOf(false) }
               Box(
                   modifier = Modifier
                       .fillMaxWidth()
                       .heightIn(min = 48.dp)
                       .background(if (pressed.value) Color.White else Color.Transparent)
-                      .pressFlash(pressedState, onClick)
+                      .pressFlash(pressed, onClick)
                       .padding(horizontal = 16.dp),
                   contentAlignment = Alignment.CenterStart
               ) {
@@ -1906,6 +1905,15 @@ jobs:
                       color = if (pressed.value) Color.Black else Color.White,
                       fontSize = 14.sp
                   )
+                  if (dot) {
+                      Box(
+                          modifier = Modifier
+                              .align(Alignment.CenterEnd)
+                              .size(9.dp)
+                              .clip(CircleShape)
+                              .background(if (pressed.value) Color.Black else Color.White)
+                      )
+                  }
               }
           }
 
@@ -2230,9 +2238,8 @@ jobs:
               }
 
               val pressedState = remember { mutableStateOf(false) }
-              // Marked rows pulse every second: white background + black text
-              val pulseOn = rememberPulseOn(marked)
-              val pressed = pressedState.value || pulseOn
+              // Marked rows stay white background + black text (static, no pulsing)
+              val pressed = pressedState.value || marked
               val copyPressed = remember { mutableStateOf(false) }
 
               Row(
@@ -2323,8 +2330,8 @@ jobs:
                       )
                       Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.15f)))
                       Column(Modifier.verticalScroll(rememberScrollState())) {
-                          if (cancelLabel != null) MenuRow(text = cancelLabel, pulse = true) { onCancel() }
-                          if (pasteLabel != null) MenuRow(text = pasteLabel, pulse = true) { onPaste() }
+                          if (cancelLabel != null) MenuRow(text = cancelLabel, dot = true) { onCancel() }
+                          if (pasteLabel != null) MenuRow(text = pasteLabel, dot = true) { onPaste() }
                           MenuRow(text = "Rename") { onRename() }
                           MenuRow(text = if (isMarked) "Unmark" else "Mark") { onMark() }
                           MenuRow(text = "Copy") { onCopy() }
