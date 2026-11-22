@@ -269,6 +269,14 @@ jobs:
           import net.lingala.zip4j.progress.ProgressMonitor
           import androidx.compose.material3.LinearProgressIndicator
           import androidx.compose.ui.text.input.PasswordVisualTransformation
+          import androidx.compose.foundation.text.BasicTextField
+          import androidx.compose.material.icons.automirrored.filled.ArrowBack
+          import androidx.compose.ui.graphics.SolidColor
+          import androidx.compose.ui.platform.LocalConfiguration
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.font.FontFamily
+          import java.nio.ByteBuffer
+          import java.nio.charset.CodingErrorAction
           import java.io.FileOutputStream
           import java.io.InputStream
           import java.lang.reflect.Method
@@ -430,10 +438,44 @@ jobs:
               "txt", "yml", "yaml", "java", "kt", "kts", "xml", "json", "md", "csv", "tsv",
               "gradle", "properties", "py", "js", "ts", "html", "css", "c", "cpp", "h", "hpp",
               "sh", "log", "ini", "cfg", "conf", "toml", "sql", "go", "rs", "swift", "dart",
-              "php", "rb", "bat", "ps1", "lua", "srt", "vtt"
+              "php", "rb", "bat", "ps1", "lua", "srt", "vtt", "cmd", "jsx", "tsx", "vue", "scss", "less",
+              "cs", "vb", "pl", "r", "scala", "groovy", "adoc", "rst", "tex", "cmake", "mk", "make",
+              "gitignore", "editorconfig", "env", "plist", "ass", "ssa", "reg", "vcf", "ics", "url",
+              "htm", "xhtml", "jsonl", "ndjson", "kml", "gpx", "lock", "lrc", "m3u", "m3u8", "nfo",
+              "pro", "smali", "aidl", "mjs", "cjs", "svg", "rc", "list", "text", "readme", "license"
           )
 
           fun isTextName(name: String): Boolean = name.substringAfterLast('.', "").lowercase() in textExtensions
+
+          // Text / code editor: which files open in it. Known text extensions, plus any unknown file whose
+          // first bytes look like text (no NUL bytes, almost no control characters). Big files go to
+          // other apps instead, because a phone text field gets slow past about 1 MB.
+          object TextFiles {
+              const val MAX_BYTES = 1_000_000L
+
+              fun canEdit(file: File): Boolean {
+                  if (file.length() > MAX_BYTES) return false
+                  if (isTextName(file.name)) return true
+                  return looksLikeText(file)
+              }
+
+              private fun looksLikeText(file: File): Boolean {
+                  return try {
+                      file.inputStream().use { input ->
+                          val buf = ByteArray(4096)
+                          val n = input.read(buf)
+                          if (n <= 0) return true
+                          var control = 0
+                          for (i in 0 until n) {
+                              val b = buf[i].toInt() and 0xFF
+                              if (b == 0) return false
+                              if (b < 32 && b != 9 && b != 10 && b != 12 && b != 13 && b != 27) control++
+                          }
+                          control * 100 < n * 2
+                      }
+                  } catch (e: Exception) { false }
+              }
+          }
 
           // ---------- Bookmarks (no limit on how many) ----------
           object Bookmarks {
@@ -1158,6 +1200,7 @@ jobs:
               var activeIndex by remember { mutableStateOf(0) }
               var pendingCloseIndex by remember { mutableStateOf(-1) }
 
+              var editorFile by remember { mutableStateOf<File?>(null) }
               var viewerImages by remember { mutableStateOf<List<File>?>(null) }
               var viewerStartIndex by remember { mutableStateOf(0) }
 
@@ -1399,7 +1442,15 @@ jobs:
                   color = Color(0xFF1E1E1E)
               ) {
                   Box(modifier = Modifier.fillMaxSize()) {
-                      if (viewerImages != null) {
+                      if (editorFile != null) {
+                          TextEditorScreen(
+                              file = editorFile!!,
+                              onClose = { saved ->
+                                  editorFile = null
+                                  if (saved) afterFileOp()
+                              }
+                          )
+                      } else if (viewerImages != null) {
                           ImageViewerScreen(
                               images = viewerImages!!,
                               startIndex = viewerStartIndex,
@@ -1588,6 +1639,7 @@ jobs:
                                                   onLongPress = { f -> contextTarget = f },
                                                   onNavigate = { d -> tab.dir = d },
                                                   onOpenArchive = { f -> startArchive(f) },
+                                                  onOpenText = { f -> editorFile = f },
                                                   onOpenImage = { images, index ->
                                                       viewerImages = images
                                                       viewerStartIndex = index
@@ -2464,6 +2516,7 @@ jobs:
               onLongPress: (File) -> Unit,
               onNavigate: (File) -> Unit,
               onOpenArchive: (File) -> Unit,
+              onOpenText: (File) -> Unit,
               onOpenImage: (images: List<File>, index: Int) -> Unit
           ) {
               val context = LocalContext.current
@@ -2567,7 +2620,7 @@ jobs:
                                               }
                                               else -> {
                                                   ScrollMemory.markRestore(directory.absolutePath)
-                                                  openFile(context, entry.file)
+                                                  if (TextFiles.canEdit(entry.file)) onOpenText(entry.file) else openFile(context, entry.file)
                                               }
                                           }
                                       }
@@ -3037,6 +3090,179 @@ jobs:
                       TextButton(onClick = onDismiss) { Text("Cancel", color = Color.White) }
                   }
               )
+          }
+
+          // =====================================================================
+          // TEXT / CODE EDITOR: back button top-left, Save top-right (faint and not tappable until
+          // something changed), the rest is the text field. UTF-8 files only (anything else would be
+          // damaged by saving). Line endings (CRLF) and a BOM are kept as they were. Files inside an
+          // opened archive are read only.
+          // =====================================================================
+          @Composable
+          fun TextEditorScreen(file: File, onClose: (saved: Boolean) -> Unit) {
+              val context = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val readOnly = remember(file) { ArchiveSupport.isInside(context, file) }
+              var loaded by remember { mutableStateOf(false) }
+              var original by remember { mutableStateOf("") }
+              var value by remember { mutableStateOf(TextFieldValue("")) }
+              var crlf by remember { mutableStateOf(false) }
+              var bom by remember { mutableStateOf(false) }
+              var savedOnce by remember { mutableStateOf(false) }
+              var saving by remember { mutableStateOf(false) }
+              var confirmLeave by remember { mutableStateOf(false) }
+
+              LaunchedEffect(file) {
+                  val result = withContext(Dispatchers.IO) {
+                      try {
+                          val decoder = Charsets.UTF_8.newDecoder()
+                              .onMalformedInput(CodingErrorAction.REPORT)
+                              .onUnmappableCharacter(CodingErrorAction.REPORT)
+                          decoder.decode(ByteBuffer.wrap(file.readBytes())).toString()
+                      } catch (e: Exception) { null }
+                  }
+                  if (result == null) {
+                      Toast.makeText(context, "Can't open: not a UTF-8 text file", Toast.LENGTH_SHORT).show()
+                      onClose(false)
+                      return@LaunchedEffect
+                  }
+                  var t: String = result
+                  if (t.startsWith("﻿")) { bom = true; t = t.substring(1) }
+                  if (t.contains("\r\n")) { crlf = true; t = t.replace("\r\n", "\n") }
+                  original = t
+                  value = TextFieldValue(t)
+                  loaded = true
+              }
+
+              val dirty = loaded && !readOnly && value.text != original
+
+              fun save(after: () -> Unit = {}) {
+                  if (!dirty || saving) return
+                  val text = value.text
+                  saving = true
+                  scope.launch {
+                      val ok = withContext(Dispatchers.IO) {
+                          try {
+                              var out = text
+                              if (crlf) out = out.replace("\n", "\r\n")
+                              if (bom) out = "﻿" + out
+                              file.writeText(out, Charsets.UTF_8)
+                              true
+                          } catch (e: Exception) { false }
+                      }
+                      saving = false
+                      if (ok) {
+                          original = text
+                          savedOnce = true
+                          Toast.makeText(context, "Saved", Toast.LENGTH_SHORT).show()
+                          after()
+                      } else {
+                          Toast.makeText(context, "Couldn't save", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+              }
+
+              fun requestClose() {
+                  if (dirty) confirmLeave = true else onClose(savedOnce)
+              }
+
+              BackHandler { requestClose() }
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .windowInsetsPadding(WindowInsets.systemBars)
+                      .imePadding()
+              ) {
+                  Row(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .padding(horizontal = 8.dp, vertical = 6.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      IconFlashButton(Icons.AutoMirrored.Filled.ArrowBack, "Back", iconSize = 24.dp) { requestClose() }
+                      Spacer(Modifier.weight(1f))
+                      val savePressed = remember { mutableStateOf(false) }
+                      val active = dirty && !saving
+                      Box(
+                          modifier = Modifier
+                              .clip(CircleShape)
+                              .background(
+                                  when {
+                                      !active -> Color.White.copy(alpha = 0.10f)
+                                      savePressed.value -> Color.Black
+                                      else -> Color.White
+                                  }
+                              )
+                              .then(if (active) Modifier.pressFlash(savePressed) { save() } else Modifier)
+                              .padding(horizontal = 20.dp, vertical = 9.dp)
+                      ) {
+                          Text(
+                              text = "Save",
+                              color = when {
+                                  !active -> Color.White.copy(alpha = 0.30f)
+                                  savePressed.value -> Color.White
+                                  else -> Color.Black
+                              },
+                              fontSize = 14.sp,
+                              fontWeight = FontWeight.SemiBold
+                          )
+                      }
+                      Spacer(Modifier.width(4.dp))
+                  }
+                  Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.12f)))
+
+                  if (!loaded) {
+                      Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                          CircularProgressIndicator(color = Color.White)
+                      }
+                  } else {
+                      val minHeight = LocalConfiguration.current.screenHeightDp.dp
+                      Box(
+                          modifier = Modifier
+                              .weight(1f)
+                              .fillMaxWidth()
+                              .verticalScroll(rememberScrollState())
+                      ) {
+                          BasicTextField(
+                              value = value,
+                              onValueChange = { if (!readOnly) value = it else value = value.copy(selection = it.selection) },
+                              textStyle = TextStyle(
+                                  color = Color.White,
+                                  fontSize = 13.sp,
+                                  lineHeight = 19.sp,
+                                  fontFamily = FontFamily.Monospace
+                              ),
+                              cursorBrush = SolidColor(Color.White),
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .defaultMinSize(minHeight = minHeight)
+                                  .padding(12.dp)
+                          )
+                      }
+                  }
+              }
+
+              if (confirmLeave) {
+                  AlertDialog(
+                      onDismissRequest = { confirmLeave = false },
+                      containerColor = Color(0xFF2A2A2A),
+                      title = { Text("Unsaved changes", color = Color.White) },
+                      text = { Text("Save before leaving?", color = Color.White.copy(alpha = 0.7f)) },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              confirmLeave = false
+                              save { onClose(true) }
+                          }) { Text("Save", color = Color.White) }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = {
+                              confirmLeave = false
+                              onClose(savedOnce)
+                          }) { Text("Discard", color = Color.White) }
+                      }
+                  )
+              }
           }
 
           fun copyFileContent(context: Context, file: File) {
