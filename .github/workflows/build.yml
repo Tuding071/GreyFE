@@ -262,6 +262,16 @@ jobs:
           import java.io.File
           import java.util.concurrent.atomic.AtomicBoolean
           import net.lingala.zip4j.ZipFile
+          import org.apache.commons.compress.PasswordRequiredException
+          import org.apache.commons.compress.archivers.sevenz.SevenZFile
+          import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+          import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
+          import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
+          import org.apache.commons.compress.compressors.xz.XZCompressorInputStream
+          import com.github.junrar.Archive
+          import java.io.BufferedInputStream
+          import java.io.FileInputStream
+          import java.io.OutputStream
           import net.lingala.zip4j.model.ZipParameters
           import net.lingala.zip4j.model.enums.AesKeyStrength
           import net.lingala.zip4j.model.enums.CompressionMethod
@@ -563,6 +573,8 @@ jobs:
           class Listing(val entries: List<Entry>)
 
           fun readEntries(dir: File): List<Entry> {
+              // Inside an opened archive the list comes from the archive's file list, not from the disk
+              ArchiveSupport.virtualList(dir)?.let { return it }
               val arr = dir.listFiles() ?: return emptyList()
               return arr.map { f ->
                   val isDir = f.isDirectory
@@ -611,7 +623,7 @@ jobs:
               fun clear() { map.clear() }
 
               fun load(dir: File): Int {
-                  val n = dir.listFiles()?.size ?: 0
+                  val n = ArchiveSupport.virtualCount(dir) ?: (dir.listFiles()?.size ?: 0)
                   synchronized(this) { map[dir.absolutePath] = n }
                   return n
               }
@@ -638,23 +650,105 @@ jobs:
 
           class OpCancelled : RuntimeException()
 
-          // ---------- Archives (zip) ----------
-          // Opening a zip: it is extracted into the app cache and shown as a normal folder, so every
-          // feature works inside it (image viewer, copy out = extract). The cache is cleared at app start.
+          // ---------- Archives ----------
+          // An archive opens like a folder: only its list of names is read (fast). A file is extracted into the
+          // app cache only when you open or copy it. Supported: zip/cbz/jar, 7z, rar (RAR4), tar, tar.gz/tgz,
+          // tar.bz2, tar.xz and single gz/bz2/xz files. Password protected zip, 7z and rar are supported.
+          // Archive views are read only (no rename / delete / move / paste inside). The cache is cleared when
+          // no tab is inside the archive any more, and at app start.
+          class ArcEntry(val path: String, val isDir: Boolean, val size: Long, val modified: Long)
+
+          class NeedPassword : Exception()
+
+          class ArchiveSession(val key: String, val file: File, val kind: String, val password: String?, val entries: List<ArcEntry>) {
+              // folder path ("" = top) -> the items directly inside it
+              val children: Map<String, List<ArcEntry>> = buildChildren(entries)
+
+              companion object {
+                  fun parentOf(p: String): String = p.substringBeforeLast('/', "")
+
+                  fun buildChildren(entries: List<ArcEntry>): Map<String, List<ArcEntry>> {
+                      val dirs = LinkedHashMap<String, ArcEntry>()
+                      val files = ArrayList<ArcEntry>()
+                      fun addDir(path: String, mod: Long) {
+                          if (path.isNotEmpty() && !dirs.containsKey(path)) {
+                              dirs[path] = ArcEntry(path, true, 0L, mod)
+                              addDir(parentOf(path), mod)
+                          }
+                      }
+                      for (e in entries) {
+                          if (e.isDir) addDir(e.path, e.modified) else {
+                              files.add(e)
+                              addDir(parentOf(e.path), e.modified)
+                          }
+                      }
+                      val map = HashMap<String, MutableList<ArcEntry>>()
+                      for (d in dirs.values) map.getOrPut(parentOf(d.path)) { ArrayList() }.add(d)
+                      for (f in files) map.getOrPut(parentOf(f.path)) { ArrayList() }.add(f)
+                      return map
+                  }
+              }
+          }
+
           class ExtractResult(val dest: File?, val wrongPassword: Boolean, val message: String?)
 
+          // Counts bytes while an archive library writes a file (used for rar) and lets Cancel stop it
+          class ProgressOutputStream(
+              private val out: OutputStream,
+              private val op: OpProgress,
+              private val counter: LongArray,
+              private val total: Long
+          ) : OutputStream() {
+              override fun write(b: Int) { out.write(b); add(1) }
+              override fun write(b: ByteArray, off: Int, len: Int) { out.write(b, off, len); add(len) }
+              override fun close() { out.close() }
+              private fun add(n: Int) {
+                  if (op.cancelled.get()) throw OpCancelled()
+                  counter[0] += n
+                  op.fraction = (counter[0].toDouble() / total).toFloat().coerceIn(0f, 1f)
+              }
+          }
+
           object ArchiveSupport {
-              fun isArchiveName(name: String): Boolean {
+              private var rootDir: File? = null
+              private val sessions = HashMap<String, ArchiveSession>()
+
+              fun kindOf(name: String): String? {
                   val n = name.lowercase()
-                  return n.endsWith(".zip") || n.endsWith(".cbz") || n.endsWith(".jar")
+                  return when {
+                      n.endsWith(".zip") || n.endsWith(".cbz") || n.endsWith(".jar") -> "zip"
+                      n.endsWith(".7z") -> "7z"
+                      n.endsWith(".rar") || n.endsWith(".cbr") -> "rar"
+                      n.endsWith(".tar.gz") || n.endsWith(".tgz") -> "targz"
+                      n.endsWith(".tar.bz2") || n.endsWith(".tbz2") || n.endsWith(".tbz") -> "tarbz2"
+                      n.endsWith(".tar.xz") || n.endsWith(".txz") -> "tarxz"
+                      n.endsWith(".tar") -> "tar"
+                      n.endsWith(".gz") -> "gz"
+                      n.endsWith(".bz2") -> "bz2"
+                      n.endsWith(".xz") -> "xz"
+                      else -> null
+                  }
               }
 
-              fun root(context: Context): File = File(context.cacheDir, "archives")
+              fun isArchiveName(name: String): Boolean = kindOf(name) != null
 
-              fun isInside(context: Context, f: File): Boolean =
-                  f.absolutePath.startsWith(root(context).absolutePath + "/")
+              fun root(context: Context): File {
+                  val r = File(context.cacheDir, "archives")
+                  rootDir = r
+                  return r
+              }
 
-              // For the top folder of an opened archive: the real folder the zip file is in (else null)
+              fun isInside(context: Context, f: File): Boolean {
+                  root(context)
+                  return isVirtualPath(f.absolutePath)
+              }
+
+              fun isVirtualPath(path: String): Boolean {
+                  val r = rootDir ?: return false
+                  return path.startsWith(r.absolutePath + "/")
+              }
+
+              // For the top folder of an opened archive: the real folder the archive file is in (else null)
               fun originFolder(context: Context, d: File): File? {
                   val r = root(context)
                   val p = d.parentFile ?: return null
@@ -665,67 +759,332 @@ jobs:
                   return if (path.isEmpty()) null else File(path)
               }
 
-              // Delete extracted archives that no tab is inside any more (keeps storage use small)
+              // Delete extracted files (and forget the file lists) of archives that no tab is inside any more
               fun cleanup(context: Context, tabPaths: List<String>) {
                   val r = root(context)
                   val rootPath = r.absolutePath + "/"
                   r.listFiles()?.forEach { f ->
-                      val key = f.name.removeSuffix(".ok").removeSuffix(".src")
+                      val key = f.name.removeSuffix(".src")
                       val used = tabPaths.any { it.startsWith(rootPath + key + "/") }
-                      if (!used) f.deleteRecursively()
+                      if (!used) {
+                          f.deleteRecursively()
+                          synchronized(this) { sessions.remove(key) }
+                      }
                   }
               }
 
-              // null = not a readable zip, true = needs a password
-              fun isEncrypted(file: File): Boolean? = try {
-                  val z = ZipFile(file)
-                  if (!z.isValidZipFile) null else z.isEncrypted
-              } catch (e: Exception) { null }
+              // ----- virtual folders -----
+              private fun locate(path: String): Pair<ArchiveSession, String>? {
+                  val r = rootDir ?: return null
+                  val prefix = r.absolutePath + "/"
+                  if (!path.startsWith(prefix)) return null
+                  val parts = path.removePrefix(prefix).split("/")
+                  val s = synchronized(this) { sessions[parts[0]] } ?: return null
+                  return s to parts.drop(2).joinToString("/")
+              }
 
-              fun extract(context: Context, file: File, password: String?, op: OpProgress): ExtractResult {
+              // Items of a folder inside an opened archive (null = not an archive folder)
+              fun virtualList(dir: File): List<Entry>? {
+                  val loc = locate(dir.absolutePath) ?: return null
+                  val list = loc.first.children[loc.second] ?: return emptyList()
+                  return list.map { e ->
+                      val name = e.path.substringAfterLast('/')
+                      Entry(File(dir, name), name, e.isDir, e.size, e.modified)
+                  }
+              }
+
+              fun virtualCount(dir: File): Int? {
+                  val loc = locate(dir.absolutePath) ?: return null
+                  return loc.first.children[loc.second]?.size ?: 0
+              }
+
+              private fun destRootOf(s: ArchiveSession): File = File(File(rootDir!!, s.key), s.file.name)
+
+              private fun cleanName(raw: String): String {
+                  val p = raw.replace('\\', '/').trim('/').removePrefix("./")
+                  if (p.split('/').any { it == ".." }) return ""
+                  return p
+              }
+
+              // ----- opening (reads the file list only) -----
+              fun open(context: Context, file: File, password: String?, op: OpProgress): ExtractResult {
+                  val kind = kindOf(file.name) ?: return ExtractResult(null, false, "Unsupported archive")
                   try {
-                      val zip = ZipFile(file)
-                      if (password != null) zip.setPassword(password.toCharArray())
-                      val headers = zip.fileHeaders
+                      val rootD = root(context)
+                      rootD.mkdirs()
                       val key = Integer.toHexString((file.absolutePath + file.lastModified() + file.length()).hashCode())
-                      val rootDir = root(context)
-                      val destRoot = File(rootDir, key)
-                      val dest = File(destRoot, file.name)
-                      val marker = File(rootDir, "$key.ok")
-                      // Remember which folder the zip lives in, so Back from the archive returns there
-                      rootDir.mkdirs()
-                      File(rootDir, "$key.src").writeText(file.parentFile?.absolutePath ?: "")
-                      // Already opened before (and not password protected): reuse
-                      if (password == null && marker.exists() && dest.isDirectory) return ExtractResult(dest, false, null)
-                      marker.delete()
-                      destRoot.deleteRecursively()
-                      dest.mkdirs()
-                      val total = headers.filter { !it.isDirectory }.sumOf { it.uncompressedSize }.coerceAtLeast(1L)
-                      var done = 0L
-                      try {
-                          for (h in headers) {
-                              if (op.cancelled.get()) {
-                                  destRoot.deleteRecursively()
-                                  return ExtractResult(null, false, "Cancelled")
-                              }
-                              op.detail = h.fileName.trimEnd('/').substringAfterLast('/')
-                              zip.extractFile(h, dest.absolutePath)
-                              done += if (h.isDirectory) 0L else h.uncompressedSize
-                              op.fraction = (done.toDouble() / total).toFloat().coerceIn(0f, 1f)
-                          }
-                      } catch (e: net.lingala.zip4j.exception.ZipException) {
-                          destRoot.deleteRecursively()
-                          val type = e.type?.name ?: ""
-                          if (password != null && (type == "WRONG_PASSWORD" || type == "CHECKSUM_MISMATCH")) {
-                              return ExtractResult(null, true, null)
-                          }
-                          if (type == "WRONG_PASSWORD") return ExtractResult(null, true, null)
-                          return ExtractResult(null, false, "Couldn't open: ${e.message}")
+                      op.detail = "Reading the file list..."
+                      val entries = try {
+                          list(kind, file, password)
+                      } catch (e: NeedPassword) {
+                          return ExtractResult(null, true, null)
                       }
-                      if (password == null) marker.writeText("ok")
+                      if (op.cancelled.get()) return ExtractResult(null, false, "Cancelled")
+                      File(rootD, "$key.src").writeText(file.parentFile?.absolutePath ?: "")
+                      val session = ArchiveSession(key, file, kind, password, entries.filter { it.path.isNotEmpty() })
+                      synchronized(this) { sessions[key] = session }
+                      val dest = destRootOf(session)
+                      dest.mkdirs()
                       return ExtractResult(dest, false, null)
                   } catch (e: Exception) {
-                      return ExtractResult(null, false, "Couldn't open: ${e.message}")
+                      val m = e.message ?: e.javaClass.simpleName
+                      return ExtractResult(null, false, "Couldn't open: $m")
+                  }
+              }
+
+              private fun tarStream(kind: String, file: File): InputStream {
+                  val raw = BufferedInputStream(FileInputStream(file), 64 * 1024)
+                  return when (kind) {
+                      "targz" -> GzipCompressorInputStream(raw)
+                      "tarbz2" -> BZip2CompressorInputStream(raw)
+                      "tarxz" -> XZCompressorInputStream(raw)
+                      else -> raw
+                  }
+              }
+
+              private fun singleName(file: File): String = file.name.substringBeforeLast('.').ifEmpty { file.name }
+
+              private fun singleStream(kind: String, file: File): InputStream {
+                  val raw = BufferedInputStream(FileInputStream(file), 64 * 1024)
+                  return when (kind) {
+                      "gz" -> GzipCompressorInputStream(raw)
+                      "bz2" -> BZip2CompressorInputStream(raw)
+                      else -> XZCompressorInputStream(raw)
+                  }
+              }
+
+              private fun list(kind: String, file: File, password: String?): List<ArcEntry> {
+                  val out = ArrayList<ArcEntry>()
+                  when (kind) {
+                      "zip" -> {
+                          val zip = ZipFile(file)
+                          if (!zip.isValidZipFile) throw java.io.IOException("not a valid zip file")
+                          if (password != null) zip.setPassword(password.toCharArray())
+                          val headers = zip.fileHeaders
+                          if (zip.isEncrypted) {
+                              if (password == null) throw NeedPassword()
+                              val first = headers.firstOrNull { !it.isDirectory }
+                              if (first != null) {
+                                  try {
+                                      zip.getInputStream(first).use { it.read() }
+                                  } catch (e: net.lingala.zip4j.exception.ZipException) {
+                                      throw NeedPassword()
+                                  }
+                              }
+                          }
+                          for (h in headers) {
+                              out.add(ArcEntry(cleanName(h.fileName), h.isDirectory, h.uncompressedSize, h.lastModifiedTimeEpoch))
+                          }
+                      }
+                      "7z" -> {
+                          try {
+                              val sf = if (password == null) SevenZFile(file) else SevenZFile(file, password.toCharArray())
+                              sf.use {
+                                  var e = it.nextEntry
+                                  while (e != null) {
+                                      if (!e.isAntiItem) {
+                                          val mod = if (e.hasLastModifiedDate()) e.lastModifiedDate.time else file.lastModified()
+                                          out.add(ArcEntry(cleanName(e.name), e.isDirectory, e.size, mod))
+                                      }
+                                      e = it.nextEntry
+                                  }
+                              }
+                              // Read the start of the first file: shows whether a password is needed / correct
+                              val probe = if (password == null) SevenZFile(file) else SevenZFile(file, password.toCharArray())
+                              probe.use {
+                                  var e = it.nextEntry
+                                  while (e != null && (e.isDirectory || e.size <= 0L)) e = it.nextEntry
+                                  if (e != null) {
+                                      val buf = ByteArray(64 * 1024)
+                                      var total = 0L
+                                      val limit = minOf(e.size, 8L * 1024 * 1024)
+                                      while (total < limit) {
+                                          val n = it.read(buf)
+                                          if (n < 0) break
+                                          total += n
+                                      }
+                                  }
+                              }
+                          } catch (e: PasswordRequiredException) {
+                              throw NeedPassword()
+                          } catch (e: java.io.IOException) {
+                              if (password != null) throw NeedPassword()
+                              throw e
+                          }
+                      }
+                      "rar" -> {
+                          val archive = try {
+                              if (password == null) Archive(file) else Archive(file, password)
+                          } catch (e: Exception) {
+                              val m = (e.message ?: "").lowercase()
+                              if (e.javaClass.simpleName.contains("V5")) throw java.io.IOException("RAR5 is not supported (only RAR4)")
+                              if (m.contains("password") || m.contains("encrypt")) throw NeedPassword()
+                              throw e
+                          }
+                          archive.use { a ->
+                              val headers = a.fileHeaders
+                              if (headers.any { it.isEncrypted }) {
+                                  if (password == null) throw NeedPassword()
+                                  val first = headers.firstOrNull { !it.isDirectory && it.isEncrypted }
+                                  if (first != null) {
+                                      try {
+                                          a.extractFile(first, object : OutputStream() { override fun write(b: Int) {} override fun write(b: ByteArray, off: Int, len: Int) {} })
+                                      } catch (e: Exception) {
+                                          throw NeedPassword()
+                                      }
+                                  }
+                              }
+                              for (h in headers) {
+                                  out.add(ArcEntry(cleanName(h.fileName), h.isDirectory, h.fullUnpackSize, h.mTime?.time ?: file.lastModified()))
+                              }
+                          }
+                      }
+                      "tar", "targz", "tarbz2", "tarxz" -> {
+                          TarArchiveInputStream(tarStream(kind, file)).use { t ->
+                              var e = t.nextEntry
+                              while (e != null) {
+                                  if (!e.isSymbolicLink && !e.isLink) {
+                                      out.add(ArcEntry(cleanName(e.name), e.isDirectory, e.size, e.lastModifiedDate.time))
+                                  }
+                                  e = t.nextEntry
+                              }
+                          }
+                      }
+                      else -> {
+                          // single compressed file: one entry; reading the start checks the file is valid
+                          singleStream(kind, file).use { it.read() }
+                          out.add(ArcEntry(singleName(file), false, 0L, file.lastModified()))
+                      }
+                  }
+                  return out.filter { it.path.isNotEmpty() }
+              }
+
+              // ----- extracting single files / folders when opened or copied -----
+              private fun wantedFiles(s: ArchiveSession, rel: String): List<ArcEntry> =
+                  s.entries.filter { !it.isDir && (rel.isEmpty() || it.path == rel || it.path.startsWith("$rel/")) }
+
+              private fun isDone(s: ArchiveSession, e: ArcEntry): Boolean {
+                  val t = File(destRootOf(s), e.path)
+                  return t.isFile && e.size > 0L && t.length() == e.size
+              }
+
+              // True when some of these files / folders still have to be extracted
+              fun needsExtraction(files: List<File>): Boolean {
+                  for (f in files) {
+                      val loc = locate(f.absolutePath) ?: continue
+                      if (wantedFiles(loc.first, loc.second).any { !isDone(loc.first, it) }) return true
+                  }
+                  return false
+              }
+
+              // Extracts the given virtual files / folders (with everything inside) into the cache. Returns an error text or null.
+              fun materialize(files: List<File>, op: OpProgress): String? {
+                  try {
+                      for (f in files) {
+                          val loc = locate(f.absolutePath) ?: continue
+                          val s = loc.first
+                          val destRoot = destRootOf(s)
+                          // keep empty folders too
+                          s.entries.filter { it.isDir && (loc.second.isEmpty() || it.path == loc.second || it.path.startsWith(loc.second + "/")) }
+                              .forEach { File(destRoot, it.path).mkdirs() }
+                          val need = wantedFiles(s, loc.second).filter { !isDone(s, it) }
+                          if (need.isEmpty()) continue
+                          extractFiles(s, need, destRoot, op)
+                      }
+                      return null
+                  } catch (e: OpCancelled) {
+                      return "Cancelled"
+                  } catch (e: NeedPassword) {
+                      return "Wrong password"
+                  } catch (e: Exception) {
+                      return "Couldn't extract: ${e.message ?: e.javaClass.simpleName}"
+                  }
+              }
+
+              private fun copyOut(reader: (ByteArray) -> Int, target: File, mod: Long, op: OpProgress, counter: LongArray, total: Long) {
+                  target.parentFile?.mkdirs()
+                  target.outputStream().use { out ->
+                      val buf = ByteArray(128 * 1024)
+                      while (true) {
+                          if (op.cancelled.get()) { out.close(); target.delete(); throw OpCancelled() }
+                          val n = reader(buf)
+                          if (n < 0) break
+                          out.write(buf, 0, n)
+                          counter[0] += n
+                          op.fraction = (counter[0].toDouble() / total).toFloat().coerceIn(0f, 1f)
+                      }
+                  }
+                  if (mod > 0L) target.setLastModified(mod)
+              }
+
+              private fun extractFiles(s: ArchiveSession, need: List<ArcEntry>, destRoot: File, op: OpProgress) {
+                  val total = need.sumOf { it.size }.coerceAtLeast(1L)
+                  val counter = LongArray(1)
+                  val byPath = need.associateBy { it.path }
+                  op.fraction = 0f
+                  when (s.kind) {
+                      "zip" -> {
+                          val zip = ZipFile(s.file)
+                          if (s.password != null) zip.setPassword(s.password.toCharArray())
+                          for (h in zip.fileHeaders) {
+                              val e = byPath[cleanName(h.fileName)] ?: continue
+                              op.detail = e.path.substringAfterLast('/')
+                              zip.getInputStream(h).use { input ->
+                                  copyOut({ b -> input.read(b) }, File(destRoot, e.path), e.modified, op, counter, total)
+                              }
+                          }
+                      }
+                      "7z" -> {
+                          val sf = if (s.password == null) SevenZFile(s.file) else SevenZFile(s.file, s.password.toCharArray())
+                          sf.use {
+                              var left = byPath.size
+                              var e = it.nextEntry
+                              while (e != null && left > 0) {
+                                  val want = if (e.isDirectory) null else byPath[cleanName(e.name)]
+                                  if (want != null) {
+                                      op.detail = want.path.substringAfterLast('/')
+                                      copyOut({ b -> it.read(b) }, File(destRoot, want.path), want.modified, op, counter, total)
+                                      left--
+                                  }
+                                  e = it.nextEntry
+                              }
+                          }
+                      }
+                      "rar" -> {
+                          val a = if (s.password == null) Archive(s.file) else Archive(s.file, s.password)
+                          a.use {
+                              for (h in it.fileHeaders) {
+                                  val want = byPath[cleanName(h.fileName)] ?: continue
+                                  op.detail = want.path.substringAfterLast('/')
+                                  val target = File(destRoot, want.path)
+                                  target.parentFile?.mkdirs()
+                                  ProgressOutputStream(FileOutputStream(target), op, counter, total).use { out -> it.extractFile(h, out) }
+                                  if (want.modified > 0L) target.setLastModified(want.modified)
+                              }
+                          }
+                      }
+                      "tar", "targz", "tarbz2", "tarxz" -> {
+                          TarArchiveInputStream(tarStream(s.kind, s.file)).use { t ->
+                              var left = byPath.size
+                              var e = t.nextEntry
+                              while (e != null && left > 0) {
+                                  val want = if (e.isDirectory) null else byPath[cleanName(e.name)]
+                                  if (want != null) {
+                                      op.detail = want.path.substringAfterLast('/')
+                                      copyOut({ b -> t.read(b) }, File(destRoot, want.path), want.modified, op, counter, total)
+                                      left--
+                                  }
+                                  e = t.nextEntry
+                              }
+                          }
+                      }
+                      else -> {
+                          val want = need.first()
+                          op.detail = want.path
+                          singleStream(s.kind, s.file).use { input ->
+                              copyOut({ b -> input.read(b) }, File(destRoot, want.path), want.modified, op, counter, total)
+                          }
+                      }
                   }
               }
           }
@@ -823,6 +1182,14 @@ jobs:
 
               // Copy or move items into destDir. Returns a short message for a toast.
               fun paste(paths: List<String>, destDir: File, move: Boolean, op: OpProgress): String {
+                  // Items copied out of an opened archive are extracted first (that is the "extract")
+                  val virtualSrc = paths.filter { ArchiveSupport.isVirtualPath(it) }
+                  if (virtualSrc.isNotEmpty()) {
+                      op.detail = "Extracting..."
+                      val err = ArchiveSupport.materialize(virtualSrc.map { File(it) }, op)
+                      if (err != null) return err
+                      op.fraction = 0f
+                  }
                   var ok = 0
                   var failed = 0
                   val destPath = destDir.absolutePath
@@ -1266,7 +1633,7 @@ jobs:
                   // A tab that was inside a deleted / moved / renamed folder goes up to the nearest folder that still exists
                   tabs.forEach { t ->
                       val d = t.dir
-                      if (d != null && !d.exists()) {
+                      if (d != null && !d.exists() && !ArchiveSupport.isVirtualPath(d.absolutePath)) {
                           var p = d.parentFile
                           while (p != null && !p.exists()) p = p.parentFile
                           t.dir = p
@@ -1325,24 +1692,38 @@ jobs:
                           }
                       }
                   ) { p ->
-                      val r = ArchiveSupport.extract(context, file, password, p)
+                      val r = ArchiveSupport.open(context, file, password, p)
                       result = r
                       r.message ?: ""
                   }
               }
 
+              // Archives open like folders (only the file list is read). Password questions come back here.
               fun startArchive(file: File) {
-                  scope.launch {
-                      val encrypted = withContext(Dispatchers.IO) { ArchiveSupport.isEncrypted(file) }
-                      when (encrypted) {
-                          null -> Toast.makeText(context, "Can't read this archive (only zip is supported)", Toast.LENGTH_SHORT).show()
-                          true -> {
-                              archiveWrongPassword = false
-                              archivePrompt = file
-                          }
-                          false -> openArchive(file, null)
-                      }
+                  openArchive(file, null)
+              }
+
+              // Extracts the given archive items (files or folders) when needed, then runs `then`
+              fun extractThen(files: List<File>, then: () -> Unit) {
+                  if (!ArchiveSupport.needsExtraction(files)) {
+                      then()
+                      return
                   }
+                  var ok = false
+                  runOp(title = "Extracting", after = { if (ok) then() }) { p ->
+                      val err = ArchiveSupport.materialize(files, p)
+                      ok = err == null
+                      err ?: ""
+                  }
+              }
+
+              // Archive items can be marked and copied (= extracted), but not changed
+              fun readOnlyBlocked(files: List<File>): Boolean {
+                  if (files.any { ArchiveSupport.isInside(context, it) }) {
+                      Toast.makeText(context, "Archives are read only: use Copy to extract", Toast.LENGTH_SHORT).show()
+                      return true
+                  }
+                  return false
               }
 
               fun doZip(targets: List<String>, name: String, password: String) {
@@ -1640,6 +2021,7 @@ jobs:
                                                   onNavigate = { d -> tab.dir = d },
                                                   onOpenArchive = { f -> startArchive(f) },
                                                   onOpenText = { f -> editorFile = f },
+                                                  onExtract = { files, then -> extractThen(files, then) },
                                                   onOpenImage = { images, index ->
                                                       viewerImages = images
                                                       viewerStartIndex = index
@@ -1695,7 +2077,7 @@ jobs:
                               } else null,
                               onRename = {
                                   contextTarget = null
-                                  renameTarget = ctx
+                                  if (!readOnlyBlocked(listOf(ctx))) renameTarget = ctx
                               },
                               onMark = {
                                   toggleMark(ctx)
@@ -1709,11 +2091,13 @@ jobs:
                                   Toast.makeText(context, "${FileOps.items(targets.size)} ready to paste", Toast.LENGTH_SHORT).show()
                               },
                               onMove = {
-                                  clipPaths = targets
-                                  clipMove = true
-                                  marked.clear()
                                   contextTarget = null
-                                  Toast.makeText(context, "${FileOps.items(targets.size)} ready to move", Toast.LENGTH_SHORT).show()
+                                  if (!readOnlyBlocked(targets.map { File(it) })) {
+                                      clipPaths = targets
+                                      clipMove = true
+                                      marked.clear()
+                                      Toast.makeText(context, "${FileOps.items(targets.size)} ready to move", Toast.LENGTH_SHORT).show()
+                                  }
                               },
                               onArchive = {
                                   contextTarget = null
@@ -1721,7 +2105,7 @@ jobs:
                               },
                               onDelete = {
                                   contextTarget = null
-                                  deleteTargets = targets
+                                  if (!readOnlyBlocked(targets.map { File(it) })) deleteTargets = targets
                               },
                               onCancel = {
                                   cancelPending()
@@ -2517,6 +2901,7 @@ jobs:
               onNavigate: (File) -> Unit,
               onOpenArchive: (File) -> Unit,
               onOpenText: (File) -> Unit,
+              onExtract: (files: List<File>, then: () -> Unit) -> Unit,
               onOpenImage: (images: List<File>, index: Int) -> Unit
           ) {
               val context = LocalContext.current
@@ -2564,6 +2949,7 @@ jobs:
               val sorted = remember(listing, sortMode) {
                   listing?.let { sortEntries(it.entries, sortMode) }
               }
+              val inArchiveDir = remember(dirPath) { ArchiveSupport.isVirtualPath(dirPath) }
               val imagesInDir = remember(sorted) {
                   sorted?.filter { !it.isDir && ThumbnailCache.isImage(it.name) }?.map { it.file } ?: emptyList()
               }
@@ -2611,16 +2997,29 @@ jobs:
                                               }
                                               ThumbnailCache.isImage(entry.name) -> {
                                                   ScrollMemory.markRestore(directory.absolutePath)
-                                                  val idx = imagesInDir.indexOf(entry.file).coerceAtLeast(0)
-                                                  onOpenImage(imagesInDir, idx)
+                                                  if (inArchiveDir) {
+                                                      // Archive: extract this folder's pictures (if not huge) so swiping works
+                                                      val imgSize = sorted.filter { !it.isDir && ThumbnailCache.isImage(it.name) }.sumOf { it.size }
+                                                      val list = if (imgSize <= 100L * 1024 * 1024) imagesInDir else listOf(entry.file)
+                                                      val i = list.indexOf(entry.file).coerceAtLeast(0)
+                                                      onExtract(list) { onOpenImage(list, i) }
+                                                  } else {
+                                                      val idx = imagesInDir.indexOf(entry.file).coerceAtLeast(0)
+                                                      onOpenImage(imagesInDir, idx)
+                                                  }
                                               }
                                               ArchiveSupport.isArchiveName(entry.name) -> {
                                                   ScrollMemory.markRestore(directory.absolutePath)
-                                                  onOpenArchive(entry.file)
+                                                  if (inArchiveDir) onExtract(listOf(entry.file)) { onOpenArchive(entry.file) }
+                                                  else onOpenArchive(entry.file)
                                               }
                                               else -> {
                                                   ScrollMemory.markRestore(directory.absolutePath)
-                                                  if (TextFiles.canEdit(entry.file)) onOpenText(entry.file) else openFile(context, entry.file)
+                                                  val openIt = {
+                                                      if (TextFiles.canEdit(entry.file)) onOpenText(entry.file) else openFile(context, entry.file)
+                                                  }
+                                                  // A file inside an archive is extracted just now, when you open it
+                                                  if (inArchiveDir) onExtract(listOf(entry.file)) { openIt() } else openIt()
                                               }
                                           }
                                       }
@@ -2694,7 +3093,9 @@ jobs:
           ) {
               val context = LocalContext.current
               val file = entry.file
-              val hasFileThumb = !entry.isDir && (ThumbnailCache.isImage(entry.name) || ThumbnailCache.isVideo(entry.name))
+              // Files inside an archive are not extracted yet, so there is nothing to preview
+              val inArchive = ArchiveSupport.isVirtualPath(file.absolutePath)
+              val hasFileThumb = !inArchive && !entry.isDir && (ThumbnailCache.isImage(entry.name) || ThumbnailCache.isVideo(entry.name))
               val muted = Color.White.copy(alpha = 0.55f)
 
               val thumb by produceState<Bitmap?>(initialValue = null, key1 = file.absolutePath, key2 = entry.modified) {
@@ -2702,7 +3103,7 @@ jobs:
               }
 
               val folderThumb by produceState<Bitmap?>(initialValue = null, key1 = file.absolutePath, key2 = entry.modified) {
-                  value = if (entry.isDir) ThumbnailCache.getFolderThumbnail(context, file) else null
+                  value = if (entry.isDir && !inArchive) ThumbnailCache.getFolderThumbnail(context, file) else null
               }
 
               // Folder item counts come from a background read, remembered after the first time
@@ -2776,7 +3177,7 @@ jobs:
                   }
 
                   // Copy pill for text-based files: copies the whole content, no opening needed
-                  if (!entry.isDir && isTextName(entry.name)) {
+                  if (!entry.isDir && !inArchive && isTextName(entry.name)) {
                       Spacer(Modifier.width(8.dp))
                       Box(
                           modifier = Modifier
@@ -3218,14 +3619,18 @@ jobs:
                       }
                   } else {
                       val minHeight = LocalConfiguration.current.screenHeightDp.dp
+                      val minWidth = LocalConfiguration.current.screenWidthDp.dp
+                      // No line wrapping: long lines scroll sideways (and the page scrolls up / down)
                       Box(
                           modifier = Modifier
                               .weight(1f)
                               .fillMaxWidth()
                               .verticalScroll(rememberScrollState())
+                              .horizontalScroll(rememberScrollState())
                       ) {
                           BasicTextField(
                               value = value,
+                              softWrap = false,
                               onValueChange = { if (!readOnly) value = it else value = value.copy(selection = it.selection) },
                               textStyle = TextStyle(
                                   color = Color.White,
@@ -3235,8 +3640,7 @@ jobs:
                               ),
                               cursorBrush = SolidColor(Color.White),
                               modifier = Modifier
-                                  .fillMaxWidth()
-                                  .defaultMinSize(minHeight = minHeight)
+                                  .defaultMinSize(minWidth = minWidth, minHeight = minHeight)
                                   .padding(12.dp)
                           )
                       }
@@ -3835,6 +4239,27 @@ jobs:
           }
           ENDOFFILE
 
+          # R8 rules for the archive libraries (they have optional parts that are not on Android)
+          cat > app/proguard-rules.pro << 'PROEOF'
+          -dontwarn org.apache.commons.compress.**
+          -dontwarn org.apache.commons.lang3.**
+          -dontwarn org.apache.commons.io.**
+          -dontwarn org.apache.commons.codec.**
+          -dontwarn com.github.luben.zstd.**
+          -dontwarn org.brotli.dec.**
+          -dontwarn org.objectweb.asm.**
+          -dontwarn org.tukaani.xz.**
+          -dontwarn com.github.junrar.**
+          -dontwarn org.slf4j.**
+          -dontwarn java.lang.management.**
+          -dontwarn javax.naming.**
+          -dontwarn javax.annotation.**
+          -keep class org.apache.commons.compress.** { *; }
+          -keep class org.tukaani.xz.** { *; }
+          -keep class com.github.junrar.** { *; }
+          -keep class net.lingala.zip4j.** { *; }
+          PROEOF
+
           cat > app/build.gradle.kts << APPEOF
           plugins {
               id("com.android.application")
@@ -3867,8 +4292,17 @@ jobs:
                   release {
                       isMinifyEnabled = true
                       isShrinkResources = true
-                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
                       signingConfig = signingConfigs.getByName("release")
+                  }
+              }
+
+              packaging {
+                  resources {
+                      excludes += listOf(
+                          "META-INF/LICENSE*", "META-INF/NOTICE*", "META-INF/DEPENDENCIES",
+                          "META-INF/INDEX.LIST", "META-INF/*.kotlin_module.bak"
+                      )
                   }
               }
 
@@ -3899,6 +4333,10 @@ jobs:
               implementation("androidx.documentfile:documentfile:1.0.1")
               // Zip reading / writing with password support (AES + classic zip encryption)
               implementation("net.lingala.zip4j:zip4j:2.11.5")
+              // More archive formats: 7z, tar, tar.gz / bz2 / xz, single gz / bz2 / xz, and rar (RAR4)
+              implementation("org.apache.commons:commons-compress:1.26.2")
+              implementation("org.tukaani:xz:1.9")
+              implementation("com.github.junrar:junrar:7.5.5")
           }
           APPEOF
 
