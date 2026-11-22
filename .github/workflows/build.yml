@@ -280,6 +280,7 @@ jobs:
           import androidx.compose.material3.LinearProgressIndicator
           import androidx.compose.ui.text.input.PasswordVisualTransformation
           import androidx.compose.foundation.text.BasicTextField
+          import androidx.compose.ui.graphics.toArgb
           import androidx.compose.foundation.layout.BoxWithConstraints
           import androidx.compose.ui.draw.drawBehind
           import androidx.compose.ui.geometry.Size
@@ -3748,8 +3749,186 @@ jobs:
           }
 
           // =====================================================================
-          // TEXT / CODE EDITOR: back button top-left, Save top-right (faint and not tappable until
-          // something changed), the rest is the text field. UTF-8 files only (anything else would be
+          // CodeEditText: the text field of the editor is a NATIVE Android EditText (not a Compose text field),
+          // because Compose's text field gets very slow with big text and the keyboard open. It draws:
+          //  - line numbers in a fixed gutter on the left
+          //  - a faint highlight on the line the cursor is on
+          //  - syntax colors (spans, calculated in the background after you stop typing)
+          // Text size is set so that about 60 lines fit the height. No wrapping: it scrolls sideways.
+          // =====================================================================
+          class CodeEditText(context: Context) : android.widget.EditText(context) {
+              class SyntaxSpan(color: Int) : android.text.style.ForegroundColorSpan(color)
+
+              var onUserEdit: (() -> Unit)? = null
+              var lang: SyntaxHighlighter.Lang? = null
+              var readOnly: Boolean = false
+
+              private val density = context.resources.displayMetrics.density
+              private val ui = android.os.Handler(android.os.Looper.getMainLooper())
+              private var suppress = false
+              private var version = 0
+              private var fitHeightPx = 0
+              private var gutterDigits = 2
+              private val numberPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+              private val fill = android.graphics.Paint()
+              private val highlightRunnable = Runnable { runHighlight() }
+
+              init {
+                  typeface = android.graphics.Typeface.MONOSPACE
+                  setTextColor(0xFFFFFFFF.toInt())
+                  setBackgroundColor(0xFF1E1E1E.toInt())
+                  gravity = android.view.Gravity.TOP or android.view.Gravity.START
+                  setHorizontallyScrolling(true)
+                  includeFontPadding = false
+                  setLineSpacing(0f, 1f)
+                  inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                      android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                      android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                  imeOptions = android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI
+                  highlightColor = 0x55FFFFFF
+                  isVerticalScrollBarEnabled = true
+                  numberPaint.typeface = android.graphics.Typeface.MONOSPACE
+                  numberPaint.textAlign = android.graphics.Paint.Align.RIGHT
+                  if (android.os.Build.VERSION.SDK_INT >= 29) {
+                      val cursor = android.graphics.drawable.GradientDrawable()
+                      cursor.setColor(0xFFFFFFFF.toInt())
+                      cursor.setSize((2 * density).toInt().coerceAtLeast(2), -1)
+                      textCursorDrawable = cursor
+                  }
+                  updatePadding()
+                  addTextChangedListener(object : android.text.TextWatcher {
+                      override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                      override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                      override fun afterTextChanged(s: android.text.Editable?) {
+                          version++
+                          if (!suppress) onUserEdit?.invoke()
+                          updatePadding()
+                          scheduleHighlight(350)
+                      }
+                  })
+              }
+
+              override fun onCheckIsTextEditor(): Boolean = !readOnly && super.onCheckIsTextEditor()
+
+              // Replaces the whole content (used once when the file is loaded)
+              fun load(content: String, readOnlyMode: Boolean) {
+                  readOnly = readOnlyMode
+                  if (readOnlyMode) keyListener = null
+                  suppress = true
+                  setText(content)
+                  suppress = false
+                  setSelection(0)
+                  updatePadding()
+                  scheduleHighlight(0)
+              }
+
+              // ----- size: about 60 lines fill the height (measured once, so the keyboard does not change it) -----
+              override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+                  super.onSizeChanged(w, h, oldw, oldh)
+                  if (fitHeightPx == 0 && h > 0) {
+                      fitHeightPx = h
+                      val lineH = (h - 16 * density) / 60f
+                      val probe = android.graphics.Paint()
+                      probe.typeface = android.graphics.Typeface.MONOSPACE
+                      probe.textSize = 100f
+                      val m = probe.fontMetrics
+                      val ratio = (m.descent - m.ascent) / 100f
+                      val px = lineH / ratio
+                      setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, px)
+                      numberPaint.textSize = px
+                      updatePadding()
+                  }
+              }
+
+              // Left padding = the line-number gutter (its width follows the number of digits)
+              private fun updatePadding() {
+                  val lines = lineCount.coerceAtLeast(1)
+                  gutterDigits = maxOf(2, lines.toString().length)
+                  val left = gutterWidth() + (6 * density).toInt()
+                  if (paddingLeft != left) {
+                      setPadding(left, (8 * density).toInt(), (24 * density).toInt(), (8 * density).toInt())
+                  }
+              }
+
+              private fun gutterWidth(): Int =
+                  (gutterDigits * numberPaint.measureText("0") + 14 * density).toInt()
+
+              override fun onSelectionChanged(selStart: Int, selEnd: Int) {
+                  super.onSelectionChanged(selStart, selEnd)
+                  invalidate()
+              }
+
+              override fun onDraw(canvas: android.graphics.Canvas) {
+                  val l = layout
+                  if (l == null) {
+                      super.onDraw(canvas)
+                      return
+                  }
+                  val offY = extendedPaddingTop.toFloat()
+                  val current = l.getLineForOffset(selectionEnd.coerceAtLeast(0))
+                  // faint highlight on the line being edited
+                  fill.color = 0x1AFFFFFF
+                  canvas.drawRect(
+                      scrollX.toFloat(), offY + l.getLineTop(current),
+                      (scrollX + width).toFloat(), offY + l.getLineBottom(current), fill
+                  )
+                  super.onDraw(canvas)
+                  // line numbers (fixed on the left, drawn over the text that scrolls under them)
+                  val gw = gutterWidth().toFloat()
+                  fill.color = 0xFF262626.toInt()
+                  canvas.drawRect(scrollX.toFloat(), scrollY.toFloat(), scrollX + gw, (scrollY + height).toFloat(), fill)
+                  fill.color = 0x22FFFFFF
+                  canvas.drawRect(scrollX + gw - 1f, scrollY.toFloat(), scrollX + gw, (scrollY + height).toFloat(), fill)
+                  val first = l.getLineForVertical((scrollY - offY).toInt().coerceAtLeast(0))
+                  val last = l.getLineForVertical((scrollY + height - offY).toInt().coerceAtLeast(0))
+                  val right = scrollX + gw - 8 * density
+                  for (i in first..last) {
+                      numberPaint.color = if (i == current) 0xFFFFFFFF.toInt() else 0x66FFFFFF
+                      canvas.drawText((i + 1).toString(), right, offY + l.getLineBaseline(i), numberPaint)
+                  }
+              }
+
+              // ----- syntax colors -----
+              private fun scheduleHighlight(delayMs: Long) {
+                  ui.removeCallbacks(highlightRunnable)
+                  if (lang != null) ui.postDelayed(highlightRunnable, delayMs)
+              }
+
+              private fun clearSyntax() {
+                  val ed = text ?: return
+                  for (s in ed.getSpans(0, ed.length, SyntaxSpan::class.java)) ed.removeSpan(s)
+              }
+
+              private fun runHighlight() {
+                  val lg = lang ?: return
+                  val ed = text ?: return
+                  if (ed.length > SyntaxHighlighter.MAX_CHARS) {
+                      clearSyntax()
+                      return
+                  }
+                  val snapshot = ed.toString()
+                  val v = version
+                  Thread {
+                      val result = SyntaxHighlighter.highlight(snapshot, lg)
+                      ui.post {
+                          // apply only if the text did not change meanwhile
+                          if (v == version) {
+                              val e = text
+                              if (e != null) {
+                                  clearSyntax()
+                                  for (r in result.spanStyles) {
+                                      e.setSpan(SyntaxSpan(r.item.color.toArgb()), r.start, r.end, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                                  }
+                              }
+                          }
+                      }
+                  }.start()
+              }
+          }
+
+          // =====================================================================
+          // TEXT / CODE EDITOR SCREEN: back button top-left, Save top-right (faint and not tappable until
+          // something changed), the rest is the native text field above. UTF-8 files only (anything else would be
           // damaged by saving). Line endings (CRLF) and a BOM are kept as they were. Files inside an
           // opened archive are read only.
           // =====================================================================
@@ -3759,14 +3938,16 @@ jobs:
               val scope = rememberCoroutineScope()
               val readOnly = remember(file) { ArchiveSupport.isInside(context, file) }
               var loaded by remember { mutableStateOf(false) }
-              var original by remember { mutableStateOf("") }
-              var value by remember { mutableStateOf(TextFieldValue("")) }
+              var loadedText by remember { mutableStateOf<String?>(null) }
+              var editor by remember { mutableStateOf<CodeEditText?>(null) }
+              var changed by remember { mutableStateOf(false) }
               var crlf by remember { mutableStateOf(false) }
               var bom by remember { mutableStateOf(false) }
               var savedOnce by remember { mutableStateOf(false) }
               var saving by remember { mutableStateOf(false) }
               var confirmLeave by remember { mutableStateOf(false) }
 
+              // 1) read the file in the background
               LaunchedEffect(file) {
                   val result = withContext(Dispatchers.IO) {
                       try {
@@ -3784,29 +3965,26 @@ jobs:
                   var t: String = result
                   if (t.startsWith("﻿")) { bom = true; t = t.substring(1) }
                   if (t.contains("\r\n")) { crlf = true; t = t.replace("\r\n", "\n") }
-                  original = t
-                  value = TextFieldValue(t)
-                  loaded = true
+                  loadedText = t
               }
 
-              val dirty = loaded && !readOnly && value.text != original
-
-              // Syntax colors: calculated in the background after typing stops (not on every key)
-              val lang = remember(file) { SyntaxHighlighter.langFor(file.name) }
-              var styled by remember { mutableStateOf<AnnotatedString?>(null) }
-              LaunchedEffect(loaded, value.text, lang) {
-                  if (!loaded || lang == null || value.text.length > SyntaxHighlighter.MAX_CHARS) {
-                      styled = null
-                      return@LaunchedEffect
+              // 2) put the text into the native field once both the text and the field exist
+              LaunchedEffect(loadedText, editor) {
+                  val t = loadedText
+                  val e = editor
+                  if (t != null && e != null && !loaded) {
+                      e.load(t, readOnly)
+                      changed = false
+                      loaded = true
                   }
-                  if (styled != null) delay(300)
-                  val t = value.text
-                  styled = withContext(Dispatchers.Default) { SyntaxHighlighter.highlight(t, lang) }
               }
+
+              val dirty = loaded && !readOnly && changed
 
               fun save(after: () -> Unit = {}) {
-                  if (!dirty || saving) return
-                  val text = value.text
+                  val e = editor
+                  if (!dirty || saving || e == null) return
+                  val text = e.text.toString()
                   saving = true
                   scope.launch {
                       val ok = withContext(Dispatchers.IO) {
@@ -3816,11 +3994,11 @@ jobs:
                               if (bom) out = "﻿" + out
                               file.writeText(out, Charsets.UTF_8)
                               true
-                          } catch (e: Exception) { false }
+                          } catch (ex: Exception) { false }
                       }
                       saving = false
                       if (ok) {
-                          original = text
+                          changed = false
                           savedOnce = true
                           Toast.makeText(context, "Saved", Toast.LENGTH_SHORT).show()
                           after()
@@ -3835,6 +4013,8 @@ jobs:
               }
 
               BackHandler { requestClose() }
+
+              val lang = remember(file) { SyntaxHighlighter.langFor(file.name) }
 
               Column(
                   modifier = Modifier
@@ -3880,72 +4060,20 @@ jobs:
                   }
                   Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.12f)))
 
-                  if (!loaded) {
-                      Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                          CircularProgressIndicator(color = Color.White)
-                      }
-                  } else {
-                      val density = LocalDensity.current
-                      val minWidth = LocalConfiguration.current.screenWidthDp.dp
-                      BoxWithConstraints(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                          // Text size: about 60 lines fill the screen height. The height is measured once
-                          // (the biggest seen), so the text does not change size when the keyboard opens.
-                          var fitHeight by remember { mutableStateOf(0.dp) }
-                          if (maxHeight > fitHeight) fitHeight = maxHeight
-                          val lineDp = ((if (fitHeight > 0.dp) fitHeight else 600.dp) - 24.dp) / 60f
-                          val lineHeightSp = with(density) { lineDp.toSp() }
-                          val fontSp = with(density) { (lineDp * 0.70f).toSp() }
-                          val padPx = with(density) { 12.dp.toPx() }
-                          val minHeight = maxOf(maxHeight, fitHeight)
-
-                          // Layout of the text: used to find and highlight the line the cursor is on
-                          var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
-                          val transformation = remember(styled) {
-                              object : VisualTransformation {
-                                  override fun filter(text: AnnotatedString): TransformedText {
-                                      val a = styled
-                                      return TransformedText(if (a == null) text else SyntaxHighlighter.adapt(a, text), OffsetMapping.Identity)
-                                  }
+                  Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                      AndroidView(
+                          modifier = Modifier.fillMaxSize(),
+                          factory = { ctx ->
+                              CodeEditText(ctx).also {
+                                  it.lang = lang
+                                  it.onUserEdit = { changed = true }
+                                  editor = it
                               }
                           }
-
-                          // No line wrapping: inside a horizontal scroll the text gets unlimited width, so long lines scroll sideways
-                          Box(
-                              modifier = Modifier
-                                  .fillMaxSize()
-                                  .verticalScroll(rememberScrollState())
-                                  .horizontalScroll(rememberScrollState())
-                          ) {
-                              BasicTextField(
-                                  value = value,
-                                  onValueChange = { if (!readOnly) value = it else value = value.copy(selection = it.selection) },
-                                  textStyle = TextStyle(
-                                      color = Color.White,
-                                      fontSize = fontSp,
-                                      lineHeight = lineHeightSp,
-                                      fontFamily = FontFamily.Monospace
-                                  ),
-                                  cursorBrush = SolidColor(Color.White),
-                                  visualTransformation = transformation,
-                                  onTextLayout = { layout = it },
-                                  modifier = Modifier
-                                      .defaultMinSize(minWidth = minWidth, minHeight = minHeight)
-                                      // faint highlight on the line you are editing / tapped / selecting
-                                      .drawBehind {
-                                          val l = layout
-                                          if (l != null) {
-                                              val off = value.selection.end.coerceIn(0, l.layoutInput.text.length)
-                                              val line = l.getLineForOffset(off)
-                                              val top = l.getLineTop(line)
-                                              drawRect(
-                                                  color = Color.White.copy(alpha = 0.10f),
-                                                  topLeft = Offset(0f, padPx + top),
-                                                  size = Size(size.width, l.getLineBottom(line) - top)
-                                              )
-                                          }
-                                      }
-                                      .padding(12.dp)
-                              )
+                      )
+                      if (!loaded) {
+                          Box(Modifier.fillMaxSize().background(Color(0xFF1E1E1E)), contentAlignment = Alignment.Center) {
+                              CircularProgressIndicator(color = Color.White)
                           }
                       }
                   }
