@@ -883,7 +883,7 @@ jobs:
                                   var e = it.nextEntry
                                   while (e != null) {
                                       if (!e.isAntiItem) {
-                                          val mod = if (e.hasLastModifiedDate()) e.lastModifiedDate.time else file.lastModified()
+                                          val mod = if (e.hasLastModifiedDate) e.lastModifiedDate.time else file.lastModified()
                                           out.add(ArcEntry(cleanName(e.name), e.isDirectory, e.size, mod))
                                       }
                                       e = it.nextEntry
@@ -3620,7 +3620,7 @@ jobs:
                   } else {
                       val minHeight = LocalConfiguration.current.screenHeightDp.dp
                       val minWidth = LocalConfiguration.current.screenWidthDp.dp
-                      // No line wrapping: long lines scroll sideways (and the page scrolls up / down)
+                      // No line wrapping: inside a horizontal scroll the text gets unlimited width, so long lines scroll sideways
                       Box(
                           modifier = Modifier
                               .weight(1f)
@@ -3630,7 +3630,6 @@ jobs:
                       ) {
                           BasicTextField(
                               value = value,
-                              softWrap = false,
                               onValueChange = { if (!readOnly) value = it else value = value.copy(selection = it.selection) },
                               textStyle = TextStyle(
                                   color = Color.White,
