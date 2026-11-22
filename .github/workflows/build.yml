@@ -1601,6 +1601,7 @@ jobs:
               var pendingCloseIndex by remember { mutableStateOf(-1) }
 
               var editorFile by remember { mutableStateOf<File?>(null) }
+              var logcatOpen by remember { mutableStateOf(false) }
               var viewerImages by remember { mutableStateOf<List<File>?>(null) }
               var viewerStartIndex by remember { mutableStateOf(0) }
 
@@ -1856,7 +1857,9 @@ jobs:
                   color = Color(0xFF1E1E1E)
               ) {
                   Box(modifier = Modifier.fillMaxSize()) {
-                      if (editorFile != null) {
+                      if (logcatOpen) {
+                          LogcatScreen(onClose = { logcatOpen = false })
+                      } else if (editorFile != null) {
                           TextEditorScreen(
                               file = editorFile!!,
                               onClose = { saved ->
@@ -1957,6 +1960,10 @@ jobs:
                                               sortMode = mode
                                               SortPrefs.save(context, mode)
                                           }
+                                      }
+                                      MenuRow(text = "Logcat") {
+                                          logcatOpen = true
+                                          close()
                                       }
                                   }
                               )
@@ -3809,10 +3816,13 @@ jobs:
                       override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
                       override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
                       override fun afterTextChanged(s: android.text.Editable?) {
+                          val t0 = System.nanoTime()
                           version++
                           if (!suppress) onUserEdit?.invoke()
                           updatePadding()
                           scheduleHighlight(350)
+                          val ms = (System.nanoTime() - t0) / 1_000_000L
+                          if (ms >= 8L) AppLog.w("editor: afterTextChanged took ${ms}ms (len=${s?.length}, spans=${applied.size})")
                       }
                   })
               }
@@ -3821,6 +3831,7 @@ jobs:
 
               // Replaces the whole content (used once when the file is loaded)
               fun load(content: String, readOnlyMode: Boolean) {
+                  val tL = System.nanoTime()
                   readOnly = readOnlyMode
                   if (readOnlyMode) keyListener = null
                   suppress = true
@@ -3829,6 +3840,7 @@ jobs:
                   setSelection(0)
                   updatePadding()
                   scheduleHighlight(0)
+                  AppLog.d("editor: load() of ${content.length} chars took ${(System.nanoTime() - tL) / 1_000_000L}ms")
               }
 
               // ----- size: about 60 lines fill the height (measured once, so the keyboard does not change it) -----
@@ -3868,6 +3880,29 @@ jobs:
               }
 
               override fun onDraw(canvas: android.graphics.Canvas) {
+                  val t0 = System.nanoTime()
+                  drawInner(canvas)
+                  val ms = (System.nanoTime() - t0) / 1_000_000L
+                  if (ms >= 12L) AppLog.w("editor: onDraw took ${ms}ms (lines=${lineCount}, spans=${applied.size}, ime=${imeVisible})")
+              }
+
+              var imeVisible = false
+
+              override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                  val t0 = System.nanoTime()
+                  super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+                  val ms = (System.nanoTime() - t0) / 1_000_000L
+                  if (ms >= 8L) AppLog.w("editor: onMeasure took ${ms}ms")
+              }
+
+              override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+                  val t0 = System.nanoTime()
+                  super.onLayout(changed, left, top, right, bottom)
+                  val ms = (System.nanoTime() - t0) / 1_000_000L
+                  if (ms >= 8L) AppLog.w("editor: onLayout took ${ms}ms")
+              }
+
+              private fun drawInner(canvas: android.graphics.Canvas) {
                   val l = layout
                   if (l == null) {
                       super.onDraw(canvas)
@@ -3930,6 +3965,7 @@ jobs:
                   }
                   val ed = text ?: return
                   val c = cache ?: return
+                  val tA = System.nanoTime()
                   clearSyntax()
                   if (lay.lineCount == 0) return
                   val firstLine = (lay.getLineForVertical(scrollY) - 20).coerceAtLeast(0)
@@ -3944,6 +3980,7 @@ jobs:
                       ed.setSpan(span, r.start, r.end, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                       applied.add(span)
                   }
+                  AppLog.d("editor: applyWindow ${(System.nanoTime() - tA) / 1_000_000L}ms, spans=${applied.size}, total colour ranges=${c.spanStyles.size}")
               }
 
               private fun runHighlight() {
@@ -3960,7 +3997,9 @@ jobs:
                   val snapshot = ed.toString()
                   val v = version
                   Thread {
+                      val tH = System.nanoTime()
                       val result = SyntaxHighlighter.highlight(snapshot, lg)
+                      AppLog.d("editor: highlight of ${snapshot.length} chars took ${(System.nanoTime() - tH) / 1_000_000L}ms (background)")
                       ui.post {
                           // use it only if the text did not change meanwhile
                           if (v == version) {
@@ -4063,6 +4102,17 @@ jobs:
 
               val lang = remember(file) { SyntaxHighlighter.langFor(file.name) }
 
+              FrameMonitor("editor")
+              val imeDensity = LocalDensity.current
+              val imeBottom = WindowInsets.ime.getBottom(imeDensity)
+              LaunchedEffect(imeBottom) {
+                  editor?.imeVisible = imeBottom > 0
+                  AppLog.d("editor: keyboard height now ${imeBottom}px (${if (imeBottom > 0) "visible" else "hidden"})")
+              }
+              LaunchedEffect(file) {
+                  AppLog.d("editor: opened ${file.name} (${file.length()} bytes), Android ${Build.VERSION.SDK_INT}, ${Build.MODEL}")
+              }
+
               Column(
                   modifier = Modifier
                       .fillMaxSize()
@@ -4145,6 +4195,146 @@ jobs:
                           }) { Text("Discard", color = Color.White) }
                       }
                   )
+              }
+          }
+
+          // =====================================================================
+          // LOGCAT (top-right menu): shows this app's own log lines (the system only allows an app to read its
+          // own log) with Refresh and Copy. The app writes useful lines itself with AppLog (tag "GreyB"):
+          // editor open/load times, keyboard shown/hidden, slow edits / slow frames, colour work, archives.
+          // NOTE FOR FUTURE: log anything worth checking with AppLog.d(...) / AppLog.w(...).
+          // =====================================================================
+          object AppLog {
+              const val TAG = "GreyB"
+              fun d(msg: String) { android.util.Log.d(TAG, msg) }
+              fun w(msg: String) { android.util.Log.w(TAG, msg) }
+          }
+
+          object LogReader {
+              private fun run(args: List<String>): List<String>? = try {
+                  val p = ProcessBuilder(args).redirectErrorStream(true).start()
+                  val lines = p.inputStream.bufferedReader().readLines()
+                  p.waitFor()
+                  lines
+              } catch (e: Exception) { null }
+
+              // The last lines of this app's log
+              fun read(maxLines: Int): List<String> {
+                  val pid = android.os.Process.myPid()
+                  val direct = run(listOf("logcat", "-d", "-v", "time", "--pid=$pid", "-t", "$maxLines"))
+                  if (direct != null && direct.isNotEmpty() && !direct.first().startsWith("logcat:")) return direct
+                  // Fallback for logcat versions without --pid: filter by the process id in each line
+                  val all = run(listOf("logcat", "-d", "-v", "time", "-t", "${maxLines * 4}")) ?: return listOf("Could not read logcat")
+                  val pat = Regex("\\(\\s*$pid\\)")
+                  return all.filter { pat.containsMatchIn(it) }.takeLast(maxLines)
+              }
+          }
+
+          // Logs frames that took long (jank) while it is composed. Use inside screens you want to check.
+          @Composable
+          fun FrameMonitor(label: String) {
+              DisposableEffect(label) {
+                  var last = 0L
+                  val choreographer = android.view.Choreographer.getInstance()
+                  val callback = object : android.view.Choreographer.FrameCallback {
+                      override fun doFrame(frameTimeNanos: Long) {
+                          if (last != 0L) {
+                              val ms = (frameTimeNanos - last) / 1_000_000L
+                              if (ms > 40L) AppLog.w("$label: slow frame ${ms}ms")
+                          }
+                          last = frameTimeNanos
+                          choreographer.postFrameCallback(this)
+                      }
+                  }
+                  choreographer.postFrameCallback(callback)
+                  onDispose { choreographer.removeFrameCallback(callback) }
+              }
+          }
+
+          @Composable
+          fun LogcatScreen(onClose: () -> Unit) {
+              val context = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var lines by remember { mutableStateOf<List<String>>(emptyList()) }
+              var loading by remember { mutableStateOf(true) }
+              val listState = remember { LazyListState() }
+
+              fun refresh() {
+                  scope.launch {
+                      loading = true
+                      lines = withContext(Dispatchers.IO) { LogReader.read(3000) }
+                      loading = false
+                      if (lines.isNotEmpty()) listState.scrollToItem(lines.size - 1)
+                  }
+              }
+
+              LaunchedEffect(Unit) { refresh() }
+              BackHandler { onClose() }
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .windowInsetsPadding(WindowInsets.systemBars)
+              ) {
+                  Row(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .padding(horizontal = 8.dp, vertical = 2.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      IconFlashButton(Icons.AutoMirrored.Filled.ArrowBack, "Back", iconSize = 24.dp) { onClose() }
+                      Text(
+                          text = "Logcat",
+                          color = Color.White,
+                          fontWeight = FontWeight.Bold,
+                          fontSize = 18.sp,
+                          modifier = Modifier.weight(1f).padding(start = 8.dp)
+                      )
+                      DialogButton(text = "Refresh", modifier = Modifier.width(88.dp)) { refresh() }
+                      Spacer(Modifier.width(6.dp))
+                      DialogButton(text = "Copy", modifier = Modifier.width(80.dp), primary = true) {
+                          val header = "GreyB logcat | Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}) | ${Build.MANUFACTURER} ${Build.MODEL}\n"
+                          var body = lines.joinToString("\n")
+                          if (body.length > 400_000) body = body.takeLast(400_000)
+                          val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                          cm.setPrimaryClip(ClipData.newPlainText("logcat", header + body))
+                          Toast.makeText(context, "Copied ${lines.size} lines", Toast.LENGTH_SHORT).show()
+                      }
+                      Spacer(Modifier.width(4.dp))
+                  }
+                  Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.12f)))
+                  Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                      LazyColumn(
+                          state = listState,
+                          modifier = Modifier.fillMaxSize().padding(horizontal = 8.dp)
+                      ) {
+                          items(lines.size) { i ->
+                              val line = lines[i]
+                              // "-v time" lines look like: 11-22 21:30:00.123 D/Tag( 1234): message  (level letter at index 19)
+                              val level = if (line.length > 20 && line[20] == '/') line[19] else ' '
+                              val color = when (level) {
+                                  'E' -> Color(0xFFFF8A80)
+                                  'W' -> Color(0xFFFFCC80)
+                                  'I' -> Color.White
+                                  'D' -> Color.White.copy(alpha = 0.75f)
+                                  else -> Color.White.copy(alpha = 0.5f)
+                              }
+                              Text(
+                                  text = line,
+                                  color = color,
+                                  fontSize = 10.sp,
+                                  lineHeight = 13.sp,
+                                  fontFamily = FontFamily.Monospace,
+                                  modifier = Modifier.padding(vertical = 1.dp)
+                              )
+                          }
+                      }
+                      if (loading) {
+                          CircularProgressIndicator(color = Color.White, modifier = Modifier.align(Alignment.Center))
+                      } else if (lines.isEmpty()) {
+                          Text("No log lines yet", color = Color.White.copy(alpha = 0.6f), modifier = Modifier.align(Alignment.Center))
+                      }
+                  }
               }
           }
 
