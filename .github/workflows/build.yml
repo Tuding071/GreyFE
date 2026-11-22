@@ -280,6 +280,15 @@ jobs:
           import androidx.compose.material3.LinearProgressIndicator
           import androidx.compose.ui.text.input.PasswordVisualTransformation
           import androidx.compose.foundation.text.BasicTextField
+          import androidx.compose.foundation.layout.BoxWithConstraints
+          import androidx.compose.ui.draw.drawBehind
+          import androidx.compose.ui.geometry.Size
+          import androidx.compose.ui.text.AnnotatedString
+          import androidx.compose.ui.text.SpanStyle
+          import androidx.compose.ui.text.TextLayoutResult
+          import androidx.compose.ui.text.input.OffsetMapping
+          import androidx.compose.ui.text.input.TransformedText
+          import androidx.compose.ui.text.input.VisualTransformation
           import androidx.compose.material.icons.automirrored.filled.ArrowBack
           import androidx.compose.ui.graphics.SolidColor
           import androidx.compose.ui.platform.LocalConfiguration
@@ -759,16 +768,35 @@ jobs:
                   return if (path.isEmpty()) null else File(path)
               }
 
-              // Delete extracted files (and forget the file lists) of archives that no tab is inside any more
+              // Archives that were just opened but no tab shows yet: cleanup must not touch them
+              private val pinned = HashSet<String>()
+
+              // The folder "up" from a folder inside an opened archive. At the top of the archive that is the
+              // real folder holding the archive file (never the hidden cache folder). null = Home.
+              fun parentFor(d: File): File? {
+                  val loc = locate(d.absolutePath) ?: return null
+                  if (loc.second.isEmpty()) {
+                      val up = loc.first.file.parentFile
+                      return if (up != null && up.exists()) up else null
+                  }
+                  return d.parentFile
+              }
+
+              // Delete extracted files (and forget the file lists) of archives that no tab is inside any more.
+              // Runs under the same lock as open(), so it can never delete an archive that is being opened again.
               fun cleanup(context: Context, tabPaths: List<String>) {
-                  val r = root(context)
-                  val rootPath = r.absolutePath + "/"
-                  r.listFiles()?.forEach { f ->
-                      val key = f.name.removeSuffix(".src")
-                      val used = tabPaths.any { it.startsWith(rootPath + key + "/") }
-                      if (!used) {
-                          f.deleteRecursively()
-                          synchronized(this) { sessions.remove(key) }
+                  synchronized(this) {
+                      val r = root(context)
+                      val rootPath = r.absolutePath + "/"
+                      r.listFiles()?.forEach { f ->
+                          val key = f.name.removeSuffix(".src")
+                          val used = tabPaths.any { it.startsWith(rootPath + key + "/") }
+                          if (used) {
+                              pinned.remove(key)
+                          } else if (!pinned.contains(key)) {
+                              f.deleteRecursively()
+                              sessions.remove(key)
+                          }
                       }
                   }
               }
@@ -820,11 +848,14 @@ jobs:
                           return ExtractResult(null, true, null)
                       }
                       if (op.cancelled.get()) return ExtractResult(null, false, "Cancelled")
-                      File(rootD, "$key.src").writeText(file.parentFile?.absolutePath ?: "")
                       val session = ArchiveSession(key, file, kind, password, entries.filter { it.path.isNotEmpty() })
-                      synchronized(this) { sessions[key] = session }
-                      val dest = destRootOf(session)
-                      dest.mkdirs()
+                      // Same lock as cleanup(): an old cleanup can not delete this archive while it is being opened
+                      val dest = synchronized(this) {
+                          pinned.add(key)
+                          File(rootD, "$key.src").writeText(file.parentFile?.absolutePath ?: "")
+                          sessions[key] = session
+                          destRootOf(session).also { it.mkdirs() }
+                      }
                       return ExtractResult(dest, false, null)
                   } catch (e: Exception) {
                       val m = e.message ?: e.javaClass.simpleName
@@ -1809,7 +1840,7 @@ jobs:
                           val d = tab.dir
                           if (d != null) {
                               // Back from the top of an opened archive goes to the folder holding the zip
-                              val parent = ArchiveSupport.originFolder(context, d) ?: d.parentFile
+                              val parent = if (ArchiveSupport.isInside(context, d)) ArchiveSupport.parentFor(d) else d.parentFile
                               val isRoot = StorageRoots.get(context).any { it.second.absolutePath == d.absolutePath }
                               tab.dir = if (parent != null && !isRoot) parent else null
                           }
@@ -3493,6 +3524,229 @@ jobs:
               )
           }
 
+          // ---------- Syntax colors for the text / code editor ----------
+          // A small generic tokenizer (no per-language grammar): comments, strings, numbers, keywords, types,
+          // function calls, constants, JSON / config keys and HTML / XML tags. Pastel colors for the dark theme.
+          // It runs in the background after you stop typing (and is skipped for very big files), so typing stays fast.
+          object SyntaxHighlighter {
+              const val MAX_CHARS = 150_000
+
+              class Lang(
+                  val lineComments: List<String>,
+                  val blockComments: Boolean,
+                  val markup: Boolean,
+                  val keywords: Boolean,
+                  val keyValue: Boolean,
+                  val quotes: String
+              )
+
+              private val cComment = Color(0xFF8A9A8A)
+              private val cString = Color(0xFFA5D6A7)
+              private val cNumber = Color(0xFFFFB86C)
+              private val cKeyword = Color(0xFFC792EA)
+              private val cType = Color(0xFFFFCB6B)
+              private val cFunction = Color(0xFF82AAFF)
+              private val cKey = Color(0xFF80CBC4)
+              private val cConstant = Color(0xFFF78C6C)
+
+              private val keywordSet = hashSetOf(
+                  "abstract", "as", "async", "await", "break", "case", "catch", "class", "const", "continue", "data",
+                  "def", "default", "del", "defer", "do", "elif", "else", "elsif", "enum", "except", "export", "extends",
+                  "extern", "final", "finally", "fn", "for", "fun", "func", "function", "go", "if", "impl", "implements",
+                  "import", "in", "inline", "interface", "internal", "is", "lambda", "let", "match", "module", "mut",
+                  "namespace", "new", "object", "open", "operator", "override", "package", "pass", "private", "protected",
+                  "pub", "public", "raise", "return", "sealed", "self", "static", "struct", "super", "suspend", "switch",
+                  "this", "throw", "throws", "trait", "try", "type", "typealias", "typeof", "union", "unsafe", "use",
+                  "using", "val", "var", "void", "volatile", "when", "where", "while", "with", "yield", "fi", "then",
+                  "done", "esac", "echo", "select", "from", "insert", "update", "delete", "create", "table", "join",
+                  "left", "right", "inner", "outer", "group", "order", "by", "having", "limit", "and", "or", "not",
+                  "int", "long", "short", "byte", "char", "float", "double", "boolean", "string", "bool"
+              )
+
+              private val constantSet = hashSetOf(
+                  "true", "false", "null", "nil", "none", "None", "True", "False", "undefined", "NULL", "TRUE", "FALSE", "NaN"
+              )
+
+              private val plain = hashSetOf(
+                  "txt", "md", "markdown", "log", "csv", "tsv", "srt", "vtt", "lrc", "nfo", "text", "readme", "license",
+                  "ass", "ssa", "sub", "m3u", "m3u8", "list", "url", "vcf", "ics", "rst", "adoc", "tex"
+              )
+
+              // null = no colors (plain text, unknown type)
+              fun langFor(name: String): Lang? {
+                  val ext = name.substringAfterLast('.', "").lowercase()
+                  if (ext.isEmpty() || ext in plain) return null
+                  return when (ext) {
+                      "json", "jsonl", "ndjson" -> Lang(emptyList(), false, false, false, false, "\"")
+                      "html", "htm", "xhtml", "xml", "svg", "plist", "kml", "gpx", "xsd", "xsl", "vue", "aidl", "rss", "atom" ->
+                          Lang(emptyList(), false, true, false, false, "\"'")
+                      "yaml", "yml", "toml", "ini", "cfg", "conf", "properties", "env", "gitignore", "editorconfig", "reg", "rc", "lock", "pro" ->
+                          Lang(listOf("#", ";"), false, false, false, true, "\"'")
+                      "sh", "bash", "zsh", "ps1", "bat", "cmd", "mk", "make", "cmake", "dockerfile" ->
+                          Lang(listOf("#", "REM ", "::"), false, false, true, false, "\"'`")
+                      "py", "rb", "pl", "r" ->
+                          Lang(listOf("#"), false, false, true, false, "\"'")
+                      "sql" -> Lang(listOf("--"), true, false, true, false, "\"'")
+                      "lua" -> Lang(listOf("--"), true, false, true, false, "\"'")
+                      else -> Lang(listOf("//"), true, false, true, false, "\"'`")
+                  }
+              }
+
+              private fun isWordChar(c: Char) = c.isLetterOrDigit() || c == '_'
+
+              fun highlight(text: String, lang: Lang): AnnotatedString {
+                  val styles = ArrayList<AnnotatedString.Range<SpanStyle>>()
+                  fun add(start: Int, end: Int, color: Color) {
+                      if (end > start) styles.add(AnnotatedString.Range(SpanStyle(color = color), start, end))
+                  }
+                  val n = text.length
+                  var i = 0
+                  while (i < n) {
+                      val c = text[i]
+                      // ----- markup: comments and tags -----
+                      if (lang.markup) {
+                          if (c == '<') {
+                              if (text.startsWith("<!--", i)) {
+                                  val e = text.indexOf("-->", i + 4)
+                                  val end = if (e < 0) n else e + 3
+                                  add(i, end, cComment)
+                                  i = end
+                                  continue
+                              }
+                              // tag: <name attr="value"> ... >
+                              var j = i + 1
+                              if (j < n && (text[j] == '/' || text[j] == '?' || text[j] == '!')) j++
+                              while (j < n && (isWordChar(text[j]) || text[j] == ':' || text[j] == '-' || text[j] == '.')) j++
+                              add(i, j, cKey)
+                              // attributes until '>'
+                              while (j < n && text[j] != '>') {
+                                  val ch = text[j]
+                                  if (ch == '"' || ch == '\'') {
+                                      var k = j + 1
+                                      while (k < n && text[k] != ch) k++
+                                      val end = if (k < n) k + 1 else n
+                                      add(j, end, cString)
+                                      j = end
+                                  } else if (isWordChar(ch)) {
+                                      var k = j
+                                      while (k < n && (isWordChar(text[k]) || text[k] == ':' || text[k] == '-' || text[k] == '.')) k++
+                                      add(j, k, cType)
+                                      j = k
+                                  } else j++
+                              }
+                              if (j < n) { add(j, j + 1, cKey); j++ }
+                              i = j
+                              continue
+                          }
+                          i++
+                          continue
+                      }
+                      // ----- comments -----
+                      if (lang.blockComments && c == '/' && text.startsWith("/*", i)) {
+                          val e = text.indexOf("*/", i + 2)
+                          val end = if (e < 0) n else e + 2
+                          add(i, end, cComment)
+                          i = end
+                          continue
+                      }
+                      var isLineComment = false
+                      for (p in lang.lineComments) {
+                          if (text.startsWith(p, i)) {
+                              // '#' / ';' inside a word (a#b) is not a comment
+                              if ((p == "#" || p == ";") && i > 0 && !text[i - 1].isWhitespace()) continue
+                              isLineComment = true
+                              break
+                          }
+                      }
+                      if (isLineComment) {
+                          var e = text.indexOf('\n', i)
+                          if (e < 0) e = n
+                          add(i, e, cComment)
+                          i = e
+                          continue
+                      }
+                      // ----- strings (and JSON / config keys) -----
+                      if (lang.quotes.indexOf(c) >= 0) {
+                          var j = i + 1
+                          while (j < n && text[j] != c && text[j] != '\n') {
+                              if (text[j] == '\\' && j + 1 < n) j++
+                              j++
+                          }
+                          val end = if (j < n && text[j] == c) j + 1 else j
+                          // a string followed by ':' is a key
+                          var k = end
+                          while (k < n && (text[k] == ' ' || text[k] == '\t')) k++
+                          val isKey = (lang.quotes == "\"" || lang.keyValue) && k < n && text[k] == ':'
+                          add(i, end, if (isKey) cKey else cString)
+                          i = end
+                          continue
+                      }
+                      // ----- numbers -----
+                      if (c.isDigit() && (i == 0 || !isWordChar(text[i - 1]))) {
+                          var j = i + 1
+                          while (j < n && (text[j].isLetterOrDigit() || text[j] == '.' || text[j] == '_')) j++
+                          add(i, j, cNumber)
+                          i = j
+                          continue
+                      }
+                      // ----- words -----
+                      if (c.isLetter() || c == '_') {
+                          var j = i + 1
+                          while (j < n && isWordChar(text[j])) j++
+                          val word = text.substring(i, j)
+                          var k = j
+                          while (k < n && (text[k] == ' ' || text[k] == '\t')) k++
+                          val next = if (k < n) text[k] else '\n'
+                          when {
+                              word in constantSet -> add(i, j, cConstant)
+                              lang.keyValue && (next == ':' || next == '=') && startsLine(text, i) -> add(i, j, cKey)
+                              lang.keywords && word in keywordSet -> add(i, j, cKeyword)
+                              lang.keywords && next == '(' -> add(i, j, cFunction)
+                              lang.keywords && word[0].isUpperCase() && word.length > 1 -> add(i, j, cType)
+                          }
+                          i = j
+                          continue
+                      }
+                      i++
+                  }
+                  return AnnotatedString(text, styles, emptyList())
+              }
+
+              private fun startsLine(text: String, pos: Int): Boolean {
+                  var k = pos - 1
+                  while (k >= 0 && (text[k] == ' ' || text[k] == '\t' || text[k] == '-')) k--
+                  return k < 0 || text[k] == '\n'
+              }
+
+              // The text was just edited and the new colors are not ready yet: keep the old colors, moved along
+              // with the edit, so the text does not flash plain while typing.
+              fun adapt(old: AnnotatedString, raw: AnnotatedString): AnnotatedString {
+                  val o = old.text
+                  val nw = raw.text
+                  if (o == nw) return old
+                  val max = minOf(o.length, nw.length)
+                  var p = 0
+                  while (p < max && o[p] == nw[p]) p++
+                  var s = 0
+                  while (s < max - p && o[o.length - 1 - s] == nw[nw.length - 1 - s]) s++
+                  val oldEnd = o.length - s
+                  val newEnd = nw.length - s
+                  val delta = nw.length - o.length
+                  fun map(x: Int): Int = when {
+                      x <= p -> x
+                      x >= oldEnd -> x + delta
+                      else -> minOf(x, newEnd)
+                  }
+                  val moved = ArrayList<AnnotatedString.Range<SpanStyle>>(old.spanStyles.size)
+                  for (r in old.spanStyles) {
+                      val a = map(r.start)
+                      val b = map(r.end)
+                      if (b > a && b <= nw.length) moved.add(AnnotatedString.Range(r.item, a, b))
+                  }
+                  return AnnotatedString(nw, moved, emptyList())
+              }
+          }
+
           // =====================================================================
           // TEXT / CODE EDITOR: back button top-left, Save top-right (faint and not tappable until
           // something changed), the rest is the text field. UTF-8 files only (anything else would be
@@ -3536,6 +3790,19 @@ jobs:
               }
 
               val dirty = loaded && !readOnly && value.text != original
+
+              // Syntax colors: calculated in the background after typing stops (not on every key)
+              val lang = remember(file) { SyntaxHighlighter.langFor(file.name) }
+              var styled by remember { mutableStateOf<AnnotatedString?>(null) }
+              LaunchedEffect(loaded, value.text, lang) {
+                  if (!loaded || lang == null || value.text.length > SyntaxHighlighter.MAX_CHARS) {
+                      styled = null
+                      return@LaunchedEffect
+                  }
+                  if (styled != null) delay(300)
+                  val t = value.text
+                  styled = withContext(Dispatchers.Default) { SyntaxHighlighter.highlight(t, lang) }
+              }
 
               fun save(after: () -> Unit = {}) {
                   if (!dirty || saving) return
@@ -3618,30 +3885,68 @@ jobs:
                           CircularProgressIndicator(color = Color.White)
                       }
                   } else {
-                      val minHeight = LocalConfiguration.current.screenHeightDp.dp
+                      val density = LocalDensity.current
                       val minWidth = LocalConfiguration.current.screenWidthDp.dp
-                      // No line wrapping: inside a horizontal scroll the text gets unlimited width, so long lines scroll sideways
-                      Box(
-                          modifier = Modifier
-                              .weight(1f)
-                              .fillMaxWidth()
-                              .verticalScroll(rememberScrollState())
-                              .horizontalScroll(rememberScrollState())
-                      ) {
-                          BasicTextField(
-                              value = value,
-                              onValueChange = { if (!readOnly) value = it else value = value.copy(selection = it.selection) },
-                              textStyle = TextStyle(
-                                  color = Color.White,
-                                  fontSize = 13.sp,
-                                  lineHeight = 19.sp,
-                                  fontFamily = FontFamily.Monospace
-                              ),
-                              cursorBrush = SolidColor(Color.White),
+                      BoxWithConstraints(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                          // Text size: about 60 lines fill the screen height. The height is measured once
+                          // (the biggest seen), so the text does not change size when the keyboard opens.
+                          var fitHeight by remember { mutableStateOf(0.dp) }
+                          if (maxHeight > fitHeight) fitHeight = maxHeight
+                          val lineDp = ((if (fitHeight > 0.dp) fitHeight else 600.dp) - 24.dp) / 60f
+                          val lineHeightSp = with(density) { lineDp.toSp() }
+                          val fontSp = with(density) { (lineDp * 0.70f).toSp() }
+                          val padPx = with(density) { 12.dp.toPx() }
+                          val minHeight = maxOf(maxHeight, fitHeight)
+
+                          // Layout of the text: used to find and highlight the line the cursor is on
+                          var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
+                          val transformation = remember(styled) {
+                              object : VisualTransformation {
+                                  override fun filter(text: AnnotatedString): TransformedText {
+                                      val a = styled
+                                      return TransformedText(if (a == null) text else SyntaxHighlighter.adapt(a, text), OffsetMapping.Identity)
+                                  }
+                              }
+                          }
+
+                          // No line wrapping: inside a horizontal scroll the text gets unlimited width, so long lines scroll sideways
+                          Box(
                               modifier = Modifier
-                                  .defaultMinSize(minWidth = minWidth, minHeight = minHeight)
-                                  .padding(12.dp)
-                          )
+                                  .fillMaxSize()
+                                  .verticalScroll(rememberScrollState())
+                                  .horizontalScroll(rememberScrollState())
+                          ) {
+                              BasicTextField(
+                                  value = value,
+                                  onValueChange = { if (!readOnly) value = it else value = value.copy(selection = it.selection) },
+                                  textStyle = TextStyle(
+                                      color = Color.White,
+                                      fontSize = fontSp,
+                                      lineHeight = lineHeightSp,
+                                      fontFamily = FontFamily.Monospace
+                                  ),
+                                  cursorBrush = SolidColor(Color.White),
+                                  visualTransformation = transformation,
+                                  onTextLayout = { layout = it },
+                                  modifier = Modifier
+                                      .defaultMinSize(minWidth = minWidth, minHeight = minHeight)
+                                      // faint highlight on the line you are editing / tapped / selecting
+                                      .drawBehind {
+                                          val l = layout
+                                          if (l != null) {
+                                              val off = value.selection.end.coerceIn(0, l.layoutInput.text.length)
+                                              val line = l.getLineForOffset(off)
+                                              val top = l.getLineTop(line)
+                                              drawRect(
+                                                  color = Color.White.copy(alpha = 0.10f),
+                                                  topLeft = Offset(0f, padPx + top),
+                                                  size = Size(size.width, l.getLineBottom(line) - top)
+                                              )
+                                          }
+                                      }
+                                      .padding(12.dp)
+                              )
+                          }
                       }
                   }
               }
