@@ -3888,11 +3888,51 @@ jobs:
 
               var imeVisible = false
 
+              // LAG FIX (found with the Logcat viewer): with no-wrap text, Android's TextView rebuilds the whole
+              // text layout on EVERY measure (its layout width is "very wide", never equal to the view width).
+              // On a 5000 line file that is ~840 ms, and it happened on every tap, every key and every frame of
+              // the keyboard animation. The text layout does not depend on the view HEIGHT, so when the width
+              // spec is the same as last time we skip the expensive super.onMeasure and only take the new size.
+              private var lastWSpec = Int.MIN_VALUE
+              private var measuredOnce = false
+
               override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
                   val t0 = System.nanoTime()
+                  val exactW = android.view.View.MeasureSpec.getMode(widthMeasureSpec) == android.view.View.MeasureSpec.EXACTLY
+                  val exactH = android.view.View.MeasureSpec.getMode(heightMeasureSpec) == android.view.View.MeasureSpec.EXACTLY
+                  if (measuredOnce && exactW && exactH && widthMeasureSpec == lastWSpec && layout != null) {
+                      setMeasuredDimension(
+                          android.view.View.MeasureSpec.getSize(widthMeasureSpec),
+                          android.view.View.MeasureSpec.getSize(heightMeasureSpec)
+                      )
+                      keepCursorVisible()
+                      return
+                  }
                   super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+                  lastWSpec = widthMeasureSpec
+                  measuredOnce = true
                   val ms = (System.nanoTime() - t0) / 1_000_000L
-                  if (ms >= 8L) AppLog.w("editor: onMeasure took ${ms}ms")
+                  if (ms >= 8L) AppLog.w("editor: full onMeasure took ${ms}ms")
+              }
+
+              // Since the skipped measure no longer scrolls the cursor into view when the keyboard shrinks the
+              // field, do it here (vertical only)
+              private fun keepCursorVisible() {
+                  post {
+                      val l = layout ?: return@post
+                      if (!hasFocus()) return@post
+                      val visible = height - extendedPaddingTop - extendedPaddingBottom
+                      if (visible <= 0) return@post
+                      val line = l.getLineForOffset(selectionEnd.coerceAtLeast(0))
+                      val top = l.getLineTop(line)
+                      val bottom = l.getLineBottom(line)
+                      var y = scrollY
+                      if (bottom > y + visible) y = bottom - visible
+                      if (top < y) y = top
+                      val maxY = (l.height - visible).coerceAtLeast(0)
+                      y = y.coerceIn(0, maxY)
+                      if (y != scrollY) scrollTo(scrollX, y)
+                  }
               }
 
               override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
