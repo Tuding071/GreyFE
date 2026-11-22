@@ -3530,7 +3530,7 @@ jobs:
           // function calls, constants, JSON / config keys and HTML / XML tags. Pastel colors for the dark theme.
           // It runs in the background after you stop typing (and is skipped for very big files), so typing stays fast.
           object SyntaxHighlighter {
-              const val MAX_CHARS = 150_000
+              const val MAX_CHARS = 1_000_000
 
               class Lang(
                   val lineComments: List<String>,
@@ -3784,7 +3784,15 @@ jobs:
                   inputType = android.text.InputType.TYPE_CLASS_TEXT or
                       android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE or
                       android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-                  imeOptions = android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI
+                  // Less work for the system on every key: no extract UI, no learning, and no autofill / content
+                  // capture (autofill copies the WHOLE text on every keystroke, which is slow for big files).
+                  imeOptions = android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI or
+                      android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+                  importantForAutofill = android.view.View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
+                  if (android.os.Build.VERSION.SDK_INT >= 30) {
+                      importantForContentCapture = android.view.View.IMPORTANT_FOR_CONTENT_CAPTURE_NO_EXCLUDE_DESCENDANTS
+                  }
+                  isSaveEnabled = false
                   highlightColor = 0x55FFFFFF
                   isVerticalScrollBarEnabled = true
                   numberPaint.typeface = android.graphics.Typeface.MONOSPACE
@@ -3889,14 +3897,52 @@ jobs:
               }
 
               // ----- syntax colors -----
+              // The colors of the WHOLE file are calculated in the background (cache). Only the part on screen
+              // (plus 20 lines above / below) gets real color spans. Thousands of spans make every keystroke slow,
+              // because Android shifts all of them on each edit; a few hundred are fine.
+              private var cache: AnnotatedString? = null
+              private var cacheVersion = -1
+              private val applied = ArrayList<SyntaxSpan>()
+
               private fun scheduleHighlight(delayMs: Long) {
                   ui.removeCallbacks(highlightRunnable)
                   if (lang != null) ui.postDelayed(highlightRunnable, delayMs)
               }
 
+              override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
+                  super.onScrollChanged(l, t, oldl, oldt)
+                  if (t != oldt && cache != null) scheduleHighlight(90)
+              }
+
               private fun clearSyntax() {
+                  val ed = text
+                  if (ed != null) for (s in applied) ed.removeSpan(s)
+                  applied.clear()
+              }
+
+              private fun applyWindow() {
+                  val lay = layout
+                  if (lay == null) {
+                      // not measured yet: try again shortly
+                      ui.postDelayed(highlightRunnable, 100)
+                      return
+                  }
                   val ed = text ?: return
-                  for (s in ed.getSpans(0, ed.length, SyntaxSpan::class.java)) ed.removeSpan(s)
+                  val c = cache ?: return
+                  clearSyntax()
+                  if (lay.lineCount == 0) return
+                  val firstLine = (lay.getLineForVertical(scrollY) - 20).coerceAtLeast(0)
+                  val lastLine = (lay.getLineForVertical(scrollY + height) + 20).coerceAtMost(lay.lineCount - 1)
+                  val from = lay.getLineStart(firstLine)
+                  val to = lay.getLineEnd(lastLine)
+                  for (r in c.spanStyles) {
+                      if (r.end <= from) continue
+                      if (r.start >= to) break
+                      if (r.end > ed.length) break
+                      val span = SyntaxSpan(r.item.color.toArgb())
+                      ed.setSpan(span, r.start, r.end, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                      applied.add(span)
+                  }
               }
 
               private fun runHighlight() {
@@ -3906,20 +3952,20 @@ jobs:
                       clearSyntax()
                       return
                   }
+                  if (cache != null && cacheVersion == version) {
+                      applyWindow()
+                      return
+                  }
                   val snapshot = ed.toString()
                   val v = version
                   Thread {
                       val result = SyntaxHighlighter.highlight(snapshot, lg)
                       ui.post {
-                          // apply only if the text did not change meanwhile
+                          // use it only if the text did not change meanwhile
                           if (v == version) {
-                              val e = text
-                              if (e != null) {
-                                  clearSyntax()
-                                  for (r in result.spanStyles) {
-                                      e.setSpan(SyntaxSpan(r.item.color.toArgb()), r.start, r.end, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                                  }
-                              }
+                              cache = result
+                              cacheVersion = v
+                              applyWindow()
                           }
                       }
                   }.start()
