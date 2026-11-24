@@ -231,6 +231,10 @@ jobs:
           import androidx.compose.ui.layout.positionInParent
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.platform.LocalDensity
+          import androidx.compose.ui.platform.LocalFocusManager
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.foundation.text.KeyboardActions
+          import androidx.compose.ui.text.input.ImeAction
           import androidx.compose.ui.platform.LocalHapticFeedback
           import androidx.compose.ui.hapticfeedback.HapticFeedbackType
           import androidx.compose.ui.focus.FocusRequester
@@ -3576,6 +3580,10 @@ jobs:
                   "true", "false", "null", "nil", "none", "None", "True", "False", "undefined", "NULL", "TRUE", "FALSE", "NaN"
               )
 
+              // Plain text (txt, md, log, no extension ...) also gets colors: "quoted text", numbers, true/false/null,
+              // key: value / key=value names at the start of a line, and links (http://...)
+              private val plainLang = Lang(emptyList(), false, false, false, true, "\"")
+
               private val plain = hashSetOf(
                   "txt", "md", "markdown", "log", "csv", "tsv", "srt", "vtt", "lrc", "nfo", "text", "readme", "license",
                   "ass", "ssa", "sub", "m3u", "m3u8", "list", "url", "vcf", "ics", "rst", "adoc", "tex"
@@ -3584,7 +3592,7 @@ jobs:
               // null = no colors (plain text, unknown type)
               fun langFor(name: String): Lang? {
                   val ext = name.substringAfterLast('.', "").lowercase()
-                  if (ext.isEmpty() || ext in plain) return null
+                  if (ext.isEmpty() || ext in plain) return plainLang
                   return when (ext) {
                       "json", "jsonl", "ndjson" -> Lang(emptyList(), false, false, false, false, "\"")
                       "html", "htm", "xhtml", "xml", "svg", "plist", "kml", "gpx", "xsd", "xsl", "vue", "aidl", "rss", "atom" ->
@@ -3703,6 +3711,13 @@ jobs:
                           var j = i + 1
                           while (j < n && isWordChar(text[j])) j++
                           val word = text.substring(i, j)
+                    if ((word == "http" || word == "https" || word == "ftp") && text.startsWith("://", j)) {
+                        var e = j + 3
+                        while (e < n && !text[e].isWhitespace() && text[e] != '"' && text[e] != '\'' && text[e] != ')' && text[e] != '>') e++
+                        add(i, e, cFunction)
+                        i = e
+                        continue
+                    }
                           var k = j
                           while (k < n && (text[k] == ' ' || text[k] == '\t')) k++
                           val next = if (k < n) text[k] else '\n'
@@ -3802,7 +3817,7 @@ jobs:
                   }
                   isSaveEnabled = false
                   highlightColor = 0x55FFFFFF
-                  isVerticalScrollBarEnabled = true
+                  isVerticalScrollBarEnabled = false
                   numberPaint.typeface = android.graphics.Typeface.MONOSPACE
                   numberPaint.textAlign = android.graphics.Paint.Align.RIGHT
                   if (android.os.Build.VERSION.SDK_INT >= 29) {
@@ -3828,6 +3843,152 @@ jobs:
               }
 
               override fun onCheckIsTextEditor(): Boolean = !readOnly && super.onCheckIsTextEditor()
+
+              // ----- fling (momentum when you swipe), draggable scroll bar, find -----
+              private val scroller = android.widget.OverScroller(context)
+              private var velocity: android.view.VelocityTracker? = null
+              private val viewConfig = android.view.ViewConfiguration.get(context)
+              private var draggingThumb = false
+              private val thumbPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+              private var matchStart = -1
+              private var matchEnd = -1
+              private val matchPaint = android.graphics.Paint().apply { color = 0x66FFD54F }
+              private val matchPath = android.graphics.Path()
+
+              private fun contentHeight(): Int {
+                  val l = layout ?: return 0
+                  return l.height + extendedPaddingTop + extendedPaddingBottom
+              }
+
+              override fun onTouchEvent(event: android.view.MotionEvent): Boolean {
+                  val action = event.actionMasked
+                  if (action == android.view.MotionEvent.ACTION_DOWN) {
+                      scroller.abortAnimation()
+                      // the right edge is the scroll bar: touch and drag it to jump around the file
+                      if (event.x > width - 36 * density && contentHeight() > height) {
+                          draggingThumb = true
+                          parent?.requestDisallowInterceptTouchEvent(true)
+                          dragThumbTo(event.y)
+                          return true
+                      }
+                  }
+                  if (draggingThumb) {
+                      if (action == android.view.MotionEvent.ACTION_MOVE) dragThumbTo(event.y)
+                      if (action == android.view.MotionEvent.ACTION_UP || action == android.view.MotionEvent.ACTION_CANCEL) {
+                          draggingThumb = false
+                          invalidate()
+                      }
+                      return true
+                  }
+                  val vt = velocity ?: android.view.VelocityTracker.obtain().also { velocity = it }
+                  vt.addMovement(event)
+                  val result = super.onTouchEvent(event)
+                  if (action == android.view.MotionEvent.ACTION_UP) {
+                      vt.computeCurrentVelocity(1000, viewConfig.scaledMaximumFlingVelocity.toFloat())
+                      val vx = -vt.xVelocity
+                      val vy = -vt.yVelocity
+                      val min = viewConfig.scaledMinimumFlingVelocity
+                      if (Math.abs(vy) > min || Math.abs(vx) > min) startFling(vx, vy)
+                  }
+                  if (action == android.view.MotionEvent.ACTION_UP || action == android.view.MotionEvent.ACTION_CANCEL) {
+                      vt.recycle()
+                      velocity = null
+                  }
+                  return result
+              }
+
+              private fun startFling(vx: Float, vy: Float) {
+                  val l = layout ?: return
+                  val maxY = (contentHeight() - height).coerceAtLeast(0)
+                  val first = l.getLineForVertical(scrollY.coerceAtLeast(0))
+                  val last = l.getLineForVertical((scrollY + height).coerceAtLeast(0))
+                  var widest = 0f
+                  for (i in first..last) widest = maxOf(widest, l.getLineWidth(i))
+                  val maxX = maxOf(scrollX, (widest + paddingLeft + paddingRight - width).toInt()).coerceAtLeast(0)
+                  scroller.fling(scrollX, scrollY, vx.toInt(), vy.toInt(), 0, maxX, 0, maxY)
+                  postInvalidateOnAnimation()
+              }
+
+              override fun computeScroll() {
+                  if (scroller.computeScrollOffset()) {
+                      scrollTo(scroller.currX, scroller.currY)
+                      postInvalidateOnAnimation()
+                  }
+              }
+
+              // thumb: [top, height] inside the view, null when everything fits on screen
+              private fun thumbGeometry(): FloatArray? {
+                  val content = contentHeight()
+                  if (content <= height || height <= 0) return null
+                  val thumbH = maxOf(40 * density, height.toFloat() * height / content)
+                  val frac = (scrollY.toFloat() / (content - height)).coerceIn(0f, 1f)
+                  return floatArrayOf(frac * (height - thumbH), thumbH)
+              }
+
+              private fun drawThumb(canvas: android.graphics.Canvas) {
+                  val g = thumbGeometry() ?: return
+                  val w = (if (draggingThumb) 8 else 4) * density
+                  thumbPaint.color = if (draggingThumb) 0xCCFFFFFF.toInt() else 0x66FFFFFF
+                  val right = scrollX + width - 3 * density
+                  val top = scrollY + g[0]
+                  canvas.drawRoundRect(right - w, top, right, top + g[1], w / 2, w / 2, thumbPaint)
+              }
+
+              private fun dragThumbTo(y: Float) {
+                  val g = thumbGeometry() ?: return
+                  val track = height - g[1]
+                  if (track <= 0f) return
+                  val frac = ((y - g[1] / 2f) / track).coerceIn(0f, 1f)
+                  scrollTo(scrollX, (frac * (contentHeight() - height)).toInt())
+                  invalidate()
+              }
+
+              fun clearMatch() {
+                  matchStart = -1
+                  matchEnd = -1
+                  invalidate()
+              }
+
+              // Finds the next match after the previous one (wraps around). Returns [index, number, total] or null.
+              fun findNext(query: String): IntArray? {
+                  if (query.isEmpty()) return null
+                  val s = text?.toString() ?: return null
+                  var from = if (matchEnd >= 0) matchEnd else selectionEnd.coerceAtLeast(0)
+                  if (from > s.length) from = 0
+                  var idx = s.indexOf(query, from, ignoreCase = true)
+                  if (idx < 0) idx = s.indexOf(query, 0, ignoreCase = true)
+                  if (idx < 0) {
+                      clearMatch()
+                      return null
+                  }
+                  var total = 0
+                  var number = 0
+                  var p = 0
+                  while (total < 99999) {
+                      val f = s.indexOf(query, p, ignoreCase = true)
+                      if (f < 0) break
+                      total++
+                      if (f == idx) number = total
+                      p = f + query.length
+                  }
+                  matchStart = idx
+                  matchEnd = idx + query.length
+                  scroller.abortAnimation()
+                  val l = layout
+                  if (l != null) {
+                      val line = l.getLineForOffset(idx)
+                      val visible = height - extendedPaddingTop - extendedPaddingBottom
+                      val y = (l.getLineTop(line) - visible / 2).coerceIn(0, maxOf(0, contentHeight() - height))
+                      val x = l.getPrimaryHorizontal(idx)
+                      var sx = scrollX
+                      if (x < scrollX + gutterWidth() + 12 * density || x > scrollX + width - 60 * density) {
+                          sx = (x - width / 3f).toInt().coerceAtLeast(0)
+                      }
+                      scrollTo(sx, y)
+                  }
+                  invalidate()
+                  return intArrayOf(idx, number, total)
+              }
 
               // Replaces the whole content (used once when the file is loaded)
               fun load(content: String, readOnlyMode: Boolean) {
@@ -3956,6 +4117,14 @@ jobs:
                       scrollX.toFloat(), offY + l.getLineTop(current),
                       (scrollX + width).toFloat(), offY + l.getLineBottom(current), fill
                   )
+                  if (matchStart >= 0 && matchEnd <= (text?.length ?: 0)) {
+                      matchPath.reset()
+                      l.getSelectionPath(matchStart, matchEnd, matchPath)
+                      canvas.save()
+                      canvas.translate(compoundPaddingLeft.toFloat(), offY)
+                      canvas.drawPath(matchPath, matchPaint)
+                      canvas.restore()
+                  }
                   super.onDraw(canvas)
                   // line numbers (fixed on the left, drawn over the text that scrolls under them)
                   val gw = gutterWidth().toFloat()
@@ -3970,6 +4139,7 @@ jobs:
                       numberPaint.color = if (i == current) 0xFFFFFFFF.toInt() else 0x66FFFFFF
                       canvas.drawText((i + 1).toString(), right, offY + l.getLineBaseline(i), numberPaint)
                   }
+                  drawThumb(canvas)
               }
 
               // ----- syntax colors -----
@@ -4072,6 +4242,26 @@ jobs:
               var savedOnce by remember { mutableStateOf(false) }
               var saving by remember { mutableStateOf(false) }
               var confirmLeave by remember { mutableStateOf(false) }
+              var searching by remember { mutableStateOf(false) }
+              var query by remember { mutableStateOf("") }
+              var resultText by remember { mutableStateOf("") }
+              val focusManager = LocalFocusManager.current
+              val searchFocus = remember { FocusRequester() }
+
+              fun doSearch() {
+                  val e = editor ?: return
+                  if (query.isEmpty()) return
+                  val r = e.findNext(query)
+                  resultText = if (r == null) "No match" else "${r[1]} of ${r[2]}"
+              }
+
+              fun exitSearch() {
+                  searching = false
+                  query = ""
+                  resultText = ""
+                  editor?.clearMatch()
+                  focusManager.clearFocus()
+              }
 
               // 1) read the file in the background
               LaunchedEffect(file) {
@@ -4139,6 +4329,7 @@ jobs:
               }
 
               BackHandler { requestClose() }
+              BackHandler(enabled = searching) { exitSearch() }
 
               val lang = remember(file) { SyntaxHighlighter.langFor(file.name) }
 
@@ -4166,6 +4357,26 @@ jobs:
                       verticalAlignment = Alignment.CenterVertically
                   ) {
                       IconFlashButton(Icons.AutoMirrored.Filled.ArrowBack, "Back", iconSize = 24.dp) { requestClose() }
+                      Spacer(Modifier.weight(1f))
+                      val findPressed = remember { mutableStateOf(false) }
+                      Box(
+                          modifier = Modifier
+                              .clip(CircleShape)
+                              .background(if (findPressed.value) Color.White else Color.White.copy(alpha = 0.10f))
+                              .then(
+                                  if (loaded) Modifier.pressFlash(findPressed) {
+                                      if (searching) exitSearch() else searching = true
+                                  } else Modifier
+                              )
+                              .padding(horizontal = 20.dp, vertical = 9.dp)
+                      ) {
+                          Text(
+                              text = if (searching) "✕" else "Find",
+                              color = if (findPressed.value) Color.Black else Color.White.copy(alpha = if (loaded) 1f else 0.3f),
+                              fontSize = 14.sp,
+                              fontWeight = FontWeight.SemiBold
+                          )
+                      }
                       Spacer(Modifier.weight(1f))
                       val savePressed = remember { mutableStateOf(false) }
                       val active = dirty && !saving
@@ -4196,6 +4407,53 @@ jobs:
                       Spacer(Modifier.width(4.dp))
                   }
                   Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.12f)))
+
+                  if (searching) {
+                      LaunchedEffect(Unit) { searchFocus.requestFocus() }
+                      Row(
+                          modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          Box(
+                              modifier = Modifier
+                                  .weight(1f)
+                                  .clip(RoundedCornerShape(10.dp))
+                                  .background(Color.White.copy(alpha = 0.10f))
+                                  .padding(horizontal = 12.dp, vertical = 10.dp)
+                          ) {
+                              if (query.isEmpty()) {
+                                  Text("Find in file", color = Color.White.copy(alpha = 0.4f), fontSize = 15.sp)
+                              }
+                              Row(verticalAlignment = Alignment.CenterVertically) {
+                                  BasicTextField(
+                                      value = query,
+                                      onValueChange = {
+                                          query = it
+                                          resultText = ""
+                                          editor?.clearMatch()
+                                      },
+                                      singleLine = true,
+                                      textStyle = TextStyle(color = Color.White, fontSize = 15.sp),
+                                      cursorBrush = SolidColor(Color.White),
+                                      keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                                      keyboardActions = KeyboardActions(onSearch = { doSearch() }),
+                                      modifier = Modifier.weight(1f).focusRequester(searchFocus)
+                                  )
+                                  if (resultText.isNotEmpty()) {
+                                      Text(
+                                          resultText,
+                                          color = Color.White.copy(alpha = 0.6f),
+                                          fontSize = 12.sp,
+                                          modifier = Modifier.padding(start = 8.dp)
+                                      )
+                                  }
+                              }
+                          }
+                          Spacer(Modifier.width(8.dp))
+                          DialogButton(text = "Search", modifier = Modifier.width(92.dp), primary = true) { doSearch() }
+                      }
+                      Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.12f)))
+                  }
 
                   Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                       AndroidView(
