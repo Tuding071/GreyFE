@@ -1876,10 +1876,10 @@ jobs:
               }
 
               // A file opened from another app ("Open with" -> GreyIV / Archive Viewer / Document Viewer)
-              val incoming = Incoming.request
-              LaunchedEffect(incoming, hasPermission) {
-                  val req = Incoming.request ?: return@LaunchedEffect
-                  if (!hasPermission) return@LaunchedEffect
+              LaunchedEffect(hasPermission) {
+                if (!hasPermission) return@LaunchedEffect
+                snapshotFlow { Incoming.request }.collect { req ->
+                  if (req == null) return@collect
                   Incoming.request = null
                   var images: List<File>? = null
                   var index = 0
@@ -1896,7 +1896,7 @@ jobs:
                   }
                   if (file == null || !file.exists()) {
                       Toast.makeText(context, "Can't open this file", Toast.LENGTH_SHORT).show()
-                      return@LaunchedEffect
+                      return@collect
                   }
                   when (req.kind) {
                       "image" -> {
@@ -1906,6 +1906,7 @@ jobs:
                       "archive" -> startArchive(file)
                       else -> editorFile = file
                   }
+                }
               }
 
               // Extracts the given archive items (files or folders) when needed, then runs `then`
@@ -3717,7 +3718,9 @@ jobs:
                   val markup: Boolean,
                   val keywords: Boolean,
                   val keyValue: Boolean,
-                  val quotes: String
+                  val quotes: String,
+                  val operators: Boolean = true,
+                  val markdown: Boolean = false
               )
 
               private val cComment = Color(0xFF8A9A8A)
@@ -3728,6 +3731,13 @@ jobs:
               private val cFunction = Color(0xFF82AAFF)
               private val cKey = Color(0xFF80CBC4)
               private val cConstant = Color(0xFFF78C6C)
+              private val cOperator = Color(0xFF89DDFF)
+              private val cVariable = Color(0xFFF07178)
+              private val cProperty = Color(0xFF9ECBFF)
+
+              private val funDecl = hashSetOf("fun", "def", "function", "func", "fn", "sub", "proc")
+              private val typeDecl = hashSetOf("class", "interface", "object", "struct", "enum", "trait", "type", "typealias", "namespace", "module", "impl", "extends", "implements", "new")
+              private const val OPERATOR_CHARS = "{}()[]<>=+-*/%&|!?^~;:"
 
               private val keywordSet = hashSetOf(
                   "abstract", "as", "async", "await", "break", "case", "catch", "class", "const", "continue", "data",
@@ -3749,7 +3759,8 @@ jobs:
 
               // Plain text (txt, md, log, no extension ...) also gets colors: "quoted text", numbers, true/false/null,
               // key: value / key=value names at the start of a line, and links (http://...)
-              private val plainLang = Lang(emptyList(), false, false, false, true, "\"")
+              private val plainLang = Lang(emptyList(), false, false, false, true, "\"", operators = false)
+              private val markdownLang = Lang(emptyList(), false, false, false, false, "`", operators = false, markdown = true)
 
               private val plain = hashSetOf(
                   "txt", "md", "markdown", "log", "csv", "tsv", "srt", "vtt", "lrc", "nfo", "text", "readme", "license",
@@ -3759,6 +3770,7 @@ jobs:
               // null = no colors (plain text, unknown type)
               fun langFor(name: String): Lang? {
                   val ext = name.substringAfterLast('.', "").lowercase()
+                  if (ext == "md" || ext == "markdown") return markdownLang
                   if (ext.isEmpty() || ext in plain) return plainLang
                   return when (ext) {
                       "json", "jsonl", "ndjson" -> Lang(emptyList(), false, false, false, false, "\"")
@@ -3787,6 +3799,21 @@ jobs:
                   var i = 0
                   while (i < n) {
                       val c = text[i]
+                      // ----- markdown: headings and list marks -----
+                      if (lang.markdown) {
+                          if (c == '#' && startsLine(text, i)) {
+                              var e = text.indexOf('\n', i)
+                              if (e < 0) e = n
+                              add(i, e, cType)
+                              i = e
+                              continue
+                          }
+                          if ((c == '-' || c == '*' || c == '>') && startsLine(text, i) && i + 1 < n && text[i + 1] == ' ') {
+                              add(i, i + 1, cOperator)
+                              i++
+                              continue
+                          }
+                      }
                       // ----- markup: comments and tags -----
                       if (lang.markup) {
                           if (c == '<') {
@@ -3865,6 +3892,35 @@ jobs:
                           i = end
                           continue
                       }
+                      // ----- @annotations, $variables, #hex colors / #directives -----
+                      if (lang.keywords && c == '@' && i + 1 < n && text[i + 1].isLetter()) {
+                          var j = i + 1
+                          while (j < n && isWordChar(text[j])) j++
+                          add(i, j, cType)
+                          i = j
+                          continue
+                      }
+                      if (lang.keywords && c == '$' && i + 1 < n && (text[i + 1].isLetter() || text[i + 1] == '_' || text[i + 1] == '{')) {
+                          var j = i + 1
+                          if (text[j] == '{') {
+                              while (j < n && text[j] != '}' && text[j] != '\n') j++
+                              if (j < n && text[j] == '}') j++
+                          } else {
+                              while (j < n && isWordChar(text[j])) j++
+                          }
+                          add(i, j, cVariable)
+                          i = j
+                          continue
+                      }
+                      if (lang.keywords && c == '#' && i + 1 < n && text[i + 1].isLetterOrDigit()) {
+                          var j = i + 1
+                          while (j < n && text[j].isLetterOrDigit()) j++
+                          val run = text.substring(i + 1, j)
+                          val hex = run.length in intArrayOf(3, 4, 6, 8) && run.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }
+                          add(i, j, if (hex) cNumber else cKeyword)
+                          i = j
+                          continue
+                      }
                       // ----- numbers -----
                       if (c.isDigit() && (i == 0 || !isWordChar(text[i - 1]))) {
                           var j = i + 1
@@ -3888,19 +3944,41 @@ jobs:
                           var k = j
                           while (k < n && (text[k] == ' ' || text[k] == '\t')) k++
                           val next = if (k < n) text[k] else '\n'
+                          val prev = if (lang.keywords) prevWord(text, i) else ""
                           when {
                               word in constantSet -> add(i, j, cConstant)
                               lang.keyValue && (next == ':' || next == '=') && startsLine(text, i) -> add(i, j, cKey)
                               lang.keywords && word in keywordSet -> add(i, j, cKeyword)
+                              lang.keywords && prev in funDecl -> add(i, j, cFunction)
+                              lang.keywords && prev in typeDecl -> add(i, j, cType)
                               lang.keywords && next == '(' -> add(i, j, cFunction)
+                              lang.keywords && i > 0 && text[i - 1] == '.' -> add(i, j, cProperty)
+                              lang.keywords && word.length > 1 && word.all { it.isUpperCase() || it.isDigit() || it == '_' } -> add(i, j, cConstant)
                               lang.keywords && word[0].isUpperCase() && word.length > 1 -> add(i, j, cType)
                           }
+                          i = j
+                          continue
+                      }
+                      // ----- operators and brackets (a run of them is one color span) -----
+                      if (lang.operators && OPERATOR_CHARS.indexOf(c) >= 0) {
+                          var j = i + 1
+                          while (j < n && OPERATOR_CHARS.indexOf(text[j]) >= 0) j++
+                          add(i, j, cOperator)
                           i = j
                           continue
                       }
                       i++
                   }
                   return AnnotatedString(text, styles, emptyList())
+              }
+
+              // the word before position pos (spaces skipped), for "fun name", "class Name"
+              private fun prevWord(text: String, pos: Int): String {
+                  var k = pos - 1
+                  while (k >= 0 && (text[k] == ' ' || text[k] == '\t')) k--
+                  val end = k + 1
+                  while (k >= 0 && isWordChar(text[k])) k--
+                  return if (end > k + 1) text.substring(k + 1, end) else ""
               }
 
               private fun startsLine(text: String, pos: Int): Boolean {
@@ -4368,6 +4446,7 @@ jobs:
               // because Android shifts all of them on each edit; a few hundred are fine.
               private var cache: AnnotatedString? = null
               private var cacheVersion = -1
+              private var scrollApplyPending = false
               private val applied = ArrayList<SyntaxSpan>()
 
               private fun scheduleHighlight(delayMs: Long) {
@@ -4378,7 +4457,13 @@ jobs:
               override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
                   super.onScrollChanged(l, t, oldl, oldt)
                   if (inTouch || draggingThumb) scrolledAway = true
-                  if (t != oldt && cache != null) scheduleHighlight(90)
+                  if (t != oldt && cache != null && !scrollApplyPending) {
+                      scrollApplyPending = true
+                      ui.postDelayed({
+                          scrollApplyPending = false
+                          runHighlight()
+                      }, 50)
+                  }
               }
 
               private fun clearSyntax() {
@@ -4584,8 +4669,9 @@ jobs:
                           .padding(horizontal = 8.dp, vertical = 6.dp),
                       verticalAlignment = Alignment.CenterVertically
                   ) {
-                      IconFlashButton(Icons.AutoMirrored.Filled.ArrowBack, "Back", iconSize = 24.dp) { requestClose() }
-                      Spacer(Modifier.weight(1f))
+                      Box(Modifier.weight(1f)) {
+                          IconFlashButton(Icons.AutoMirrored.Filled.ArrowBack, "Back", iconSize = 24.dp) { requestClose() }
+                      }
                       val findPressed = remember { mutableStateOf(false) }
                       Box(
                           modifier = Modifier
@@ -4628,7 +4714,8 @@ jobs:
                               fontWeight = FontWeight.SemiBold
                           )
                       }
-                      Spacer(Modifier.weight(1f))
+                      // equal weights on both sides keep Find + Edit exactly in the middle
+                      Box(Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
                       val savePressed = remember { mutableStateOf(false) }
                       val active = dirty && !saving
                       Box(
@@ -4654,6 +4741,7 @@ jobs:
                               fontSize = 14.sp,
                               fontWeight = FontWeight.SemiBold
                           )
+                      }
                       }
                       Spacer(Modifier.width(4.dp))
                   }
