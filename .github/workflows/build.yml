@@ -1,4 +1,4 @@
-name: Build GreyB Explorer
+name: Build GreyFE
 
 on:
   push:
@@ -38,11 +38,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: app/release.keystore
-          key: greyb-explorer-keystore-v1
+          key: grey-fe-keystore-v1
 
       - name: Generate project structure
         run: |
-          mkdir -p app/src/main/java/com/greyb/explorer
+          mkdir -p app/src/main/java/com/grey/fe
           mkdir -p app/src/main/res/values
           mkdir -p app/src/main/res/xml
           mkdir -p gradle/wrapper
@@ -61,7 +61,7 @@ jobs:
                   tools:ignore="ScopedStorage" />
 
               <application
-                  android:label="GreyB Explorer"
+                  android:label="GreyFE"
                   android:icon="@mipmap/ic_launcher"
                   android:theme="@style/AppTheme"
                   android:requestLegacyExternalStorage="true"
@@ -71,12 +71,73 @@ jobs:
                       android:name=".MainActivity"
                       android:exported="true"
                       android:windowSoftInputMode="adjustResize"
-                      android:label="GreyB Explorer">
+                      android:launchMode="singleTask"
+                      android:label="GreyFE">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+
+                  <!-- Grey(Image Viewer): shows up in the "Open with" list of other apps -->
+                  <activity-alias
+                      android:name=".ImageViewerAlias"
+                      android:targetActivity=".MainActivity"
+                      android:exported="true"
+                      android:label="Grey(Image Viewer)">
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="image/*" />
+                      </intent-filter>
+                  </activity-alias>
+
+                  <!-- Grey(Archive Viewer): shows up in the "Open with" list of other apps -->
+                  <activity-alias
+                      android:name=".ArchiveViewerAlias"
+                      android:targetActivity=".MainActivity"
+                      android:exported="true"
+                      android:label="Grey(Archive Viewer)">
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="application/zip" />
+                          <data android:mimeType="application/x-zip-compressed" />
+                          <data android:mimeType="application/x-zip" />
+                          <data android:mimeType="application/java-archive" />
+                          <data android:mimeType="application/vnd.comicbook+zip" />
+                          <data android:mimeType="application/x-cbz" />
+                          <data android:mimeType="application/x-7z-compressed" />
+                          <data android:mimeType="application/vnd.rar" />
+                          <data android:mimeType="application/x-rar-compressed" />
+                          <data android:mimeType="application/x-rar" />
+                          <data android:mimeType="application/x-tar" />
+                          <data android:mimeType="application/gzip" />
+                          <data android:mimeType="application/x-gzip" />
+                          <data android:mimeType="application/x-bzip2" />
+                          <data android:mimeType="application/x-xz" />
+                      </intent-filter>
+                  </activity-alias>
+
+                  <!-- Grey(Document Viewer): shows up in the "Open with" list of other apps -->
+                  <activity-alias
+                      android:name=".DocumentViewerAlias"
+                      android:targetActivity=".MainActivity"
+                      android:exported="true"
+                      android:label="Grey(Document Viewer)">
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/*" />
+                          <data android:mimeType="application/json" />
+                          <data android:mimeType="application/xml" />
+                          <data android:mimeType="application/javascript" />
+                          <data android:mimeType="application/x-sh" />
+                          <data android:mimeType="application/x-yaml" />
+                          <data android:mimeType="application/yaml" />
+                          <data android:mimeType="application/x-subrip" />
+                      </intent-filter>
+                  </activity-alias>
 
                   <provider
                       android:name="androidx.core.content.FileProvider"
@@ -116,8 +177,8 @@ jobs:
 
       - name: Generate MainActivity.kt
         run: |
-          cat > app/src/main/java/com/greyb/explorer/MainActivity.kt << 'ENDOFFILE'
-          package com.greyb.explorer
+          cat > app/src/main/java/com/grey/fe/MainActivity.kt << 'ENDOFFILE'
+          package com.grey.fe
 
           import android.Manifest
           import android.content.ClipData
@@ -312,9 +373,82 @@ jobs:
           import kotlin.math.abs
           import kotlin.math.roundToInt
 
+          // A file another app asked GreyFE to open (kind = image / archive / doc, chosen by which tool it picked)
+          class IncomingRequest(val kind: String, val uri: Uri)
+
+          object Incoming {
+              var request by mutableStateOf<IncomingRequest?>(null)
+          }
+
+          // Turns the Uri another app gives us into a real file. Real paths are used directly (so edits are saved to
+          // the real file); anything else is copied into the cache first.
+          object IntentFiles {
+              fun resolve(context: Context, uri: Uri): File? {
+                  if (uri.scheme == "file") return uri.path?.let { File(it) }?.takeIf { it.exists() }
+                  if (uri.scheme != "content") return null
+                  if (uri.authority == "com.android.externalstorage.documents") {
+                      try {
+                          val id = android.provider.DocumentsContract.getDocumentId(uri)
+                          val parts = id.split(":", limit = 2)
+                          if (parts.size == 2) {
+                              val base = if (parts[0] == "primary") android.os.Environment.getExternalStorageDirectory() else File("/storage/" + parts[0])
+                              val f = File(base, parts[1])
+                              if (f.exists()) return f
+                          }
+                      } catch (e: Exception) { }
+                  }
+                  var name = "file"
+                  try {
+                      context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                          if (c.moveToFirst()) {
+                              val di = c.getColumnIndex("_data")
+                              if (di >= 0) {
+                                  val path = c.getString(di)
+                                  if (path != null && File(path).exists()) return File(path)
+                              }
+                              val ni = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                              if (ni >= 0) c.getString(ni)?.let { name = it }
+                          }
+                      }
+                  } catch (e: Exception) { }
+                  return try {
+                      val dir = File(context.cacheDir, "incoming")
+                      dir.deleteRecursively()
+                      dir.mkdirs()
+                      val out = File(dir, name.replace('/', '_'))
+                      context.contentResolver.openInputStream(uri)?.use { input ->
+                          out.outputStream().use { input.copyTo(it) }
+                      } ?: return null
+                      out
+                  } catch (e: Exception) { null }
+              }
+          }
+
           class MainActivity : ComponentActivity() {
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  handleIncoming(intent)
+              }
+
+              private fun handleIncoming(i: Intent?) {
+                  if (i == null || i.action != Intent.ACTION_VIEW) return
+                  val uri = i.data ?: return
+                  val cls = i.component?.className ?: ""
+                  val type = i.type ?: ""
+                  val kind = when {
+                      cls.endsWith("ImageViewerAlias") -> "image"
+                      cls.endsWith("ArchiveViewerAlias") -> "archive"
+                      cls.endsWith("DocumentViewerAlias") -> "doc"
+                      type.startsWith("image/") -> "image"
+                      else -> "doc"
+                  }
+                  Incoming.request = IncomingRequest(kind, uri)
+              }
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  if (savedInstanceState == null) handleIncoming(intent)
                   enableEdgeToEdge(
                       statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
                       navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
@@ -1739,6 +1873,39 @@ jobs:
               // Archives open like folders (only the file list is read). Password questions come back here.
               fun startArchive(file: File) {
                   openArchive(file, null)
+              }
+
+              // A file opened from another app ("Open with" -> GreyIV / Archive Viewer / Document Viewer)
+              val incoming = Incoming.request
+              LaunchedEffect(incoming, hasPermission) {
+                  val req = Incoming.request ?: return@LaunchedEffect
+                  if (!hasPermission) return@LaunchedEffect
+                  Incoming.request = null
+                  var images: List<File>? = null
+                  var index = 0
+                  val file = withContext(Dispatchers.IO) {
+                      val f = IntentFiles.resolve(context, req.uri)
+                      if (f != null && req.kind == "image") {
+                          val sibs = f.parentFile?.listFiles()
+                              ?.filter { it.isFile && ThumbnailCache.isImage(it.name) }
+                              ?.sortedBy { it.name.lowercase() } ?: emptyList()
+                          val at = sibs.indexOfFirst { it.absolutePath == f.absolutePath }
+                          if (at >= 0) { images = sibs; index = at } else { images = listOf(f); index = 0 }
+                      }
+                      f
+                  }
+                  if (file == null || !file.exists()) {
+                      Toast.makeText(context, "Can't open this file", Toast.LENGTH_SHORT).show()
+                      return@LaunchedEffect
+                  }
+                  when (req.kind) {
+                      "image" -> {
+                          viewerImages = images
+                          viewerStartIndex = index
+                      }
+                      "archive" -> startArchive(file)
+                      else -> editorFile = file
+                  }
               }
 
               // Extracts the given archive items (files or folders) when needed, then runs `then`
@@ -3832,6 +3999,7 @@ jobs:
                       override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
                       override fun afterTextChanged(s: android.text.Editable?) {
                           val t0 = System.nanoTime()
+                          scrolledAway = false
                           version++
                           if (!suppress) onUserEdit?.invoke()
                           updatePadding()
@@ -3842,6 +4010,26 @@ jobs:
                   })
               }
 
+              override fun onPreDraw(): Boolean {
+                  if (scrolledAway) return true
+                  return super.onPreDraw()
+              }
+
+              // Edit mode latch: off = no keyboard and no accidental edits (scroll, find and select only)
+              fun setEditing(on: Boolean) {
+                  if (readOnly) return
+                  val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+                  if (on) {
+                      inputType = editInputType
+                      setHorizontallyScrolling(true)
+                      requestFocus()
+                      post { imm.showSoftInput(this, 0) }
+                  } else {
+                      keyListener = null
+                      imm.hideSoftInputFromWindow(windowToken, 0)
+                  }
+              }
+
               override fun onCheckIsTextEditor(): Boolean = !readOnly && super.onCheckIsTextEditor()
 
               // ----- fling (momentum when you swipe), draggable scroll bar, find -----
@@ -3849,6 +4037,13 @@ jobs:
               private var velocity: android.view.VelocityTracker? = null
               private val viewConfig = android.view.ViewConfiguration.get(context)
               private var draggingThumb = false
+              private var inTouch = false
+              // true after the user scrolled / flung / dragged the bar / jumped to a match: Android's TextView would
+              // otherwise drag the view back to the blinking cursor on the next frame ("magnet")
+              var scrolledAway = false
+              private val editInputType = android.text.InputType.TYPE_CLASS_TEXT or
+                  android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                  android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
               private val thumbPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
               private var matchStart = -1
               private var matchEnd = -1
@@ -3864,6 +4059,7 @@ jobs:
                   val action = event.actionMasked
                   if (action == android.view.MotionEvent.ACTION_DOWN) {
                       scroller.abortAnimation()
+                      inTouch = true
                       // the right edge is the scroll bar: touch and drag it to jump around the file
                       if (event.x > width - 36 * density && contentHeight() > height) {
                           draggingThumb = true
@@ -3876,6 +4072,7 @@ jobs:
                       if (action == android.view.MotionEvent.ACTION_MOVE) dragThumbTo(event.y)
                       if (action == android.view.MotionEvent.ACTION_UP || action == android.view.MotionEvent.ACTION_CANCEL) {
                           draggingThumb = false
+                          inTouch = false
                           invalidate()
                       }
                       return true
@@ -3893,6 +4090,7 @@ jobs:
                   if (action == android.view.MotionEvent.ACTION_UP || action == android.view.MotionEvent.ACTION_CANCEL) {
                       vt.recycle()
                       velocity = null
+                      inTouch = false
                   }
                   return result
               }
@@ -3911,6 +4109,7 @@ jobs:
 
               override fun computeScroll() {
                   if (scroller.computeScrollOffset()) {
+                      scrolledAway = true
                       scrollTo(scroller.currX, scroller.currY)
                       postInvalidateOnAnimation()
                   }
@@ -3939,6 +4138,7 @@ jobs:
                   val track = height - g[1]
                   if (track <= 0f) return
                   val frac = ((y - g[1] / 2f) / track).coerceIn(0f, 1f)
+                  scrolledAway = true
                   scrollTo(scrollX, (frac * (contentHeight() - height)).toInt())
                   invalidate()
               }
@@ -3950,13 +4150,31 @@ jobs:
               }
 
               // Finds the next match after the previous one (wraps around). Returns [index, number, total] or null.
-              fun findNext(query: String): IntArray? {
+              private fun anchorOffset(): Int {
+                  val l = layout ?: return 0
+                  return l.getLineStart(l.getLineForVertical(scrollY.coerceAtLeast(0)))
+              }
+
+              // mode 0 = while typing (stay on the current match if it still fits, else the first one from the top of the screen),
+              // 1 = next, 2 = previous
+              fun find(query: String, mode: Int): IntArray? {
                   if (query.isEmpty()) return null
                   val s = text?.toString() ?: return null
-                  var from = if (matchEnd >= 0) matchEnd else selectionEnd.coerceAtLeast(0)
-                  if (from > s.length) from = 0
-                  var idx = s.indexOf(query, from, ignoreCase = true)
-                  if (idx < 0) idx = s.indexOf(query, 0, ignoreCase = true)
+                  var idx: Int
+                  if (mode == 2) {
+                      val before = (if (matchStart >= 0) matchStart else anchorOffset()) - 1
+                      idx = if (before >= 0) s.lastIndexOf(query, before, ignoreCase = true) else -1
+                      if (idx < 0) idx = s.lastIndexOf(query, s.length, ignoreCase = true)
+                  } else {
+                      var from = when {
+                          mode == 1 && matchEnd >= 0 -> matchEnd
+                          mode == 0 && matchStart >= 0 -> matchStart
+                          else -> anchorOffset()
+                      }
+                      if (from > s.length) from = 0
+                      idx = s.indexOf(query, from, ignoreCase = true)
+                      if (idx < 0) idx = s.indexOf(query, 0, ignoreCase = true)
+                  }
                   if (idx < 0) {
                       clearMatch()
                       return null
@@ -3973,6 +4191,7 @@ jobs:
                   }
                   matchStart = idx
                   matchEnd = idx + query.length
+                  scrolledAway = true
                   scroller.abortAnimation()
                   val l = layout
                   if (l != null) {
@@ -3994,7 +4213,7 @@ jobs:
               fun load(content: String, readOnlyMode: Boolean) {
                   val tL = System.nanoTime()
                   readOnly = readOnlyMode
-                  if (readOnlyMode) keyListener = null
+                  keyListener = null   // starts in view mode; the Edit button in the header latches editing
                   suppress = true
                   setText(content)
                   suppress = false
@@ -4037,6 +4256,7 @@ jobs:
 
               override fun onSelectionChanged(selStart: Int, selEnd: Int) {
                   super.onSelectionChanged(selStart, selEnd)
+                  scrolledAway = false
                   invalidate()
               }
 
@@ -4081,7 +4301,7 @@ jobs:
               private fun keepCursorVisible() {
                   post {
                       val l = layout ?: return@post
-                      if (!hasFocus()) return@post
+                      if (!hasFocus() || scrolledAway) return@post
                       val visible = height - extendedPaddingTop - extendedPaddingBottom
                       if (visible <= 0) return@post
                       val line = l.getLineForOffset(selectionEnd.coerceAtLeast(0))
@@ -4157,6 +4377,7 @@ jobs:
 
               override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
                   super.onScrollChanged(l, t, oldl, oldt)
+                  if (inTouch || draggingThumb) scrolledAway = true
                   if (t != oldt && cache != null) scheduleHighlight(90)
               }
 
@@ -4248,10 +4469,17 @@ jobs:
               val focusManager = LocalFocusManager.current
               val searchFocus = remember { FocusRequester() }
 
-              fun doSearch() {
+              var editing by remember { mutableStateOf(false) }
+
+              // mode: 0 = while typing, 1 = next, 2 = previous
+              fun doSearch(mode: Int) {
                   val e = editor ?: return
-                  if (query.isEmpty()) return
-                  val r = e.findNext(query)
+                  if (query.isEmpty()) {
+                      e.clearMatch()
+                      resultText = ""
+                      return
+                  }
+                  val r = e.find(query, mode)
                   resultText = if (r == null) "No match" else "${r[1]} of ${r[2]}"
               }
 
@@ -4377,6 +4605,29 @@ jobs:
                               fontWeight = FontWeight.SemiBold
                           )
                       }
+                      Spacer(Modifier.width(8.dp))
+                      val editPressed = remember { mutableStateOf(false) }
+                      val canEdit = loaded && !readOnly
+                      val editLit = editing || editPressed.value
+                      Box(
+                          modifier = Modifier
+                              .clip(CircleShape)
+                              .background(if (editLit) Color.White else Color.White.copy(alpha = 0.10f))
+                              .then(
+                                  if (canEdit) Modifier.pressFlash(editPressed) {
+                                      editing = !editing
+                                      editor?.setEditing(editing)
+                                  } else Modifier
+                              )
+                              .padding(horizontal = 20.dp, vertical = 9.dp)
+                      ) {
+                          Text(
+                              text = "Edit",
+                              color = if (editLit) Color.Black else Color.White.copy(alpha = if (canEdit) 1f else 0.3f),
+                              fontSize = 14.sp,
+                              fontWeight = FontWeight.SemiBold
+                          )
+                      }
                       Spacer(Modifier.weight(1f))
                       val savePressed = remember { mutableStateOf(false) }
                       val active = dirty && !saving
@@ -4429,14 +4680,13 @@ jobs:
                                       value = query,
                                       onValueChange = {
                                           query = it
-                                          resultText = ""
-                                          editor?.clearMatch()
+                                          doSearch(0)
                                       },
                                       singleLine = true,
                                       textStyle = TextStyle(color = Color.White, fontSize = 15.sp),
                                       cursorBrush = SolidColor(Color.White),
                                       keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                                      keyboardActions = KeyboardActions(onSearch = { doSearch() }),
+                                      keyboardActions = KeyboardActions(onSearch = { doSearch(1) }),
                                       modifier = Modifier.weight(1f).focusRequester(searchFocus)
                                   )
                                   if (resultText.isNotEmpty()) {
@@ -4450,7 +4700,9 @@ jobs:
                               }
                           }
                           Spacer(Modifier.width(8.dp))
-                          DialogButton(text = "Search", modifier = Modifier.width(92.dp), primary = true) { doSearch() }
+                          DialogButton(text = "▲", modifier = Modifier.width(52.dp)) { doSearch(2) }
+                          Spacer(Modifier.width(6.dp))
+                          DialogButton(text = "▼", modifier = Modifier.width(52.dp), primary = true) { doSearch(1) }
                       }
                       Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.12f)))
                   }
@@ -4498,12 +4750,12 @@ jobs:
 
           // =====================================================================
           // LOGCAT (top-right menu): shows this app's own log lines (the system only allows an app to read its
-          // own log) with Refresh and Copy. The app writes useful lines itself with AppLog (tag "GreyB"):
+          // own log) with Refresh and Copy. The app writes useful lines itself with AppLog (tag "GreyFE"):
           // editor open/load times, keyboard shown/hidden, slow edits / slow frames, colour work, archives.
           // NOTE FOR FUTURE: log anything worth checking with AppLog.d(...) / AppLog.w(...).
           // =====================================================================
           object AppLog {
-              const val TAG = "GreyB"
+              const val TAG = "GreyFE"
               fun d(msg: String) { android.util.Log.d(TAG, msg) }
               fun w(msg: String) { android.util.Log.w(TAG, msg) }
           }
@@ -4591,7 +4843,7 @@ jobs:
                       DialogButton(text = "Refresh", modifier = Modifier.width(88.dp)) { refresh() }
                       Spacer(Modifier.width(6.dp))
                       DialogButton(text = "Copy", modifier = Modifier.width(80.dp), primary = true) {
-                          val header = "GreyB logcat | Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}) | ${Build.MANUFACTURER} ${Build.MODEL}\n"
+                          val header = "GreyFE logcat | Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}) | ${Build.MANUFACTURER} ${Build.MODEL}\n"
                           var body = lines.joinToString("\n")
                           if (body.length > 400_000) body = body.takeLast(400_000)
                           val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -5194,7 +5446,7 @@ jobs:
           cat > settings.gradle.kts << 'ENDOFFILE'
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
-          rootProject.name = "GreyBExplorer"
+          rootProject.name = "GreyFE"
           include(":app")
           ENDOFFILE
 
@@ -5235,11 +5487,11 @@ jobs:
           }
 
           android {
-              namespace = "com.greyb.explorer"
+              namespace = "com.grey.fe"
               compileSdk = 36
 
               defaultConfig {
-                  applicationId = "com.greyb.explorer"
+                  applicationId = "com.grey.fe"
                   minSdk = 26
                   targetSdk = 36
                   versionCode = ${BUILD_NUMBER}
@@ -5318,7 +5570,7 @@ jobs:
       - name: Generate fixed keystore (if missing)
         run: |
           if [ ! -f app/release.keystore ]; then
-            keytool -genkey -v -keystore app/release.keystore -alias greyb -keyalg RSA -keysize 2048 -validity 10000 -storepass greyb2024 -keypass greyb2024 -dname "CN=GreyB, OU=GreyB, O=GreyB Explorer, L=Test, S=Test, C=US"
+            keytool -genkey -v -keystore app/release.keystore -alias greyb -keyalg RSA -keysize 2048 -validity 10000 -storepass greyb2024 -keypass greyb2024 -dname "CN=GreyFE, OU=GreyFE, O=GreyFE, L=Test, S=Test, C=US"
             echo "✅ New keystore created"
           else
             echo "✅ Using existing cached keystore"
@@ -5375,13 +5627,13 @@ jobs:
 
       - name: Bundle APK + source
         run: |
-          mkdir -p GreyB-Explorer-release
-          cp app/build/outputs/apk/release/app-release.apk GreyB-Explorer-release/GreyB-Explorer.apk
-          cp app/src/main/java/com/greyb/explorer/MainActivity.kt GreyB-Explorer-release/
-          cp app/src/main/AndroidManifest.xml GreyB-Explorer-release/
-          cp .github/workflows/build.yml GreyB-Explorer-release/
+          mkdir -p GreyFE-release
+          cp app/build/outputs/apk/release/app-release.apk GreyFE-release/GreyFE.apk
+          cp app/src/main/java/com/grey/fe/MainActivity.kt GreyFE-release/
+          cp app/src/main/AndroidManifest.xml GreyFE-release/
+          cp .github/workflows/build.yml GreyFE-release/
           APK_SIZE=$(ls -lh app/build/outputs/apk/release/app-release.apk | awk '{print $5}')
-          cat > GreyB-Explorer-release/BUILD_INFO.txt << INFOEOF
+          cat > GreyFE-release/BUILD_INFO.txt << INFOEOF
           Build:      #${{ github.run_number }}
           Commit:     ${{ github.sha }}
           Timestamp:  $(date -u '+%Y-%m-%d %H:%M:%S UTC')
@@ -5393,6 +5645,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GreyB-Explorer-${{ github.run_number }}
-          path: GreyB-Explorer-release/
+          name: GreyFE-${{ github.run_number }}
+          path: GreyFE-release/
           retention-days: 30
