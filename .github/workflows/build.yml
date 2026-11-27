@@ -3296,7 +3296,7 @@ jobs:
               Box(
                   modifier = Modifier
                       .size(42.dp)
-                      .clip(RoundedCornerShape(8.dp))
+                      .then(if (thumb != null || isDirectory) Modifier.clip(RoundedCornerShape(8.dp)) else Modifier)
                       .background(if (isDirectory) Color(0xFF3A3A3A) else Color.Transparent),
                   contentAlignment = Alignment.Center
               ) {
@@ -3380,11 +3380,12 @@ jobs:
                   }
               }
 
-              val sizeText = if (entry.isDir) {
-                  folderCount?.let { "$it items" } ?: "Folder"
-              } else {
-                  formatSize(entry.size)
+              // text pieces are built once per row (not on every redraw), so scrolling many short rows stays smooth
+              val sizeText = remember(entry.isDir, entry.size, folderCount) {
+                  if (entry.isDir) folderCount?.let { "$it items" } ?: "Folder" else formatSize(entry.size)
               }
+              val dateText = remember(entry.modified) { formatDate(entry.modified) }
+              val showCopyPill = remember(entry.name, entry.isDir) { !entry.isDir && isTextName(entry.name) }
 
               val pressedState = remember { mutableStateOf(false) }
               // Marked rows stay white background + black text (static, no pulsing)
@@ -3435,7 +3436,7 @@ jobs:
                               maxLines = 1
                           )
                           Text(
-                              text = formatDate(entry.modified),
+                              text = dateText,
                               color = secondary,
                               fontSize = 11.sp,
                               maxLines = 1
@@ -3444,12 +3445,11 @@ jobs:
                   }
 
                   // Copy pill for text-based files: copies the whole content, no opening needed
-                  if (!entry.isDir && isTextName(entry.name)) {
+                  if (showCopyPill) {
                       Spacer(Modifier.width(8.dp))
                       Box(
                           modifier = Modifier
-                              .clip(CircleShape)
-                              .background(if (copyPressed.value || pressed) Color.Black else Color.White)
+                              .background(if (copyPressed.value || pressed) Color.Black else Color.White, CircleShape)
                               .pressFlash(copyPressed) { onCopyContent(file) }
                               .padding(horizontal = 12.dp, vertical = 6.dp)
                       ) {
