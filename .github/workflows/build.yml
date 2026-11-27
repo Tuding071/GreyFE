@@ -2130,7 +2130,10 @@ jobs:
                                   onMenuToggle = { menuOpen = !menuOpen },
                                   onMenuDismiss = { menuOpen = false },
                                   menuPulse = pending,
-                                  subtitle = if (tabs.getOrNull(activeIndex)?.dir != null) ListStats.text else null,
+                                  subtitle = if (tabs.getOrNull(activeIndex)?.dir != null) ListStats.text else {
+                                      val homeCount = StorageRoots.get(context).size
+                                      if (homeCount == 1) "1 storage" else "$homeCount storages"
+                                  },
                                   menuContent = { close ->
                                       val activeDir = tabs.getOrNull(activeIndex)?.dir
                                       // Pending actions pulse (white bg / black text) so they are not forgotten
@@ -2318,21 +2321,20 @@ jobs:
                                       }
                                   }
                               }
-                          }
-
-                          // Find bar: at the bottom, so the keyboard lifts it and the list above does not move
-                          if (findOpen && tabs.getOrNull(activeIndex)?.dir != null) {
-                              ListFindBar(
-                                  query = findQuery,
-                                  resultText = FindBus.resultText,
-                                  onQueryChange = { q ->
-                                      findQuery = q
-                                      FindBus.applyQuery(q)
-                                  },
-                                  onNext = { FindBus.step(1) },
-                                  onPrev = { FindBus.step(-1) },
-                                  onClose = { closeFind() }
-                              )
+                              // Find bar: at the bottom, so the keyboard lifts it and the list above does not move
+                              if (findOpen && tabs.getOrNull(activeIndex)?.dir != null) {
+                                  ListFindBar(
+                                      query = findQuery,
+                                      resultText = FindBus.resultText,
+                                      onQueryChange = { q ->
+                                          findQuery = q
+                                          FindBus.applyQuery(q)
+                                      },
+                                      onNext = { FindBus.step(1) },
+                                      onPrev = { FindBus.step(-1) },
+                                      onClose = { closeFind() }
+                                  )
+                              }
                           }
 
                           // Pending close confirmation
@@ -5325,7 +5327,8 @@ jobs:
               private val thumbPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
               private var matchStart = -1
               private var matchEnd = -1
-              private val matchPaint = android.graphics.Paint().apply { color = 0x66FFD54F }
+              private val matchPaint = android.graphics.Paint().apply { color = 0xFFFFFFFF.toInt() }
+              private val matchTextPaint = android.text.TextPaint()
               private val matchPath = android.graphics.Path()
 
               private fun contentHeight(): Int {
@@ -5624,6 +5627,26 @@ jobs:
                       canvas.restore()
                   }
                   super.onDraw(canvas)
+                  // the match: its text is drawn again in black over the white background
+                  val fullText = text
+                  if (fullText != null && matchStart >= 0 && matchEnd > matchStart && matchEnd <= fullText.length) {
+                      matchTextPaint.set(paint)
+                      matchTextPaint.color = 0xFF000000.toInt()
+                      val firstLine = l.getLineForOffset(matchStart)
+                      val lastLine = l.getLineForOffset(matchEnd - 1)
+                      for (ln in firstLine..lastLine) {
+                          val ls = Math.max(matchStart, l.getLineStart(ln))
+                          var le = Math.min(matchEnd, l.getLineEnd(ln))
+                          if (le > ls && fullText[le - 1] == '\n') le--
+                          if (le <= ls) continue
+                          canvas.drawText(
+                              fullText, ls, le,
+                              compoundPaddingLeft + l.getPrimaryHorizontal(ls),
+                              offY + l.getLineBaseline(ln),
+                              matchTextPaint
+                          )
+                      }
+                  }
                   // line numbers (fixed on the left, drawn over the text that scrolls under them)
                   val gw = gutterWidth().toFloat()
                   fill.color = 0xFF262626.toInt()
@@ -6646,7 +6669,13 @@ jobs:
                                               val target = 3f
                                               val cx = containerSize.x / 2f
                                               val cy = containerSize.y / 2f
-                                              val newOffset = clampOffsets(target, cx - down.position.x, cy - down.position.y)
+                                              // keep the tapped spot under the finger; the edges / corners limit it (clampOffsets)
+                                              val tap = secondDown.position
+                                              val newOffset = clampOffsets(
+                                                  target,
+                                                  (tap.x - cx) * (1f / target - 1f),
+                                                  (tap.y - cy) * (1f / target - 1f)
+                                              )
                                               animateTo(target, newOffset.x, newOffset.y)
                                           }
                                       } else {
