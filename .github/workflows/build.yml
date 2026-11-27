@@ -2215,7 +2215,7 @@ jobs:
                                       resultText = FindBus.resultText,
                                       onQueryChange = { q ->
                                           findQuery = q
-                                          FindBus.setQuery(q)
+                                          FindBus.applyQuery(q)
                                       },
                                       onNext = { FindBus.step(1) },
                                       onPrev = { FindBus.step(-1) },
@@ -3215,7 +3215,7 @@ jobs:
               var active: FileListView? = null
               var query: String = ""
               var resultText by mutableStateOf("")
-              fun setQuery(q: String) {
+              fun applyQuery(q: String) {
                   query = q
                   val v = active
                   if (v != null) v.setFind(q) else resultText = if (q.isEmpty()) "" else "No match"
