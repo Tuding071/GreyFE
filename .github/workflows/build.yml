@@ -2204,6 +2204,14 @@ jobs:
                                           // It triggers after about 48 dp of mostly-horizontal movement.
                                           awaitEachGesture {
                                               val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                              if (ListSwipe.count > 0) {
+                                                  // The file list view handles its own tab swipe; just let this touch pass
+                                                  while (true) {
+                                                      val ev = awaitPointerEvent(PointerEventPass.Initial)
+                                                      if (ev.changes.none { it.pressed }) break
+                                                  }
+                                                  return@awaitEachGesture
+                                              }
                                               val slop = viewConfiguration.touchSlop
                                               val startTime = System.currentTimeMillis()
                                               val trigger = 32.dp.toPx()
@@ -2279,6 +2287,10 @@ jobs:
                                                   onOpenImage = { images, index ->
                                                       viewerImages = images
                                                       viewerStartIndex = index
+                                                  },
+                                                  onSwipeTab = { dir ->
+                                                      val target = activeIndex + dir
+                                                      if (target in 0 until tabs.size) activeIndex = target
                                                   }
                                               )
                                           }
@@ -3143,6 +3155,748 @@ jobs:
           // File list: edge to edge, 15 rows fill the screen at minimum height,
           // rows grow up to 3 name lines. Shows skeleton rows while loading.
           // Uses the memory cache first, so revisiting a folder is instant.
+          // =====================================================================
+          // FILE LIST VIEW: the whole file list is ONE native view that draws every row itself
+          // (same idea as the document viewer): no per-row views or Compose nodes, its own fling,
+          // its own touch handling. NOTE FOR FUTURE: row look = FileRow (kept as reference);
+          // keep both in sync if the row design changes.
+          // =====================================================================
+          object ListSwipe {
+              // number of FileListViews on screen; while one exists it handles the tab swipe itself
+              var count = 0
+          }
+
+          private typealias GCanvas = android.graphics.Canvas
+          private typealias GPaint = android.graphics.Paint
+          private typealias GPath = android.graphics.Path
+          private typealias GRectF = android.graphics.RectF
+
+          private class ListThumb(val bmp: Bitmap) {
+              val shader = android.graphics.BitmapShader(bmp, android.graphics.Shader.TileMode.CLAMP, android.graphics.Shader.TileMode.CLAMP)
+          }
+
+          class FileListView(context: Context) : android.view.View(context) {
+              var onClickEntry: (Entry) -> Unit = {}
+              var onLongEntry: (Entry) -> Unit = {}
+              var onCopyEntry: (Entry) -> Unit = {}
+              var onSwipeTab: (Int) -> Unit = {}
+              var onRefreshRequest: () -> Unit = {}
+              var onSavePosition: (Int, Int) -> Unit = { _, _ -> }
+
+              var marked: Set<String> = emptySet()
+                  set(v) { if (field !== v) { field = v; invalidate() } }
+              var lastOpened: String? = null
+                  set(v) { if (field != v) { field = v; invalidate() } }
+              var refreshing: Boolean = false
+                  set(v) {
+                      if (field != v) {
+                          field = v
+                          if (v) pullTarget = dp(48f) else pullTarget = 0f
+                          invalidate()
+                      }
+                  }
+
+              // ----- sizes and paints -----
+              private val dm = context.resources.displayMetrics
+              private val d = dm.density
+              private fun dp(v: Float): Float = v * d
+              private fun sp(v: Float): Float = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_SP, v, dm)
+
+              private val namePaint = android.text.TextPaint(GPaint.ANTI_ALIAS_FLAG).also { it.textSize = sp(15f) }
+              private val subPaint = android.text.TextPaint(GPaint.ANTI_ALIAS_FLAG).also { it.textSize = sp(11f) }
+              private val pillPaint = android.text.TextPaint(GPaint.ANTI_ALIAS_FLAG).also {
+                  it.textSize = sp(12f)
+                  it.typeface = if (android.os.Build.VERSION.SDK_INT >= 28)
+                      android.graphics.Typeface.create(android.graphics.Typeface.DEFAULT, 600, false)
+                  else android.graphics.Typeface.create(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
+              }
+              private val emptyPaint = android.text.TextPaint(GPaint.ANTI_ALIAS_FLAG).also { it.textSize = sp(16f); it.color = 0xFFFFFFFF.toInt() }
+              private val fill = GPaint(GPaint.ANTI_ALIAS_FLAG)
+              private val shaderPaint = GPaint(GPaint.ANTI_ALIAS_FLAG)
+              private val rect = GRectF()
+              private val imgMatrix = android.graphics.Matrix()
+
+              private val nameAscent = namePaint.ascent()
+              private val nameLineH = Math.ceil((namePaint.descent() - namePaint.ascent()).toDouble()).toFloat()
+              private val subAscent = subPaint.ascent()
+              private val subLineH = Math.ceil((subPaint.descent() - subPaint.ascent()).toDouble()).toFloat()
+              private val pillAscent = pillPaint.ascent()
+              private val pillTextW = pillPaint.measureText("Copy")
+              private val pillW = pillTextW + dp(24f)
+              private val pillH = Math.ceil((pillPaint.descent() - pillPaint.ascent()).toDouble()).toFloat() + dp(12f)
+
+              // Material "folder" and "file" icons, drawn on a 24 x 24 grid
+              private val folderPath = GPath().apply {
+                  moveTo(10f, 4f); lineTo(4f, 4f); quadTo(2f, 4f, 2f, 6f); lineTo(2f, 18f); quadTo(2f, 20f, 4f, 20f)
+                  lineTo(20f, 20f); quadTo(22f, 20f, 22f, 18f); lineTo(22f, 8f); quadTo(22f, 6f, 20f, 6f); lineTo(12f, 6f); close()
+              }
+              private val filePath = GPath().apply {
+                  moveTo(6f, 2f); quadTo(4f, 2f, 4f, 4f); lineTo(4f, 20f); quadTo(4f, 22f, 6f, 22f); lineTo(18f, 22f)
+                  quadTo(20f, 22f, 20f, 20f); lineTo(20f, 8f); lineTo(14f, 2f); close()
+              }
+              private val foldPath = GPath().apply { moveTo(14f, 2f); lineTo(20f, 8f); lineTo(14f, 8f); close() }
+
+              // ----- data -----
+              private companion object {
+                  const val F_DIR = 1
+                  const val F_THUMB = 2
+                  const val F_APKARC = 4
+                  const val F_PILL = 8
+                  const val F_FOLDERTHUMB = 16
+              }
+
+              private var entries: List<Entry> = emptyList()
+              private var inArchive = false
+              private var n = 0
+              private var rowTop = IntArray(1)
+              private var layouts = arrayOfNulls<android.text.StaticLayout>(0)
+              private var lines = IntArray(0)
+              private var flags = IntArray(0)
+              private var sizeText = arrayOfNulls<String>(0)
+              private var dateText = arrayOfNulls<String>(0)
+              private var keys = arrayOfNulls<String>(0)
+              private var restoreChecked = false
+              private var pendingRestore: IntArray? = null
+
+              // ----- scrolling -----
+              private var offset = 0f
+              private var maxOffset = 0f
+              private var pull = 0f
+              private var pullTarget = 0f
+              private val scroller = android.widget.OverScroller(context)
+              private var flinging = false
+              private var vt: android.view.VelocityTracker? = null
+              private val vc = android.view.ViewConfiguration.get(context)
+              private val slop = vc.scaledTouchSlop
+              private val minFling = vc.scaledMinimumFlingVelocity
+              private val maxFling = vc.scaledMaximumFlingVelocity
+
+              // ----- touch state -----
+              private var downX = 0f
+              private var downY = 0f
+              private var lastY = 0f
+              private var downTime = 0L
+              private var downRow = -1
+              private var downPill = false
+              private var decided = false
+              private var horizontal = false
+              private var dragging = false
+              private var moved = false
+              private var longFired = false
+              private var ignoreTap = false
+              private var touching = false
+              private var pressedRow = -1
+              private var pillRow = -1
+
+              // ----- thumbnails -----
+              private val thumbs = LruCache<String, ListThumb>(80)
+              private val done = HashSet<String>()
+              private val jobs = HashMap<String, kotlinx.coroutines.Job>()
+              private var scope: kotlinx.coroutines.CoroutineScope? = null
+              private var rootJob: kotlinx.coroutines.Job? = null
+              private var attached = false
+
+              private val pressRunnable = Runnable {
+                  if (downRow >= 0) {
+                      if (downPill) pillRow = downRow else pressedRow = downRow
+                      invalidate()
+                  }
+              }
+              private val longRunnable = Runnable {
+                  if (touching && !moved && downRow >= 0 && !downPill) {
+                      longFired = true
+                      pressedRow = downRow
+                      performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+                      invalidate()
+                      entries.getOrNull(downRow)?.let { onLongEntry(it) }
+                  }
+              }
+              private val clearRunnable = Runnable { pressedRow = -1; pillRow = -1; invalidate() }
+
+              // ===================== data =====================
+              fun setEntries(list: List<Entry>, archive: Boolean, restore: IntArray?) {
+                  if (list === entries && archive == inArchive && restoreChecked) return
+                  if (!restoreChecked) { pendingRestore = restore; restoreChecked = true }
+                  entries = list
+                  inArchive = archive
+                  n = list.size
+                  rowTop = IntArray(n + 1)
+                  layouts = arrayOfNulls(n)
+                  lines = IntArray(n)
+                  flags = IntArray(n)
+                  sizeText = arrayOfNulls(n)
+                  dateText = arrayOfNulls(n)
+                  keys = arrayOfNulls(n)
+                  for (i in 0 until n) {
+                      val e = list[i]
+                      var f = 0
+                      if (e.isDir) {
+                          f = f or F_DIR
+                          if (!archive) f = f or F_FOLDERTHUMB
+                      } else {
+                          if (!archive && (ThumbnailCache.isImage(e.name) || ThumbnailCache.isVideo(e.name) || ThumbnailCache.isApk(e.name))) f = f or F_THUMB
+                          if (archive && ThumbnailCache.isApk(e.name) && e.size in 1L..(30L * 1024 * 1024)) f = f or F_APKARC
+                          if (isTextName(e.name)) f = f or F_PILL
+                      }
+                      flags[i] = f
+                  }
+                  for (j in jobs.values) j.cancel()
+                  jobs.clear()
+                  computeRows()
+                  invalidate()
+                  if (!flinging && !touching) requestVisible()
+              }
+
+              private fun computeRows() {
+                  if (width <= 0 || height <= 0) return
+                  val t0 = System.nanoTime()
+                  val w = width.toFloat()
+                  val minH = height / 15
+                  val baseAvail = w - dp(8f) - dp(42f) - dp(12f) - dp(8f)
+                  rowTop[0] = 0
+                  for (i in 0 until n) {
+                      val e = entries[i]
+                      val avail = baseAvail - (if (flags[i] and F_PILL != 0) dp(8f) + pillW else 0f)
+                      var ln = 1
+                      layouts[i] = null
+                      if (namePaint.measureText(e.name) > avail) {
+                          val lay = android.text.StaticLayout.Builder
+                              .obtain(e.name, 0, e.name.length, namePaint, Math.max(1, avail.toInt()))
+                              .setMaxLines(3)
+                              .setEllipsize(android.text.TextUtils.TruncateAt.END)
+                              .setIncludePad(false)
+                              .build()
+                          layouts[i] = lay
+                          ln = lay.lineCount.coerceIn(1, 3)
+                      }
+                      lines[i] = ln
+                      val textH = ln * nameLineH + dp(2f) + subLineH
+                      val content = Math.max(dp(42f), textH)
+                      val h = Math.max(minH, (content + dp(12f)).toInt())
+                      rowTop[i + 1] = rowTop[i] + h
+                  }
+                  maxOffset = Math.max(0, rowTop[n] - height).toFloat()
+                  val pr = pendingRestore
+                  if (pr != null && n > 0) {
+                      pendingRestore = null
+                      val idx = pr[0].coerceIn(0, n - 1)
+                      offset = (rowTop[idx] + pr[1]).toFloat()
+                  }
+                  offset = offset.coerceIn(0f, maxOffset)
+                  val ms = (System.nanoTime() - t0) / 1_000_000L
+                  if (ms >= 20L) AppLog.w("list: computeRows took ${ms}ms for $n rows")
+              }
+
+              override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+                  super.onSizeChanged(w, h, oldw, oldh)
+                  computeRows()
+                  requestVisible()
+              }
+
+              // row index that contains content position y (0 .. n-1)
+              private fun rowAt(y: Float): Int {
+                  if (n == 0) return 0
+                  val yy = y.toInt()
+                  var lo = 0
+                  var hi = n - 1
+                  while (lo < hi) {
+                      val mid = (lo + hi + 1) ushr 1
+                      if (rowTop[mid] <= yy) lo = mid else hi = mid - 1
+                  }
+                  return lo
+              }
+
+              private fun rowAtPoint(y: Float): Int {
+                  if (n == 0) return -1
+                  val cy = y + offset - pull
+                  if (cy < 0f || cy >= rowTop[n]) return -1
+                  return rowAt(cy)
+              }
+
+              private fun thumbKey(i: Int): String {
+                  keys[i]?.let { return it }
+                  val e = entries[i]
+                  val k = e.file.absolutePath + ":" + e.modified
+                  keys[i] = k
+                  return k
+              }
+
+              fun reportPosition() {
+                  if (n == 0) return
+                  val i = rowAt(offset)
+                  onSavePosition(i, (offset - rowTop[i]).toInt())
+              }
+
+              // ===================== drawing =====================
+              override fun onDraw(c: GCanvas) {
+                  val t0 = System.nanoTime()
+                  stepScroll()
+                  if (n == 0) {
+                      val txt = "Empty folder"
+                      c.drawText(txt, (width - emptyPaint.measureText(txt)) / 2f, height / 2f - emptyPaint.ascent() / 2f, emptyPaint)
+                      drawIndicator(c)
+                      stepPull()
+                      return
+                  }
+                  c.save()
+                  c.translate(0f, pull)
+                  val first = rowAt(offset)
+                  val limit = height - pull
+                  var i = first
+                  while (i < n) {
+                      val top = rowTop[i] - offset
+                      if (top > limit) break
+                      drawRow(c, i, top)
+                      i++
+                  }
+                  c.restore()
+                  drawIndicator(c)
+                  stepPull()
+                  val ms = (System.nanoTime() - t0) / 1_000_000L
+                  if (ms >= 12L) AppLog.w("list: draw took ${ms}ms")
+              }
+
+              private fun stepScroll() {
+                  if (!flinging) return
+                  val more = scroller.computeScrollOffset()
+                  offset = scroller.currY.toFloat().coerceIn(0f, maxOffset)
+                  if (more) {
+                      postInvalidateOnAnimation()
+                  } else {
+                      flinging = false
+                      post { settled() }
+                  }
+              }
+
+              private fun stepPull() {
+                  if (!touching) {
+                      if (Math.abs(pull - pullTarget) > 0.5f) {
+                          pull += (pullTarget - pull) * 0.25f
+                          postInvalidateOnAnimation()
+                      } else {
+                          pull = pullTarget
+                      }
+                  }
+                  if (refreshing) postInvalidateOnAnimation()
+              }
+
+              private fun settled() {
+                  reportPosition()
+                  requestVisible()
+              }
+
+              private fun drawRow(c: GCanvas, i: Int, top: Float) {
+                  val e = entries[i]
+                  val f = flags[i]
+                  val isDir = f and F_DIR != 0
+                  val rowH = (rowTop[i + 1] - rowTop[i]).toFloat()
+                  val w = width.toFloat()
+                  val path = e.file.absolutePath
+
+                  val isMarked = marked.isNotEmpty() && marked.contains(path)
+                  val pressed = pressedRow == i || isMarked
+                  val lp = lastOpened
+                  val isLast = !pressed && lp != null &&
+                      (lp == path || (isDir && lp.length > path.length && lp[path.length] == '/' && lp.startsWith(path)))
+
+                  if (pressed) {
+                      fill.style = GPaint.Style.FILL
+                      fill.color = 0xFFFFFFFF.toInt()
+                      c.drawRect(0f, top, w, top + rowH, fill)
+                  } else if (isLast) {
+                      fill.style = GPaint.Style.FILL
+                      fill.color = 0x1FFFFFFF
+                      c.drawRect(0f, top, w, top + rowH, fill)
+                  }
+
+                  // ----- thumb box (42 dp) -----
+                  val box = dp(42f)
+                  val tx = dp(8f)
+                  val ty = top + (rowH - box) / 2f
+                  if (isDir) {
+                      fill.style = GPaint.Style.FILL
+                      fill.color = 0xFF3A3A3A.toInt()
+                      rect.set(tx, ty, tx + box, ty + box)
+                      c.drawRoundRect(rect, dp(8f), dp(8f), fill)
+                      drawIcon(c, folderPath, tx + box / 2f, ty + box / 2f, dp(28f), 0xFFE0B04F.toInt())
+                      val fb = thumbs.get("f:" + thumbKey(i))
+                      if (fb != null) {
+                          val bs = dp(20f)
+                          val bx = tx + box - bs
+                          val by = ty + box - bs
+                          fill.color = 0xFFFFFFFF.toInt()
+                          rect.set(bx, by, bx + bs, by + bs)
+                          c.drawRoundRect(rect, dp(4f), dp(4f), fill)
+                          drawThumb(c, fb, bx + dp(1f), by + dp(1f), bs - dp(2f), dp(3f))
+                      }
+                  } else {
+                      val th = if (f and (F_THUMB or F_APKARC) != 0) thumbs.get(thumbKey(i)) else null
+                      if (th != null) {
+                          drawThumb(c, th, tx, ty, box, dp(8f))
+                      } else {
+                          drawIcon(c, filePath, tx + box / 2f, ty + box / 2f, dp(26f), 0xFFB0BEC5.toInt())
+                          drawIcon(c, foldPath, tx + box / 2f, ty + box / 2f, dp(26f), 0x66000000)
+                      }
+                  }
+
+                  // ----- texts -----
+                  val textX = dp(62f)
+                  val hasPill = f and F_PILL != 0
+                  val rightEdge = w - dp(8f) - (if (hasPill) pillW + dp(8f) else 0f)
+                  val ln = lines[i]
+                  val nameH = ln * nameLineH
+                  val blockH = nameH + dp(2f) + subLineH
+                  val blockTop = top + (rowH - blockH) / 2f
+                  namePaint.color = if (pressed) 0xFF000000.toInt() else 0xFFFFFFFF.toInt()
+                  val lay = layouts[i]
+                  if (lay == null) {
+                      c.drawText(e.name, textX, blockTop - nameAscent, namePaint)
+                  } else {
+                      c.save()
+                      c.translate(textX, blockTop)
+                      lay.draw(c)
+                      c.restore()
+                  }
+                  subPaint.color = when {
+                      pressed -> 0x99000000.toInt()
+                      isLast -> 0xCCFFFFFF.toInt()
+                      else -> 0x8CFFFFFF.toInt()
+                  }
+                  val sizeStr: String = if (isDir) {
+                      FolderCount.cached(path)?.let { "$it items" } ?: "Folder"
+                  } else {
+                      sizeText[i] ?: formatSize(e.size).also { sizeText[i] = it }
+                  }
+                  val dateStr = dateText[i] ?: formatDate(e.modified).also { dateText[i] = it }
+                  val subBase = blockTop + nameH + dp(2f) - subAscent
+                  c.drawText(sizeStr, textX, subBase, subPaint)
+                  c.drawText(dateStr, rightEdge - subPaint.measureText(dateStr), subBase, subPaint)
+
+                  // ----- Copy pill -----
+                  if (hasPill) {
+                      val inverted = pillRow == i || pressed
+                      val pr = w - dp(8f)
+                      val pl = pr - pillW
+                      val pt = top + (rowH - pillH) / 2f
+                      fill.style = GPaint.Style.FILL
+                      fill.color = if (inverted) 0xFF000000.toInt() else 0xFFFFFFFF.toInt()
+                      rect.set(pl, pt, pr, pt + pillH)
+                      c.drawRoundRect(rect, pillH / 2f, pillH / 2f, fill)
+                      pillPaint.color = if (inverted) 0xFFFFFFFF.toInt() else 0xFF000000.toInt()
+                      c.drawText("Copy", pl + dp(12f), pt + dp(6f) - pillAscent, pillPaint)
+                  }
+              }
+
+              private fun drawIcon(c: GCanvas, p: GPath, cx: Float, cy: Float, size: Float, color: Int) {
+                  c.save()
+                  c.translate(cx - size / 2f, cy - size / 2f)
+                  val s = size / 24f
+                  c.scale(s, s)
+                  fill.style = GPaint.Style.FILL
+                  fill.color = color
+                  c.drawPath(p, fill)
+                  c.restore()
+              }
+
+              // picture cropped to fill the square (like ContentScale.Crop), with rounded corners
+              private fun drawThumb(c: GCanvas, t: ListThumb, x: Float, y: Float, size: Float, radius: Float) {
+                  val bw = t.bmp.width.toFloat()
+                  val bh = t.bmp.height.toFloat()
+                  if (bw <= 0f || bh <= 0f) return
+                  val s = Math.max(size / bw, size / bh)
+                  imgMatrix.reset()
+                  imgMatrix.postScale(s, s)
+                  imgMatrix.postTranslate(x + (size - bw * s) / 2f, y + (size - bh * s) / 2f)
+                  t.shader.setLocalMatrix(imgMatrix)
+                  shaderPaint.shader = t.shader
+                  rect.set(x, y, x + size, y + size)
+                  c.drawRoundRect(rect, radius, radius, shaderPaint)
+              }
+
+              private fun drawIndicator(c: GCanvas) {
+                  if (pull < 1f && !refreshing) return
+                  val r = dp(16f)
+                  val cx = width / 2f
+                  val cy = pull - dp(22f)
+                  fill.style = GPaint.Style.FILL
+                  fill.color = 0xFF333333.toInt()
+                  c.drawCircle(cx, cy, r, fill)
+                  fill.style = GPaint.Style.STROKE
+                  fill.strokeWidth = dp(3f)
+                  fill.strokeCap = GPaint.Cap.ROUND
+                  fill.color = 0xFFFFFFFF.toInt()
+                  rect.set(cx - r + dp(6f), cy - r + dp(6f), cx + r - dp(6f), cy + r - dp(6f))
+                  if (refreshing) {
+                      val a = (android.os.SystemClock.uptimeMillis() % 900L) / 900f * 360f
+                      c.drawArc(rect, a, 250f, false, fill)
+                  } else {
+                      val prog = Math.min(1f, pull / dp(72f))
+                      c.drawArc(rect, pull * 2f, prog * 270f, false, fill)
+                  }
+                  fill.style = GPaint.Style.FILL
+              }
+
+              // ===================== thumbnails and counts =====================
+              private fun requestVisible() {
+                  if (n == 0 || height <= 0 || !attached) return
+                  for (j in jobs.values) j.cancel()
+                  jobs.clear()
+                  val first = rowAt(offset)
+                  val last = rowAt(offset + height)
+                  for (i in first..last) {
+                      val e = entries[i]
+                      val f = flags[i]
+                      if (f and F_THUMB != 0) {
+                          request(thumbKey(i)) { ThumbnailCache.getThumbnail(context, e.file, e.modified) }
+                      }
+                      if (f and F_APKARC != 0) {
+                          request(thumbKey(i)) {
+                              // an apk inside an archive: only a small one is unpacked (quietly) so its icon can be shown
+                              withContext(Dispatchers.IO) { ArchiveSupport.materialize(listOf(e.file), OpProgress("icon")) }
+                              if (e.file.exists()) ThumbnailCache.getApkIcon(context, e.file, e.modified) else null
+                          }
+                      }
+                      if (f and F_FOLDERTHUMB != 0) {
+                          request("f:" + thumbKey(i)) { ThumbnailCache.getFolderThumbnail(context, e.file) }
+                          if (FolderCount.cached(e.file.absolutePath) == null) requestCount(e)
+                      }
+                  }
+              }
+
+              private fun request(key: String, block: suspend () -> Bitmap?) {
+                  if (thumbs.get(key) != null || done.contains(key) || jobs.containsKey(key)) return
+                  val sc = scope ?: return
+                  jobs[key] = sc.launch {
+                      val b = try {
+                          block()
+                      } catch (ex: kotlinx.coroutines.CancellationException) {
+                          throw ex
+                      } catch (ex: Throwable) {
+                          null
+                      }
+                      if (b != null) thumbs.put(key, ListThumb(b)) else done.add(key)
+                      jobs.remove(key)
+                      invalidate()
+                  }
+              }
+
+              private fun requestCount(e: Entry) {
+                  val key = "c:" + e.file.absolutePath
+                  if (jobs.containsKey(key)) return
+                  val sc = scope ?: return
+                  jobs[key] = sc.launch {
+                      withContext(Dispatchers.IO) { FolderCount.load(e.file) }
+                      jobs.remove(key)
+                      invalidate()
+                  }
+              }
+
+              override fun onAttachedToWindow() {
+                  super.onAttachedToWindow()
+                  attached = true
+                  ListSwipe.count++
+                  val job = kotlinx.coroutines.SupervisorJob()
+                  rootJob = job
+                  scope = kotlinx.coroutines.CoroutineScope(job + Dispatchers.Main)
+                  requestVisible()
+              }
+
+              override fun onDetachedFromWindow() {
+                  reportPosition()
+                  attached = false
+                  ListSwipe.count = Math.max(0, ListSwipe.count - 1)
+                  rootJob?.cancel()
+                  rootJob = null
+                  scope = null
+                  jobs.clear()
+                  removeCallbacks(pressRunnable)
+                  removeCallbacks(longRunnable)
+                  removeCallbacks(clearRunnable)
+                  super.onDetachedFromWindow()
+              }
+
+              // ===================== touch =====================
+              private fun pillHit(i: Int, x: Float, y: Float): Boolean {
+                  if (flags[i] and F_PILL == 0) return false
+                  val top = rowTop[i] - offset + pull
+                  val rowH = (rowTop[i + 1] - rowTop[i]).toFloat()
+                  val right = width - dp(8f)
+                  val left = right - pillW
+                  val pt = top + (rowH - pillH) / 2f
+                  val pad = dp(4f)
+                  return x >= left - pad && x <= right + pad && y >= pt - pad && y <= pt + pillH + pad
+              }
+
+              private fun cancelPress() {
+                  removeCallbacks(pressRunnable)
+                  removeCallbacks(longRunnable)
+              }
+
+              private fun showThenClear() {
+                  removeCallbacks(clearRunnable)
+                  postDelayed(clearRunnable, 140)
+              }
+
+              override fun onTouchEvent(ev: android.view.MotionEvent): Boolean {
+                  when (ev.actionMasked) {
+                      android.view.MotionEvent.ACTION_DOWN -> {
+                          parent?.requestDisallowInterceptTouchEvent(true)
+                          removeCallbacks(clearRunnable)
+                          vt?.recycle()
+                          vt = android.view.VelocityTracker.obtain().also { it.addMovement(ev) }
+                          downX = ev.x
+                          downY = ev.y
+                          lastY = ev.y
+                          downTime = ev.eventTime
+                          decided = false
+                          horizontal = false
+                          dragging = false
+                          moved = false
+                          longFired = false
+                          touching = true
+                          pressedRow = -1
+                          pillRow = -1
+                          ignoreTap = flinging
+                          if (flinging) {
+                              scroller.abortAnimation()
+                              flinging = false
+                          }
+                          downRow = rowAtPoint(ev.y)
+                          downPill = downRow >= 0 && pillHit(downRow, ev.x, ev.y)
+                          if (!ignoreTap && downRow >= 0) {
+                              postDelayed(pressRunnable, 60)
+                              if (!downPill) postDelayed(longRunnable, android.view.ViewConfiguration.getLongPressTimeout().toLong())
+                          }
+                          return true
+                      }
+                      android.view.MotionEvent.ACTION_MOVE -> {
+                          vt?.addMovement(ev)
+                          val dx = ev.x - downX
+                          val dy = ev.y - downY
+                          if (!decided && (Math.abs(dx) > slop || Math.abs(dy) > slop)) {
+                              decided = true
+                              moved = true
+                              horizontal = Math.abs(dx) > Math.abs(dy)
+                              cancelPress()
+                              pressedRow = -1
+                              pillRow = -1
+                              if (!horizontal) {
+                                  dragging = true
+                                  lastY = ev.y
+                              }
+                              invalidate()
+                          } else if (dragging) {
+                              val step = ev.y - lastY
+                              lastY = ev.y
+                              dragBy(step)
+                          }
+                          return true
+                      }
+                      android.view.MotionEvent.ACTION_UP -> {
+                          cancelPress()
+                          touching = false
+                          vt?.addMovement(ev)
+                          if (dragging) {
+                              dragging = false
+                              if (pull > 0f) {
+                                  releasePull()
+                              } else {
+                                  vt?.computeCurrentVelocity(1000, maxFling.toFloat())
+                                  val vy = -(vt?.yVelocity ?: 0f)
+                                  if (Math.abs(vy) > minFling && maxOffset > 0f) {
+                                      flinging = true
+                                      scroller.fling(0, offset.toInt(), 0, vy.toInt(), 0, 0, 0, maxOffset.toInt())
+                                  } else {
+                                      settled()
+                                  }
+                              }
+                              pressedRow = -1
+                              pillRow = -1
+                          } else if (horizontal) {
+                              val dx = ev.x - downX
+                              val needed = if (ev.eventTime - downTime < 250L) dp(18f) else dp(32f)
+                              if (dx < -needed) onSwipeTab(1) else if (dx > needed) onSwipeTab(-1)
+                              pressedRow = -1
+                              pillRow = -1
+                          } else if (longFired) {
+                              showThenClear()
+                          } else if (!moved && !ignoreTap && downRow >= 0) {
+                              val e = entries.getOrNull(downRow)
+                              if (downPill) pillRow = downRow else pressedRow = downRow
+                              showThenClear()
+                              if (e != null) {
+                                  reportPosition()
+                                  if (downPill) onCopyEntry(e) else onClickEntry(e)
+                              }
+                          } else {
+                              pressedRow = -1
+                              pillRow = -1
+                              if (ignoreTap && !moved) settled()
+                          }
+                          recycleTracker()
+                          invalidate()
+                          return true
+                      }
+                      android.view.MotionEvent.ACTION_CANCEL -> {
+                          cancelPress()
+                          touching = false
+                          if (dragging) {
+                              dragging = false
+                              if (pull > 0f) releasePull() else settled()
+                          }
+                          pressedRow = -1
+                          pillRow = -1
+                          recycleTracker()
+                          invalidate()
+                          return true
+                      }
+                  }
+                  return true
+              }
+
+              private fun recycleTracker() {
+                  vt?.recycle()
+                  vt = null
+              }
+
+              // finger moved by `step` pixels (positive = down). Past the top it pulls (refresh).
+              private fun dragBy(step: Float) {
+                  var s = step
+                  if (pull > 0f) {
+                      pull += s * 0.5f
+                      if (pull < 0f) {
+                          s = pull * 2f
+                          pull = 0f
+                      } else {
+                          pull = Math.min(pull, dp(120f))
+                          invalidate()
+                          return
+                      }
+                  }
+                  val newOff = offset - s
+                  if (newOff < 0f) {
+                      offset = 0f
+                      pull = Math.min(pull + (-newOff) * 0.5f, dp(120f))
+                  } else if (newOff > maxOffset) {
+                      offset = maxOffset
+                  } else {
+                      offset = newOff
+                  }
+                  invalidate()
+              }
+
+              private fun releasePull() {
+                  if (pull >= dp(72f) && !refreshing) {
+                      pullTarget = dp(48f)
+                      onRefreshRequest()
+                  } else {
+                      pullTarget = if (refreshing) dp(48f) else 0f
+                  }
+                  invalidate()
+              }
+          }
+
+
           @OptIn(ExperimentalMaterial3Api::class)
           @Composable
           fun FileListScreen(
@@ -3156,22 +3910,16 @@ jobs:
               onOpenArchive: (File) -> Unit,
               onOpenText: (File) -> Unit,
               onExtract: (files: List<File>, then: () -> Unit) -> Unit,
-              onOpenImage: (images: List<File>, index: Int) -> Unit
+              onOpenImage: (images: List<File>, index: Int) -> Unit,
+              onSwipeTab: (Int) -> Unit = {}
           ) {
               val context = LocalContext.current
-              val haptic = LocalHapticFeedback.current
 
               // Each folder gets its own scroll state: it starts at the top, except when coming back
               // from opening a file (image, zip, ...), then it returns to the remembered position
               val dirPath = directory.absolutePath
-              val listState = remember(dirPath) {
-                  val s = ScrollMemory.take(dirPath)
-                  if (s != null) LazyListState(s[0], s[1]) else LazyListState()
-              }
-              LaunchedEffect(listState, dirPath) {
-                  snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
-                      .collect { (i, o) -> ScrollMemory.save(dirPath, i, o) }
-              }
+              // The list view restores this position itself (null = start at the top)
+              val restorePos = remember(dirPath) { ScrollMemory.take(dirPath) }
               var loadKey by remember { mutableStateOf(0) }
               var refreshing by remember { mutableStateOf(false) }
               var listing by remember(directory) { mutableStateOf(DirCache.get(directory.absolutePath)) }
@@ -3204,45 +3952,21 @@ jobs:
                   listing?.let { sortEntries(it.entries, sortMode) }
               }
               FrameMonitor("list")
+              val lastOpenedPath = LastOpened.path
               val inArchiveDir = remember(dirPath) { ArchiveSupport.isVirtualPath(dirPath) }
               val imagesInDir = remember(sorted) {
                   sorted?.filter { !it.isDir && ThumbnailCache.isImage(it.name) }?.map { it.file } ?: emptyList()
               }
 
-              PullToRefreshBox(
-                  isRefreshing = refreshing,
-                  onRefresh = {
-                      refreshing = true
-                      loadKey++
-                  },
-                  modifier = Modifier.fillMaxSize()
-              ) {
+              // Pull-to-refresh is handled inside FileListView
+              Box(modifier = Modifier.fillMaxSize()) {
                   BoxWithConstraints(Modifier.fillMaxSize()) {
                       val rowMin: Dp = maxHeight / 15
 
                       if (sorted == null) {
                           SkeletonRows(count = 15, rowHeight = rowMin)
-                      } else if (sorted.isEmpty()) {
-                          Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                              Text("Empty folder", color = Color.White, fontSize = 16.sp)
-                          }
                       } else {
-                          LazyColumn(modifier = Modifier.fillMaxSize(), state = listState) {
-                              items(sorted, key = { it.file.absolutePath }) { entry ->
-                                  FileRow(
-                                      onCopyContent = { f ->
-                                          // inside an archive the file is extracted first, then copied
-                                          if (inArchiveDir) onExtract(listOf(f)) { copyFileContent(context, f) } else copyFileContent(context, f)
-                                      },
-                                      entry = entry,
-                                      rowMinHeight = rowMin,
-                                      modifier = Modifier.animateItem(),
-                                      marked = marked.contains(entry.file.absolutePath),
-                                      onLongClick = {
-                                          haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                          onLongPress(entry.file)
-                                      },
-                                      onClick = {
+                          val handleClick: (Entry) -> Unit = { entry ->
                                           // Opening (not selecting while items are marked) leaves the faint highlight on this row
                                           // (inside an opened archive the highlight stays on the zip itself)
                           if (marked.isEmpty() && !ArchiveSupport.isInside(context, directory)) LastOpened.path = entry.file.absolutePath
@@ -3281,9 +4005,30 @@ jobs:
                                                   if (inArchiveDir) onExtract(listOf(entry.file)) { openIt() } else openIt()
                                               }
                                           }
+                          }
+                          androidx.compose.runtime.key(dirPath) {
+                              AndroidView(
+                                  modifier = Modifier.fillMaxSize(),
+                                  factory = { ctx -> FileListView(ctx) },
+                                  update = { v ->
+                                      v.onClickEntry = handleClick
+                                      v.onLongEntry = { e -> onLongPress(e.file) }
+                                      v.onCopyEntry = { e ->
+                                          // inside an archive the file is extracted first, then copied
+                                          if (inArchiveDir) onExtract(listOf(e.file)) { copyFileContent(context, e.file) } else copyFileContent(context, e.file)
                                       }
-                                  )
-                              }
+                                      v.onSwipeTab = onSwipeTab
+                                      v.onRefreshRequest = {
+                                          refreshing = true
+                                          loadKey++
+                                      }
+                                      v.onSavePosition = { i, o -> ScrollMemory.save(dirPath, i, o) }
+                                      v.marked = marked
+                                      v.lastOpened = lastOpenedPath
+                                      v.refreshing = refreshing
+                                      v.setEntries(sorted, inArchiveDir, restorePos)
+                                  }
+                              )
                           }
                       }
                   }
