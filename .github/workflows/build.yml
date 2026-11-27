@@ -1788,6 +1788,13 @@ jobs:
               var panelOpen by remember { mutableStateOf(false) }
               var menuOpen by remember { mutableStateOf(false) }
               var bookmarkListVersion by remember { mutableStateOf(0) }
+              var findOpen by remember { mutableStateOf(false) }
+              var findQuery by remember { mutableStateOf("") }
+              fun closeFind() {
+                  findOpen = false
+                  findQuery = ""
+                  FindBus.clear()
+              }
 
               // ---- Marking, copy / move, rename, delete ----
               val scope = rememberCoroutineScope()
@@ -2046,6 +2053,8 @@ jobs:
                   onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
               }
 
+              LaunchedEffect(activeIndex, tabs.getOrNull(activeIndex)?.dir) { if (findOpen) closeFind() }
+
               BackHandler(enabled = viewerImages != null || contextTarget != null || panelOpen || menuOpen || tabs.size > 1 || tabs.getOrNull(activeIndex)?.dir != null) {
                   when {
                       viewerImages != null -> viewerImages = null
@@ -2064,6 +2073,8 @@ jobs:
                       }
                   }
               }
+
+              BackHandler(enabled = findOpen && contextTarget == null && !menuOpen) { closeFind() }
 
               CompositionLocalProvider(LocalPulse provides pulseOn) {
               Surface(
@@ -2118,6 +2129,7 @@ jobs:
                                   onMenuToggle = { menuOpen = !menuOpen },
                                   onMenuDismiss = { menuOpen = false },
                                   menuPulse = pending,
+                                  subtitle = if (tabs.getOrNull(activeIndex)?.dir != null) ListStats.text else null,
                                   menuContent = { close ->
                                       val activeDir = tabs.getOrNull(activeIndex)?.dir
                                       // Pending actions pulse (white bg / black text) so they are not forgotten
@@ -2130,6 +2142,12 @@ jobs:
                                       if (activeDir != null && clipPaths.isNotEmpty()) {
                                           MenuRow(text = if (clipMove) "Move here" else "Paste here", dot = true) {
                                               doPaste()
+                                              close()
+                                          }
+                                      }
+                                      if (activeDir != null) {
+                                          MenuRow(text = "Find") {
+                                              findOpen = true
                                               close()
                                           }
                                       }
@@ -2190,6 +2208,20 @@ jobs:
                                   onRequestClose = { pendingCloseIndex = it },
                                   onSwipeAddTab = { newTab(null) }
                               )
+
+                              if (findOpen && tabs.getOrNull(activeIndex)?.dir != null) {
+                                  ListFindBar(
+                                      query = findQuery,
+                                      resultText = FindBus.resultText,
+                                      onQueryChange = { q ->
+                                          findQuery = q
+                                          FindBus.setQuery(q)
+                                      },
+                                      onNext = { FindBus.step(1) },
+                                      onPrev = { FindBus.step(-1) },
+                                      onClose = { closeFind() }
+                                  )
+                              }
 
                               // Small gap between the tabs and the list
                               Spacer(Modifier.height(8.dp))
@@ -2888,6 +2920,7 @@ jobs:
               onMenuToggle: () -> Unit,
               onMenuDismiss: () -> Unit,
               menuPulse: Boolean = false,
+              subtitle: String? = null,
               menuContent: (@Composable (closeMenu: () -> Unit) -> Unit)? = null
           ) {
               val scrollState = rememberScrollState()
@@ -2904,10 +2937,10 @@ jobs:
                   scrollState.animateScrollTo(want, tween(200))
               }
 
+              Column(Modifier.fillMaxWidth().background(Color(0xFF2A2A2A))) {
               Row(
                   modifier = Modifier
                       .fillMaxWidth()
-                      .background(Color(0xFF2A2A2A))
                       .padding(horizontal = 5.dp, vertical = 6.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
@@ -2980,6 +3013,16 @@ jobs:
                           }
                       }
                   }
+              }
+              if (!subtitle.isNullOrEmpty()) {
+                  Text(
+                      text = subtitle,
+                      color = Color.White.copy(alpha = 0.55f),
+                      fontSize = 11.sp,
+                      maxLines = 1,
+                      modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 7.dp)
+                  )
+              }
               }
           }
 
@@ -3167,6 +3210,24 @@ jobs:
               var count = 0
           }
 
+          // Find in the folder (top-right menu): the app's find bar talks to the list view through this
+          object FindBus {
+              var active: FileListView? = null
+              var query: String = ""
+              var resultText by mutableStateOf("")
+              fun setQuery(q: String) {
+                  query = q
+                  val v = active
+                  if (v != null) v.setFind(q) else resultText = if (q.isEmpty()) "" else "No match"
+              }
+              fun step(dir: Int) { active?.findStep(dir) }
+              fun clear() {
+                  query = ""
+                  resultText = ""
+                  active?.setFind("")
+              }
+          }
+
           private typealias GCanvas = android.graphics.Canvas
           private typealias GPaint = android.graphics.Paint
           private typealias GPath = android.graphics.Path
@@ -3289,6 +3350,17 @@ jobs:
               private var touching = false
               private var pressedRow = -1
               private var pillRow = -1
+              private var draggingThumb = false
+              private val rightPad = dp(18f)
+              private val thumbPaint = GPaint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+
+              // ----- find -----
+              private var findQuery = ""
+              private var matches = IntArray(0)
+              private var isMatch = BooleanArray(0)
+              private var matchCount = 0
+              private var curMatch = -1
+              private val selPath = GPath()
 
               // ----- thumbnails -----
               // small (128 px) copies of the pictures; about 500 fit, so a whole screen-load ahead is kept
@@ -3349,6 +3421,7 @@ jobs:
                       flags[i] = f
                   }
                   computeRows()
+                  if (findQuery.isNotEmpty()) computeMatches(false)
                   invalidate()
               }
 
@@ -3357,7 +3430,7 @@ jobs:
                   val t0 = System.nanoTime()
                   val w = width.toFloat()
                   val minH = height / 15
-                  val baseAvail = w - dp(8f) - dp(42f) - dp(12f) - dp(8f)
+                  val baseAvail = w - dp(8f) - dp(42f) - dp(12f) - rightPad
                   rowTop[0] = 0
                   for (i in 0 until n) {
                       val e = entries[i]
@@ -3455,6 +3528,7 @@ jobs:
                   }
                   c.restore()
                   drawIndicator(c)
+                  drawScrollbar(c)
                   stepPull()
                   val ms = (System.nanoTime() - t0) / 1_000_000L
                   if (ms >= 12L) AppLog.w("list: draw took ${ms}ms")
@@ -3545,13 +3619,38 @@ jobs:
                   // ----- texts -----
                   val textX = dp(62f)
                   val hasPill = f and F_PILL != 0
-                  val rightEdge = w - dp(8f) - (if (hasPill) pillW + dp(8f) else 0f)
+                  val rightEdge = w - rightPad - (if (hasPill) pillW + dp(8f) else 0f)
                   val ln = lines[i]
                   val nameH = ln * nameLineH
                   val blockH = nameH + dp(2f) + subLineH
                   val blockTop = top + (rowH - blockH) / 2f
                   namePaint.color = if (pressed) 0xFF000000.toInt() else 0xFFFFFFFF.toInt()
                   val lay = layouts[i]
+                  if (findQuery.isNotEmpty() && i < isMatch.size && isMatch[i]) {
+                      val idx = e.name.indexOf(findQuery, 0, true)
+                      if (idx >= 0) {
+                          val isCur = curMatch >= 0 && curMatch < matchCount && matches[curMatch] == i
+                          fill.style = android.graphics.Paint.Style.FILL
+                          fill.color = if (isCur) 0x99FFD54F.toInt() else 0x55FFD54F
+                          if (lay == null) {
+                              val x0 = textX + namePaint.measureText(e.name, 0, idx)
+                              val x1 = textX + namePaint.measureText(e.name, 0, Math.min(e.name.length, idx + findQuery.length))
+                              c.drawRect(x0, blockTop, x1, blockTop + nameLineH, fill)
+                          } else {
+                              val lastEnd = lay.getLineEnd(lay.lineCount - 1)
+                              val st = Math.min(idx, lastEnd)
+                              val en = Math.min(idx + findQuery.length, lastEnd)
+                              if (st < en) {
+                                  selPath.reset()
+                                  lay.getSelectionPath(st, en, selPath)
+                                  c.save()
+                                  c.translate(textX, blockTop)
+                                  c.drawPath(selPath, fill)
+                                  c.restore()
+                              }
+                          }
+                      }
+                  }
                   if (lay == null) {
                       c.drawText(e.name, textX, blockTop - nameAscent, namePaint)
                   } else {
@@ -3578,7 +3677,7 @@ jobs:
                   // ----- Copy pill -----
                   if (hasPill) {
                       val inverted = pillRow == i || pressed
-                      val pr = w - dp(8f)
+                      val pr = w - rightPad
                       val pl = pr - pillW
                       val pt = top + (rowH - pillH) / 2f
                       fill.style = android.graphics.Paint.Style.FILL
@@ -3614,6 +3713,99 @@ jobs:
                   shaderPaint.shader = t.shader
                   rect.set(x, y, x + size, y + size)
                   c.drawRoundRect(rect, radius, radius, shaderPaint)
+              }
+
+              // thumb size / position of the scroll bar (null when everything fits on screen)
+              private fun thumbHeight(): Float = Math.max(dp(40f), height.toFloat() * height / (height + maxOffset))
+
+              private fun drawScrollbar(c: GCanvas) {
+                  if (maxOffset <= 0f || height <= 0) return
+                  val th = thumbHeight()
+                  val frac = (offset / maxOffset).coerceIn(0f, 1f)
+                  val top = frac * (height - th)
+                  val w = (if (draggingThumb) 8f else 4f) * d
+                  thumbPaint.color = if (draggingThumb) 0xCCFFFFFF.toInt() else 0x66FFFFFF
+                  val right = width - 3f * d
+                  c.drawRoundRect(right - w, top, right, top + th, w / 2f, w / 2f, thumbPaint)
+              }
+
+              private fun dragThumbTo(y: Float) {
+                  if (maxOffset <= 0f) return
+                  val th = thumbHeight()
+                  val track = height - th
+                  if (track <= 0f) return
+                  val frac = ((y - th / 2f) / track).coerceIn(0f, 1f)
+                  offset = frac * maxOffset
+                  invalidate()
+              }
+
+              // ===================== find =====================
+              fun setFind(q: String) {
+                  findQuery = q
+                  computeMatches(true)
+              }
+
+              private fun computeMatches(jump: Boolean) {
+                  if (findQuery.isEmpty() || n == 0) {
+                      matchCount = 0
+                      curMatch = -1
+                      isMatch = BooleanArray(0)
+                      FindBus.resultText = if (findQuery.isEmpty()) "" else "No match"
+                      invalidate()
+                      return
+                  }
+                  val tmp = IntArray(n)
+                  val flagsArr = BooleanArray(n)
+                  var c = 0
+                  for (i in 0 until n) {
+                      if (entries[i].name.contains(findQuery, ignoreCase = true)) {
+                          tmp[c++] = i
+                          flagsArr[i] = true
+                      }
+                  }
+                  matches = tmp
+                  isMatch = flagsArr
+                  matchCount = c
+                  if (c == 0) {
+                      curMatch = -1
+                      FindBus.resultText = "No match"
+                      invalidate()
+                      return
+                  }
+                  if (jump) {
+                      // first match at or after the top row on screen (wraps to the first one)
+                      val topRow = rowAt(offset)
+                      var k = 0
+                      while (k < c && tmp[k] < topRow) k++
+                      if (k >= c) k = 0
+                      curMatch = k
+                      scrollToMatch()
+                  } else {
+                      curMatch = curMatch.coerceIn(0, c - 1)
+                  }
+                  FindBus.resultText = "${curMatch + 1} of $c"
+                  invalidate()
+              }
+
+              fun findStep(dir: Int) {
+                  if (matchCount == 0) return
+                  curMatch = ((curMatch + dir) % matchCount + matchCount) % matchCount
+                  FindBus.resultText = "${curMatch + 1} of $matchCount"
+                  scrollToMatch()
+                  invalidate()
+              }
+
+              private fun scrollToMatch() {
+                  if (curMatch < 0 || curMatch >= matchCount || height <= 0) return
+                  val r = matches[curMatch]
+                  val rowH = rowTop[r + 1] - rowTop[r]
+                  val topY = rowTop[r] - offset
+                  if (topY >= 0f && topY + rowH <= height) return
+                  val target = (rowTop[r] + rowH / 2f - height / 2f).coerceIn(0f, maxOffset)
+                  scroller.forceFinished(true)
+                  scroller.startScroll(0, offset.toInt(), 0, (target - offset).toInt(), 250)
+                  flinging = true
+                  invalidate()
               }
 
               private fun drawIndicator(c: GCanvas) {
@@ -3769,6 +3961,8 @@ jobs:
                   super.onAttachedToWindow()
                   attached = true
                   ListSwipe.count++
+                  FindBus.active = this
+                  if (FindBus.query.isNotEmpty()) findQuery = FindBus.query
                   val job = kotlinx.coroutines.SupervisorJob()
                   rootJob = job
                   scope = kotlinx.coroutines.CoroutineScope(job + Dispatchers.Main)
@@ -3779,6 +3973,7 @@ jobs:
                   reportPosition()
                   attached = false
                   ListSwipe.count = Math.max(0, ListSwipe.count - 1)
+                  if (FindBus.active === this) FindBus.active = null
                   rootJob?.cancel()
                   rootJob = null
                   scope = null
@@ -3795,7 +3990,7 @@ jobs:
                   if (flags[i] and F_PILL == 0) return false
                   val top = rowTop[i] - offset + pull
                   val rowH = (rowTop[i + 1] - rowTop[i]).toFloat()
-                  val right = width - dp(8f)
+                  val right = width - rightPad
                   val left = right - pillW
                   val pt = top + (rowH - pillH) / 2f
                   val pad = dp(4f)
@@ -3813,6 +4008,29 @@ jobs:
               }
 
               override fun onTouchEvent(ev: android.view.MotionEvent): Boolean {
+                  // the right edge is the scroll bar: touch and drag it to jump around the folder
+                  if (ev.actionMasked == android.view.MotionEvent.ACTION_DOWN && maxOffset > 0f && ev.x > width - dp(16f)) {
+                      parent?.requestDisallowInterceptTouchEvent(true)
+                      removeCallbacks(clearRunnable)
+                      scroller.abortAnimation()
+                      flinging = false
+                      draggingThumb = true
+                      touching = true
+                      pressedRow = -1
+                      pillRow = -1
+                      dragThumbTo(ev.y)
+                      return true
+                  }
+                  if (draggingThumb) {
+                      if (ev.actionMasked == android.view.MotionEvent.ACTION_MOVE) dragThumbTo(ev.y)
+                      if (ev.actionMasked == android.view.MotionEvent.ACTION_UP || ev.actionMasked == android.view.MotionEvent.ACTION_CANCEL) {
+                          draggingThumb = false
+                          touching = false
+                          settled()
+                          invalidate()
+                      }
+                      return true
+                  }
                   when (ev.actionMasked) {
                       android.view.MotionEvent.ACTION_DOWN -> {
                           parent?.requestDisallowInterceptTouchEvent(true)
@@ -3972,6 +4190,79 @@ jobs:
           }
 
 
+          // Folder / file counts of the open folder, shown under the breadcrumbs
+          object ListStats {
+              var text by mutableStateOf("")
+              fun of(list: List<Entry>?): String {
+                  if (list == null) return ""
+                  val folders = list.count { it.isDir }
+                  val files = list.size - folders
+                  val parts = ArrayList<String>()
+                  if (folders > 0) parts.add(if (folders == 1) "1 folder" else "$folders folders")
+                  if (files > 0) parts.add(if (files == 1) "1 file" else "$files files")
+                  return if (parts.isEmpty()) "Empty" else parts.joinToString(", ")
+              }
+          }
+
+          // Find bar (top-right menu > Find): searches names in the open folder as you type
+          @Composable
+          fun ListFindBar(
+              query: String,
+              resultText: String,
+              onQueryChange: (String) -> Unit,
+              onNext: () -> Unit,
+              onPrev: () -> Unit,
+              onClose: () -> Unit
+          ) {
+              val focus = remember { FocusRequester() }
+              LaunchedEffect(Unit) { focus.requestFocus() }
+              Column(Modifier.fillMaxWidth().background(Color(0xFF1E1E1E))) {
+                  Row(
+                      modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Box(
+                          modifier = Modifier
+                              .weight(1f)
+                              .clip(RoundedCornerShape(10.dp))
+                              .background(Color.White.copy(alpha = 0.10f))
+                              .padding(horizontal = 12.dp, vertical = 10.dp)
+                      ) {
+                          if (query.isEmpty()) {
+                              Text("Find in this folder", color = Color.White.copy(alpha = 0.4f), fontSize = 15.sp)
+                          }
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              BasicTextField(
+                                  value = query,
+                                  onValueChange = onQueryChange,
+                                  singleLine = true,
+                                  textStyle = TextStyle(color = Color.White, fontSize = 15.sp),
+                                  cursorBrush = SolidColor(Color.White),
+                                  keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                                  keyboardActions = KeyboardActions(onSearch = { onNext() }),
+                                  modifier = Modifier.weight(1f).focusRequester(focus)
+                              )
+                              if (resultText.isNotEmpty()) {
+                                  Text(
+                                      resultText,
+                                      color = Color.White.copy(alpha = 0.6f),
+                                      fontSize = 12.sp,
+                                      modifier = Modifier.padding(start = 8.dp)
+                                  )
+                              }
+                          }
+                      }
+                      Spacer(Modifier.width(8.dp))
+                      DialogButton(text = "▲", modifier = Modifier.width(48.dp)) { onPrev() }
+                      Spacer(Modifier.width(6.dp))
+                      DialogButton(text = "▼", modifier = Modifier.width(48.dp), primary = true) { onNext() }
+                      Spacer(Modifier.width(6.dp))
+                      DialogButton(text = "✕", modifier = Modifier.width(44.dp)) { onClose() }
+                  }
+                  Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.12f)))
+              }
+          }
+
           @OptIn(ExperimentalMaterial3Api::class)
           @Composable
           fun FileListScreen(
@@ -4028,6 +4319,7 @@ jobs:
               }
               FrameMonitor("list")
               val lastOpenedPath = LastOpened.path
+              LaunchedEffect(sorted) { ListStats.text = ListStats.of(sorted) }
               val inArchiveDir = remember(dirPath) { ArchiveSupport.isVirtualPath(dirPath) }
               val imagesInDir = remember(sorted) {
                   sorted?.filter { !it.isDir && ThumbnailCache.isImage(it.name) }?.map { it.file } ?: emptyList()
