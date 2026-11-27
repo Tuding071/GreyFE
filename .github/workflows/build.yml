@@ -59,6 +59,8 @@ jobs:
                   android:maxSdkVersion="28" />
               <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
                   tools:ignore="ScopedStorage" />
+              <!-- needed to open the system installer for .apk files -->
+              <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
               <application
                   android:label="GreyFE"
@@ -1452,6 +1454,33 @@ jobs:
                   return digest.joinToString("") { "%02x".format(it) }
               }
 
+              fun isApk(name: String): Boolean = name.lowercase().endsWith(".apk")
+
+              // The app icon of an .apk (read from the file itself; memory cache only, so transparent icons stay clean)
+              suspend fun getApkIcon(context: Context, file: File, modified: Long): Bitmap? = withContext(Dispatchers.IO) {
+                  val key = keyFor("apk:${file.absolutePath}:$modified")
+                  memory.get(key)?.let { return@withContext it }
+                  var bmp: Bitmap? = null
+                  try {
+                      val pm = context.packageManager
+                      val info = pm.getPackageArchiveInfo(file.absolutePath, 0)
+                      val ai = info?.applicationInfo
+                      if (ai != null) {
+                          ai.sourceDir = file.absolutePath
+                          ai.publicSourceDir = file.absolutePath
+                          val d = ai.loadIcon(pm)
+                          val b = Bitmap.createBitmap(THUMB_SIZE, THUMB_SIZE, Bitmap.Config.ARGB_8888)
+                          d.setBounds(0, 0, THUMB_SIZE, THUMB_SIZE)
+                          d.draw(android.graphics.Canvas(b))
+                          bmp = b
+                      }
+                  } catch (e: Throwable) {
+                      AppLog.w("apk icon failed for ${file.name}: ${e.javaClass.simpleName} ${e.message}")
+                  }
+                  if (bmp != null) memory.put(key, bmp)
+                  bmp
+              }
+
               fun isImage(name: String): Boolean {
                   val ext = name.substringAfterLast('.', "").lowercase()
                   return ext in setOf("jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif")
@@ -1466,6 +1495,7 @@ jobs:
 
               suspend fun getThumbnail(context: Context, file: File, modified: Long): Bitmap? = withContext(Dispatchers.IO) {
                   val name = file.name
+                  if (isApk(name)) return@withContext getApkIcon(context, file, modified)
                   if (!isImage(name) && !isVideo(name)) return@withContext null
                   val key = keyFor("${file.absolutePath}:$modified")
                   memory.get(key)?.let { return@withContext it }
@@ -3312,11 +3342,18 @@ jobs:
               val file = entry.file
               // Files inside an archive are not extracted yet, so there is nothing to preview
               val inArchive = ArchiveSupport.isVirtualPath(file.absolutePath)
-              val hasFileThumb = !inArchive && !entry.isDir && (ThumbnailCache.isImage(entry.name) || ThumbnailCache.isVideo(entry.name))
+              val isApkEntry = !entry.isDir && ThumbnailCache.isApk(entry.name)
+              val hasFileThumb = !inArchive && !entry.isDir && (ThumbnailCache.isImage(entry.name) || ThumbnailCache.isVideo(entry.name) || isApkEntry)
               val muted = Color.White.copy(alpha = 0.55f)
 
               val thumb by produceState<Bitmap?>(initialValue = null, key1 = file.absolutePath, key2 = entry.modified) {
-                  value = if (hasFileThumb) ThumbnailCache.getThumbnail(context, file, entry.modified) else null
+                  value = if (hasFileThumb) {
+                      ThumbnailCache.getThumbnail(context, file, entry.modified)
+                  } else if (inArchive && isApkEntry && entry.size in 1L..(30L * 1024 * 1024)) {
+                      // an apk inside an archive: only a small one is unpacked (quietly) so its icon can be shown
+                      withContext(Dispatchers.IO) { ArchiveSupport.materialize(listOf(file), OpProgress("icon")) }
+                      if (file.exists()) ThumbnailCache.getApkIcon(context, file, entry.modified) else null
+                  } else null
               }
 
               val folderThumb by produceState<Bitmap?>(initialValue = null, key1 = file.absolutePath, key2 = entry.modified) {
@@ -5499,7 +5536,37 @@ jobs:
                   }
               )
 
+          // Opens the system installer. Needs "install unknown apps" allowed for this app (asked here when it is not).
+          fun installApk(context: Context, file: File) {
+              val canInstall = Build.VERSION.SDK_INT < Build.VERSION_CODES.O || context.packageManager.canRequestPackageInstalls()
+              AppLog.d("install: ${file.absolutePath} (${file.length()} bytes), allowed=$canInstall")
+              if (!canInstall) {
+                  Toast.makeText(context, "Allow this app to install apps, then open the apk again", Toast.LENGTH_LONG).show()
+                  try {
+                      context.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + context.packageName)))
+                  } catch (e: Exception) {
+                      AppLog.w("install settings failed: ${e.message}")
+                  }
+                  return
+              }
+              try {
+                  val uri = FileProvider.getUriForFile(context, context.packageName + ".fileprovider", file)
+                  val intent = Intent(Intent.ACTION_VIEW).apply {
+                      setDataAndType(uri, "application/vnd.android.package-archive")
+                      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  }
+                  context.startActivity(intent)
+              } catch (e: Exception) {
+                  AppLog.w("install failed: ${e.javaClass.simpleName} ${e.message}")
+                  Toast.makeText(context, "Could not start the installer", Toast.LENGTH_SHORT).show()
+              }
+          }
+
           fun openFile(context: Context, file: File) {
+              if (file.extension.equals("apk", ignoreCase = true)) {
+                  installApk(context, file)
+                  return
+              }
               val uri = FileProvider.getUriForFile(context, context.packageName + ".fileprovider", file)
               val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
               openUri(context, uri, mime)
