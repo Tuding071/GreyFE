@@ -2249,15 +2249,16 @@ jobs:
                                       targetState = activeIndex,
                                       transitionSpec = {
                                           // Fast switch: 150 ms
+                                          // (slide only, no fade: fading a native list view makes it flicker)
                                           if (targetState > initialState) {
-                                              (slideInHorizontally(tween(150)) { it / 4 } + fadeIn(tween(150))) togetherWith
-                                                  (slideOutHorizontally(tween(150)) { -it / 4 } + fadeOut(tween(150)))
+                                              slideInHorizontally(tween(150)) { it / 4 } togetherWith
+                                                  slideOutHorizontally(tween(150)) { -it / 4 }
                                           } else {
-                                              (slideInHorizontally(tween(150)) { -it / 4 } + fadeIn(tween(150))) togetherWith
-                                                  (slideOutHorizontally(tween(150)) { it / 4 } + fadeOut(tween(150)))
+                                              slideInHorizontally(tween(150)) { -it / 4 } togetherWith
+                                                  slideOutHorizontally(tween(150)) { it / 4 }
                                           }
                                       },
-                                      modifier = Modifier.fillMaxSize(),
+                                      modifier = Modifier.fillMaxSize().clipToBounds(),
                                       label = "tabSwitch"
                                   ) { idx ->
                                       val tab = tabs.getOrNull(idx)
@@ -3255,6 +3256,7 @@ jobs:
               private var sizeText = arrayOfNulls<String>(0)
               private var dateText = arrayOfNulls<String>(0)
               private var keys = arrayOfNulls<String>(0)
+              private var fkeys = arrayOfNulls<String>(0)
               private var restoreChecked = false
               private var pendingRestore: IntArray? = null
 
@@ -3289,9 +3291,14 @@ jobs:
               private var pillRow = -1
 
               // ----- thumbnails -----
-              private val thumbs = LruCache<String, ListThumb>(80)
+              // small (128 px) copies of the pictures; about 500 fit, so a whole screen-load ahead is kept
+              private val thumbs = object : LruCache<String, ListThumb>(48 * 1024 * 1024) {
+                  override fun sizeOf(key: String, value: ListThumb): Int = value.bmp.byteCount
+              }
               private val done = HashSet<String>()
-              private val jobs = HashMap<String, kotlinx.coroutines.Job>()
+              private val inflight = HashSet<String>()
+              private val inflightCount = HashSet<String>()
+              private val reach = 250
               private var scope: kotlinx.coroutines.CoroutineScope? = null
               private var rootJob: kotlinx.coroutines.Job? = null
               private var attached = false
@@ -3327,6 +3334,7 @@ jobs:
                   sizeText = arrayOfNulls(n)
                   dateText = arrayOfNulls(n)
                   keys = arrayOfNulls(n)
+                  fkeys = arrayOfNulls(n)
                   for (i in 0 until n) {
                       val e = list[i]
                       var f = 0
@@ -3340,11 +3348,8 @@ jobs:
                       }
                       flags[i] = f
                   }
-                  for (j in jobs.values) j.cancel()
-                  jobs.clear()
                   computeRows()
                   invalidate()
-                  if (!flinging && !touching) requestVisible()
               }
 
               private fun computeRows() {
@@ -3390,7 +3395,6 @@ jobs:
               override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
                   super.onSizeChanged(w, h, oldw, oldh)
                   computeRows()
-                  requestVisible()
               }
 
               // row index that contains content position y (0 .. n-1)
@@ -3482,7 +3486,6 @@ jobs:
 
               private fun settled() {
                   reportPosition()
-                  requestVisible()
               }
 
               private fun drawRow(c: GCanvas, i: Int, top: Float) {
@@ -3637,36 +3640,64 @@ jobs:
               }
 
               // ===================== thumbnails and counts =====================
-              private fun requestVisible() {
-                  if (n == 0 || height <= 0 || !attached) return
-                  for (j in jobs.values) j.cancel()
-                  jobs.clear()
-                  val first = rowAt(offset)
-                  val last = rowAt(offset + height)
-                  for (i in first..last) {
-                      val e = entries[i]
-                      val f = flags[i]
-                      if (f and F_THUMB != 0) {
-                          request(thumbKey(i)) { ThumbnailCache.getThumbnail(context, e.file, e.modified) }
-                      }
-                      if (f and F_APKARC != 0) {
-                          request(thumbKey(i)) {
-                              // an apk inside an archive: only a small one is unpacked (quietly) so its icon can be shown
-                              withContext(Dispatchers.IO) { ArchiveSupport.materialize(listOf(e.file), OpProgress("icon")) }
-                              if (e.file.exists()) ThumbnailCache.getApkIcon(context, e.file, e.modified) else null
-                          }
-                      }
-                      if (f and F_FOLDERTHUMB != 0) {
-                          request("f:" + thumbKey(i)) { ThumbnailCache.getFolderThumbnail(context, e.file) }
-                          if (FolderCount.cached(e.file.absolutePath) == null) requestCount(e)
-                      }
-                  }
+              // Three background workers keep loading pictures for the rows around where you are (and where a
+              // fling is going to stop), nearest first, so a row already has its thumbnail when it scrolls into view.
+              private fun shrink(b: Bitmap): Bitmap {
+                  val m = Math.max(b.width, b.height)
+                  if (m <= 128) return b
+                  val s = 128f / m
+                  return Bitmap.createScaledBitmap(b, Math.max(1, (b.width * s).toInt()), Math.max(1, (b.height * s).toInt()), true)
               }
 
-              private fun request(key: String, block: suspend () -> Bitmap?) {
-                  if (thumbs.get(key) != null || done.contains(key) || jobs.containsKey(key)) return
-                  val sc = scope ?: return
-                  jobs[key] = sc.launch {
+              private fun folderKey(i: Int): String {
+                  fkeys[i]?.let { return it }
+                  val k = "f:" + thumbKey(i)
+                  fkeys[i] = k
+                  return k
+              }
+
+              // 0 = picture / icon, 1 = folder preview, 2 = folder item count, -1 = nothing to do for this row
+              private fun missingKind(i: Int): Int {
+                  val f = flags[i]
+                  if (f and (F_THUMB or F_APKARC) != 0) {
+                      val k = thumbKey(i)
+                      if (thumbs.get(k) == null && !done.contains(k) && !inflight.contains(k)) return 0
+                  }
+                  if (f and F_FOLDERTHUMB != 0) {
+                      val k = folderKey(i)
+                      if (thumbs.get(k) == null && !done.contains(k) && !inflight.contains(k)) return 1
+                      val p = entries[i].file.absolutePath
+                      if (FolderCount.cached(p) == null && !inflightCount.contains(p)) return 2
+                  }
+                  return -1
+              }
+
+              private fun nextTask(): IntArray? {
+                  if (n == 0 || height <= 0) return null
+                  val focusY = if (flinging) scroller.finalY.toFloat() + height / 2f else offset + height / 2f
+                  val focus = rowAt(focusY)
+                  var dist = 0
+                  while (dist <= reach) {
+                      val up = focus - dist
+                      if (up >= 0) {
+                          val t = missingKind(up)
+                          if (t >= 0) return intArrayOf(up, t)
+                      }
+                      if (dist > 0) {
+                          val down = focus + dist
+                          if (down < n) {
+                              val t = missingKind(down)
+                              if (t >= 0) return intArrayOf(down, t)
+                          }
+                      }
+                      dist++
+                  }
+                  return null
+              }
+
+              private suspend fun load(key: String, block: suspend () -> Bitmap?) {
+                  inflight.add(key)
+                  try {
                       val b = try {
                           block()
                       } catch (ex: kotlinx.coroutines.CancellationException) {
@@ -3674,20 +3705,63 @@ jobs:
                       } catch (ex: Throwable) {
                           null
                       }
-                      if (b != null) thumbs.put(key, ListThumb(b)) else done.add(key)
-                      jobs.remove(key)
+                      if (b != null) {
+                          val small = withContext(Dispatchers.Default) { shrink(b) }
+                          thumbs.put(key, ListThumb(small))
+                      } else {
+                          done.add(key)
+                      }
                       invalidate()
+                  } finally {
+                      inflight.remove(key)
                   }
               }
 
-              private fun requestCount(e: Entry) {
-                  val key = "c:" + e.file.absolutePath
-                  if (jobs.containsKey(key)) return
+              private suspend fun runTask(i: Int, kind: Int) {
+                  val e = entries.getOrNull(i)
+                  if (e == null) {
+                      delay(50)
+                      return
+                  }
+                  when (kind) {
+                      0 -> {
+                          if (flags[i] and F_APKARC != 0) {
+                              load(thumbKey(i)) {
+                                  // an apk inside an archive: only a small one is unpacked (quietly) so its icon can be shown
+                                  withContext(Dispatchers.IO) { ArchiveSupport.materialize(listOf(e.file), OpProgress("icon")) }
+                                  if (e.file.exists()) ThumbnailCache.getApkIcon(context, e.file, e.modified) else null
+                              }
+                          } else {
+                              load(thumbKey(i)) { ThumbnailCache.getThumbnail(context, e.file, e.modified) }
+                          }
+                      }
+                      1 -> load(folderKey(i)) { ThumbnailCache.getFolderThumbnail(context, e.file) }
+                      else -> {
+                          val p = e.file.absolutePath
+                          inflightCount.add(p)
+                          try {
+                              withContext(Dispatchers.IO) { FolderCount.load(e.file) }
+                              invalidate()
+                          } finally {
+                              inflightCount.remove(p)
+                          }
+                      }
+                  }
+              }
+
+              private fun startWorkers() {
                   val sc = scope ?: return
-                  jobs[key] = sc.launch {
-                      withContext(Dispatchers.IO) { FolderCount.load(e.file) }
-                      jobs.remove(key)
-                      invalidate()
+                  repeat(3) {
+                      sc.launch {
+                          while (true) {
+                              val t = nextTask()
+                              if (t == null) {
+                                  delay(120)
+                              } else {
+                                  runTask(t[0], t[1])
+                              }
+                          }
+                      }
                   }
               }
 
@@ -3698,7 +3772,7 @@ jobs:
                   val job = kotlinx.coroutines.SupervisorJob()
                   rootJob = job
                   scope = kotlinx.coroutines.CoroutineScope(job + Dispatchers.Main)
-                  requestVisible()
+                  startWorkers()
               }
 
               override fun onDetachedFromWindow() {
@@ -3708,7 +3782,8 @@ jobs:
                   rootJob?.cancel()
                   rootJob = null
                   scope = null
-                  jobs.clear()
+                  inflight.clear()
+                  inflightCount.clear()
                   removeCallbacks(pressRunnable)
                   removeCallbacks(longRunnable)
                   removeCallbacks(clearRunnable)
