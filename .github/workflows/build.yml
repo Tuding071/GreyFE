@@ -3202,17 +3202,17 @@ jobs:
               private fun dp(v: Float): Float = v * d
               private fun sp(v: Float): Float = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_SP, v, dm)
 
-              private val namePaint = android.text.TextPaint(GPaint.ANTI_ALIAS_FLAG).also { it.textSize = sp(15f) }
-              private val subPaint = android.text.TextPaint(GPaint.ANTI_ALIAS_FLAG).also { it.textSize = sp(11f) }
-              private val pillPaint = android.text.TextPaint(GPaint.ANTI_ALIAS_FLAG).also {
+              private val namePaint = android.text.TextPaint(android.graphics.Paint.ANTI_ALIAS_FLAG).also { it.textSize = sp(15f) }
+              private val subPaint = android.text.TextPaint(android.graphics.Paint.ANTI_ALIAS_FLAG).also { it.textSize = sp(11f) }
+              private val pillPaint = android.text.TextPaint(android.graphics.Paint.ANTI_ALIAS_FLAG).also {
                   it.textSize = sp(12f)
                   it.typeface = if (android.os.Build.VERSION.SDK_INT >= 28)
                       android.graphics.Typeface.create(android.graphics.Typeface.DEFAULT, 600, false)
                   else android.graphics.Typeface.create(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
               }
-              private val emptyPaint = android.text.TextPaint(GPaint.ANTI_ALIAS_FLAG).also { it.textSize = sp(16f); it.color = 0xFFFFFFFF.toInt() }
-              private val fill = GPaint(GPaint.ANTI_ALIAS_FLAG)
-              private val shaderPaint = GPaint(GPaint.ANTI_ALIAS_FLAG)
+              private val emptyPaint = android.text.TextPaint(android.graphics.Paint.ANTI_ALIAS_FLAG).also { it.textSize = sp(16f); it.color = 0xFFFFFFFF.toInt() }
+              private val fill = GPaint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+              private val shaderPaint = GPaint(android.graphics.Paint.ANTI_ALIAS_FLAG)
               private val rect = GRectF()
               private val imgMatrix = android.graphics.Matrix()
 
@@ -3500,11 +3500,11 @@ jobs:
                       (lp == path || (isDir && lp.length > path.length && lp[path.length] == '/' && lp.startsWith(path)))
 
                   if (pressed) {
-                      fill.style = GPaint.Style.FILL
+                      fill.style = android.graphics.Paint.Style.FILL
                       fill.color = 0xFFFFFFFF.toInt()
                       c.drawRect(0f, top, w, top + rowH, fill)
                   } else if (isLast) {
-                      fill.style = GPaint.Style.FILL
+                      fill.style = android.graphics.Paint.Style.FILL
                       fill.color = 0x1FFFFFFF
                       c.drawRect(0f, top, w, top + rowH, fill)
                   }
@@ -3514,7 +3514,7 @@ jobs:
                   val tx = dp(8f)
                   val ty = top + (rowH - box) / 2f
                   if (isDir) {
-                      fill.style = GPaint.Style.FILL
+                      fill.style = android.graphics.Paint.Style.FILL
                       fill.color = 0xFF3A3A3A.toInt()
                       rect.set(tx, ty, tx + box, ty + box)
                       c.drawRoundRect(rect, dp(8f), dp(8f), fill)
@@ -3578,7 +3578,7 @@ jobs:
                       val pr = w - dp(8f)
                       val pl = pr - pillW
                       val pt = top + (rowH - pillH) / 2f
-                      fill.style = GPaint.Style.FILL
+                      fill.style = android.graphics.Paint.Style.FILL
                       fill.color = if (inverted) 0xFF000000.toInt() else 0xFFFFFFFF.toInt()
                       rect.set(pl, pt, pr, pt + pillH)
                       c.drawRoundRect(rect, pillH / 2f, pillH / 2f, fill)
@@ -3592,7 +3592,7 @@ jobs:
                   c.translate(cx - size / 2f, cy - size / 2f)
                   val s = size / 24f
                   c.scale(s, s)
-                  fill.style = GPaint.Style.FILL
+                  fill.style = android.graphics.Paint.Style.FILL
                   fill.color = color
                   c.drawPath(p, fill)
                   c.restore()
@@ -3618,12 +3618,12 @@ jobs:
                   val r = dp(16f)
                   val cx = width / 2f
                   val cy = pull - dp(22f)
-                  fill.style = GPaint.Style.FILL
+                  fill.style = android.graphics.Paint.Style.FILL
                   fill.color = 0xFF333333.toInt()
                   c.drawCircle(cx, cy, r, fill)
-                  fill.style = GPaint.Style.STROKE
+                  fill.style = android.graphics.Paint.Style.STROKE
                   fill.strokeWidth = dp(3f)
-                  fill.strokeCap = GPaint.Cap.ROUND
+                  fill.strokeCap = android.graphics.Paint.Cap.ROUND
                   fill.color = 0xFFFFFFFF.toInt()
                   rect.set(cx - r + dp(6f), cy - r + dp(6f), cx + r - dp(6f), cy + r - dp(6f))
                   if (refreshing) {
@@ -3633,7 +3633,7 @@ jobs:
                       val prog = Math.min(1f, pull / dp(72f))
                       c.drawArc(rect, pull * 2f, prog * 270f, false, fill)
                   }
-                  fill.style = GPaint.Style.FILL
+                  fill.style = android.graphics.Paint.Style.FILL
               }
 
               // ===================== thumbnails and counts =====================
