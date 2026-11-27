@@ -322,6 +322,8 @@ jobs:
           import androidx.lifecycle.LifecycleEventObserver
           import androidx.lifecycle.compose.LocalLifecycleOwner
           import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.sync.Semaphore
+          import kotlinx.coroutines.sync.withPermit
           import kotlinx.coroutines.coroutineScope
           import kotlinx.coroutines.delay
           import kotlinx.coroutines.launch
@@ -1438,6 +1440,8 @@ jobs:
           object ThumbnailCache {
               private const val MAX_THUMBS = 500
               private const val THUMB_SIZE = 240
+              // At most 3 pictures / icons are made at the same time, so fast scrolling does not pile up work and stutter
+              private val gate = Semaphore(3)
 
               private val memory = object : LruCache<String, Bitmap>(12 * 1024 * 1024) {
                   override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
@@ -1461,7 +1465,8 @@ jobs:
                   val key = keyFor("apk:${file.absolutePath}:$modified")
                   memory.get(key)?.let { return@withContext it }
                   var bmp: Bitmap? = null
-                  try {
+                  val t0 = System.nanoTime()
+                  gate.withPermit { try {
                       val pm = context.packageManager
                       val info = pm.getPackageArchiveInfo(file.absolutePath, 0)
                       val ai = info?.applicationInfo
@@ -1476,8 +1481,10 @@ jobs:
                       }
                   } catch (e: Throwable) {
                       AppLog.w("apk icon failed for ${file.name}: ${e.javaClass.simpleName} ${e.message}")
-                  }
-                  if (bmp != null) memory.put(key, bmp)
+                  } }
+                  val ms = (System.nanoTime() - t0) / 1_000_000L
+                  if (ms >= 150L) AppLog.d("apk icon of ${file.name} took ${ms}ms")
+                  bmp?.let { memory.put(key, it) }
                   bmp
               }
 
@@ -1499,13 +1506,18 @@ jobs:
                   if (!isImage(name) && !isVideo(name)) return@withContext null
                   val key = keyFor("${file.absolutePath}:$modified")
                   memory.get(key)?.let { return@withContext it }
-                  val bmp = loadOrGenerate(context, key) {
-                      when {
-                          isImage(name) -> decodeSampledImage(file.absolutePath, THUMB_SIZE)
-                          isVideo(name) -> extractVideoFrame(file.absolutePath)
-                          else -> null
+                  val t0 = System.nanoTime()
+                  val bmp = gate.withPermit {
+                      loadOrGenerate(context, key) {
+                          when {
+                              isImage(name) -> decodeSampledImage(file.absolutePath, THUMB_SIZE)
+                              isVideo(name) -> extractVideoFrame(file.absolutePath)
+                              else -> null
+                          }
                       }
                   }
+                  val ms = (System.nanoTime() - t0) / 1_000_000L
+                  if (ms >= 150L) AppLog.d("thumbnail of $name took ${ms}ms")
                   if (bmp != null) memory.put(key, bmp)
                   bmp
               }
@@ -3191,6 +3203,7 @@ jobs:
               val sorted = remember(listing, sortMode) {
                   listing?.let { sortEntries(it.entries, sortMode) }
               }
+              FrameMonitor("list")
               val inArchiveDir = remember(dirPath) { ArchiveSupport.isVirtualPath(dirPath) }
               val imagesInDir = remember(sorted) {
                   sorted?.filter { !it.isDir && ThumbnailCache.isImage(it.name) }?.map { it.file } ?: emptyList()
