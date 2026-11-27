@@ -2121,6 +2121,7 @@ jobs:
                               modifier = Modifier
                                   .fillMaxSize()
                                   .windowInsetsPadding(WindowInsets.systemBars)
+                                  .imePadding()
                           ) {
                               ScreenHeader(
                                   breadcrumbs = activeBreadcrumbs(context, tabs.getOrNull(activeIndex)),
@@ -2209,27 +2210,14 @@ jobs:
                                   onSwipeAddTab = { newTab(null) }
                               )
 
-                              if (findOpen && tabs.getOrNull(activeIndex)?.dir != null) {
-                                  ListFindBar(
-                                      query = findQuery,
-                                      resultText = FindBus.resultText,
-                                      onQueryChange = { q ->
-                                          findQuery = q
-                                          FindBus.applyQuery(q)
-                                      },
-                                      onNext = { FindBus.step(1) },
-                                      onPrev = { FindBus.step(-1) },
-                                      onClose = { closeFind() }
-                                  )
-                              }
-
                               // Small gap between the tabs and the list
                               Spacer(Modifier.height(8.dp))
 
                               // Content: swipe left/right switches tabs, with motion between them
                               Box(
                                   modifier = Modifier
-                                      .fillMaxSize()
+                                      .weight(1f)
+                                      .fillMaxWidth()
                                       .pointerInput(tabs.size, activeIndex) {
                                           // Swipe to switch tabs. It watches the touch BEFORE the list does
                                           // (Initial pass), so it works even when the finger starts on a list item.
@@ -2330,6 +2318,21 @@ jobs:
                                       }
                                   }
                               }
+                          }
+
+                          // Find bar: at the bottom, so the keyboard lifts it and the list above does not move
+                          if (findOpen && tabs.getOrNull(activeIndex)?.dir != null) {
+                              ListFindBar(
+                                  query = findQuery,
+                                  resultText = FindBus.resultText,
+                                  onQueryChange = { q ->
+                                      findQuery = q
+                                      FindBus.applyQuery(q)
+                                  },
+                                  onNext = { FindBus.step(1) },
+                                  onPrev = { FindBus.step(-1) },
+                                  onClose = { closeFind() }
+                              )
                           }
 
                           // Pending close confirmation
@@ -2803,17 +2806,20 @@ jobs:
               return this.pointerInput(Unit) {
                   detectTapGestures(
                       onPress = {
-                          coroutineScope {
-                              val showJob = launch {
-                                  delay(60)
-                                  pressed.value = true
+                          try {
+                              coroutineScope {
+                                  val showJob = launch {
+                                      delay(60)
+                                      pressed.value = true
+                                  }
+                                  val released = tryAwaitRelease()
+                                  showJob.cancel()
+                                  if (released) {
+                                      pressed.value = true
+                                      delay(140)
+                                  }
                               }
-                              val released = tryAwaitRelease()
-                              showJob.cancel()
-                              if (released) {
-                                  pressed.value = true
-                                  delay(140)
-                              }
+                          } finally {
                               pressed.value = false
                           }
                       },
@@ -3014,15 +3020,14 @@ jobs:
                       }
                   }
               }
-              if (!subtitle.isNullOrEmpty()) {
-                  Text(
-                      text = subtitle,
-                      color = Color.White.copy(alpha = 0.55f),
-                      fontSize = 11.sp,
-                      maxLines = 1,
-                      modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 7.dp)
-                  )
-              }
+              // always drawn (a blank line on Home / while loading) so the header never changes height
+              Text(
+                  text = if (subtitle.isNullOrEmpty()) " " else subtitle,
+                  color = Color.White.copy(alpha = 0.55f),
+                  fontSize = 11.sp,
+                  maxLines = 1,
+                  modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 7.dp)
+              )
               }
           }
 
@@ -3319,6 +3324,7 @@ jobs:
               private var keys = arrayOfNulls<String>(0)
               private var fkeys = arrayOfNulls<String>(0)
               private var restoreChecked = false
+              private var baseH = 0
               private var pendingRestore: IntArray? = null
 
               // ----- scrolling -----
@@ -3429,7 +3435,7 @@ jobs:
                   if (width <= 0 || height <= 0) return
                   val t0 = System.nanoTime()
                   val w = width.toFloat()
-                  val minH = height / 15
+                  val minH = Math.max(baseH, height) / 15
                   val baseAvail = w - dp(8f) - dp(42f) - dp(12f) - rightPad
                   rowTop[0] = 0
                   for (i in 0 until n) {
@@ -3467,6 +3473,7 @@ jobs:
 
               override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
                   super.onSizeChanged(w, h, oldw, oldh)
+                  if (h > baseH) baseH = h
                   computeRows()
               }
 
@@ -3626,20 +3633,22 @@ jobs:
                   val blockTop = top + (rowH - blockH) / 2f
                   namePaint.color = if (pressed) 0xFF000000.toInt() else 0xFFFFFFFF.toInt()
                   val lay = layouts[i]
+                  var hlIdx = -1
+                  var hlCur = false
                   if (findQuery.isNotEmpty() && i < isMatch.size && isMatch[i]) {
-                      val idx = e.name.indexOf(findQuery, 0, true)
-                      if (idx >= 0) {
-                          val isCur = curMatch >= 0 && curMatch < matchCount && matches[curMatch] == i
+                      hlIdx = e.name.indexOf(findQuery, 0, true)
+                      if (hlIdx >= 0) {
+                          hlCur = curMatch >= 0 && curMatch < matchCount && matches[curMatch] == i
                           fill.style = android.graphics.Paint.Style.FILL
-                          fill.color = if (isCur) 0x99FFD54F.toInt() else 0x55FFD54F
+                          fill.color = if (hlCur) 0xFFFFFFFF.toInt() else 0x55FFD54F
                           if (lay == null) {
-                              val x0 = textX + namePaint.measureText(e.name, 0, idx)
-                              val x1 = textX + namePaint.measureText(e.name, 0, Math.min(e.name.length, idx + findQuery.length))
+                              val x0 = textX + namePaint.measureText(e.name, 0, hlIdx)
+                              val x1 = textX + namePaint.measureText(e.name, 0, Math.min(e.name.length, hlIdx + findQuery.length))
                               c.drawRect(x0, blockTop, x1, blockTop + nameLineH, fill)
                           } else {
                               val lastEnd = lay.getLineEnd(lay.lineCount - 1)
-                              val st = Math.min(idx, lastEnd)
-                              val en = Math.min(idx + findQuery.length, lastEnd)
+                              val st = Math.min(hlIdx, lastEnd)
+                              val en = Math.min(hlIdx + findQuery.length, lastEnd)
                               if (st < en) {
                                   selPath.reset()
                                   lay.getSelectionPath(st, en, selPath)
@@ -3658,6 +3667,30 @@ jobs:
                       c.translate(textX, blockTop)
                       lay.draw(c)
                       c.restore()
+                  }
+                  if (hlCur && hlIdx >= 0) {
+                      // the current match: white background (drawn above) with black text
+                      namePaint.color = 0xFF000000.toInt()
+                      c.save()
+                      if (lay == null) {
+                          val x0 = textX + namePaint.measureText(e.name, 0, hlIdx)
+                          val x1 = textX + namePaint.measureText(e.name, 0, Math.min(e.name.length, hlIdx + findQuery.length))
+                          c.clipRect(x0, blockTop, x1, blockTop + nameLineH)
+                          c.drawText(e.name, textX, blockTop - nameAscent, namePaint)
+                      } else {
+                          val lastEnd = lay.getLineEnd(lay.lineCount - 1)
+                          val st = Math.min(hlIdx, lastEnd)
+                          val en = Math.min(hlIdx + findQuery.length, lastEnd)
+                          if (st < en) {
+                              selPath.reset()
+                              lay.getSelectionPath(st, en, selPath)
+                              c.translate(textX, blockTop)
+                              c.clipPath(selPath)
+                              lay.draw(c)
+                          }
+                      }
+                      c.restore()
+                      namePaint.color = if (pressed) 0xFF000000.toInt() else 0xFFFFFFFF.toInt()
                   }
                   subPaint.color = when {
                       pressed -> 0x99000000.toInt()
@@ -4217,6 +4250,7 @@ jobs:
               val focus = remember { FocusRequester() }
               LaunchedEffect(Unit) { focus.requestFocus() }
               Column(Modifier.fillMaxWidth().background(Color(0xFF1E1E1E))) {
+                  Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.12f)))
                   Row(
                       modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
                       verticalAlignment = Alignment.CenterVertically
@@ -4259,7 +4293,6 @@ jobs:
                       Spacer(Modifier.width(6.dp))
                       DialogButton(text = "✕", modifier = Modifier.width(44.dp)) { onClose() }
                   }
-                  Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.12f)))
               }
           }
 
@@ -5914,8 +5947,29 @@ jobs:
                   }
                   Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.12f)))
 
+
+                  Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                      AndroidView(
+                          modifier = Modifier.fillMaxSize(),
+                          factory = { ctx ->
+                              CodeEditText(ctx).also {
+                                  it.lang = lang
+                                  it.onUserEdit = { changed = true }
+                                  editor = it
+                              }
+                          }
+                      )
+                      if (!loaded) {
+                          Box(Modifier.fillMaxSize().background(Color(0xFF1E1E1E)), contentAlignment = Alignment.Center) {
+                              CircularProgressIndicator(color = Color.White)
+                          }
+                      }
+                  }
+
+                  // Find bar at the bottom: the keyboard lifts it, and the text above does not move
                   if (searching) {
                       LaunchedEffect(Unit) { searchFocus.requestFocus() }
+                      Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.12f)))
                       Row(
                           modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
                           verticalAlignment = Alignment.CenterVertically
@@ -5958,25 +6012,6 @@ jobs:
                           DialogButton(text = "▲", modifier = Modifier.width(52.dp)) { doSearch(2) }
                           Spacer(Modifier.width(6.dp))
                           DialogButton(text = "▼", modifier = Modifier.width(52.dp), primary = true) { doSearch(1) }
-                      }
-                      Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.12f)))
-                  }
-
-                  Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                      AndroidView(
-                          modifier = Modifier.fillMaxSize(),
-                          factory = { ctx ->
-                              CodeEditText(ctx).also {
-                                  it.lang = lang
-                                  it.onUserEdit = { changed = true }
-                                  editor = it
-                              }
-                          }
-                      )
-                      if (!loaded) {
-                          Box(Modifier.fillMaxSize().background(Color(0xFF1E1E1E)), contentAlignment = Alignment.Center) {
-                              CircularProgressIndicator(color = Color.White)
-                          }
                       }
                   }
               }
