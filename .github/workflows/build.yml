@@ -6669,12 +6669,18 @@ jobs:
                                               val target = 3f
                                               val cx = containerSize.x / 2f
                                               val cy = containerSize.y / 2f
-                                              // keep the tapped spot under the finger; the edges / corners limit it (clampOffsets)
+                                              // Near the middle the tapped spot stays under the finger; the closer the tap is to an
+                                              // edge / corner, the more the zoom centers on it (so you see more). Per axis.
                                               val tap = secondDown.position
+                                              val dx = tap.x - cx
+                                              val dy = tap.y - cy
+                                              val tx = if (cx > 0f) (Math.abs(dx) / cx).coerceIn(0f, 1f) else 0f
+                                              val ty = if (cy > 0f) (Math.abs(dy) / cy).coerceIn(0f, 1f) else 0f
+                                              val keep = 1f / target - 1f
                                               val newOffset = clampOffsets(
                                                   target,
-                                                  (tap.x - cx) * (1f / target - 1f),
-                                                  (tap.y - cy) * (1f / target - 1f)
+                                                  dx * (keep * (1f - tx) - tx),
+                                                  dy * (keep * (1f - ty) - ty)
                                               )
                                               animateTo(target, newOffset.x, newOffset.y)
                                           }
