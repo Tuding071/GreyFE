@@ -326,6 +326,7 @@ jobs:
           import kotlinx.coroutines.sync.withPermit
           import kotlinx.coroutines.coroutineScope
           import kotlinx.coroutines.delay
+          import kotlinx.coroutines.ensureActive
           import kotlinx.coroutines.launch
           import kotlinx.coroutines.withContext
           import kotlinx.coroutines.withTimeoutOrNull
@@ -1809,6 +1810,8 @@ jobs:
               var op by remember { mutableStateOf<OpProgress?>(null) }
               var zipTargets by remember { mutableStateOf<List<String>?>(null) }
               var newFolderOpen by remember { mutableStateOf(false) }
+              var newFileOpen by remember { mutableStateOf(false) }
+              var detailsTargets by remember { mutableStateOf<List<File>?>(null) }
               var archivePrompt by remember { mutableStateOf<File?>(null) }
               var archiveWrongPassword by remember { mutableStateOf(false) }
 
@@ -1821,8 +1824,9 @@ jobs:
                   else -> "Cancel Copy"
               }
               val pulseOn = remember { mutableStateOf(false) }
-              LaunchedEffect(pending) {
-                  if (pending) {
+              val holding = contextTarget != null
+              LaunchedEffect(pending || holding) {
+                  if (pending || holding) {
                       while (true) {
                           pulseOn.value = true
                           delay(500)
@@ -1970,6 +1974,21 @@ jobs:
                       ok = err == null
                       err ?: ""
                   }
+              }
+
+              // Share: only files can be shared (folders are skipped); archive items are extracted first
+              fun shareTargets(paths: List<String>) {
+                  val entries = ListStats.entries
+                  val files = paths.map { File(it) }.filter { f ->
+                      val isDir = entries?.firstOrNull { it.file.absolutePath == f.absolutePath }?.isDir ?: f.isDirectory
+                      !isDir
+                  }
+                  if (files.isEmpty()) {
+                      Toast.makeText(context, "Folders can't be shared", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  if (files.size < paths.size) Toast.makeText(context, "Folders skipped", Toast.LENGTH_SHORT).show()
+                  extractThen(files) { shareFiles(context, files) }
               }
 
               // Archive items can be marked and copied (= extracted), but not changed
@@ -2155,9 +2174,22 @@ jobs:
                                               close()
                                           }
                                       }
+                                      if (activeDir != null) {
+                                          MenuRow(text = "Mark all") {
+                                              ListStats.entries?.forEach { e ->
+                                                  val p = e.file.absolutePath
+                                                  if (!marked.contains(p)) marked.add(p)
+                                              }
+                                              close()
+                                          }
+                                      }
                                       if (activeDir != null && !ArchiveSupport.isInside(context, activeDir)) {
                                           MenuRow(text = "Add New Folder") {
                                               newFolderOpen = true
+                                              close()
+                                          }
+                                          MenuRow(text = "Add New txt File") {
+                                              newFileOpen = true
                                               close()
                                           }
                                       }
@@ -2315,7 +2347,8 @@ jobs:
                                                   onSwipeTab = { dir ->
                                                       val target = activeIndex + dir
                                                       if (target in 0 until tabs.size) activeIndex = target
-                                                  }
+                                                  },
+                                                  pulsePath = contextTarget?.absolutePath
                                               )
                                           }
                                       }
@@ -2407,6 +2440,14 @@ jobs:
                                   contextTarget = null
                                   if (!archiveBlocked(tabs.getOrNull(activeIndex)?.dir)) zipTargets = targets
                               },
+                              onShare = {
+                                  contextTarget = null
+                                  shareTargets(targets)
+                              },
+                              onDetails = {
+                                  contextTarget = null
+                                  detailsTargets = targets.map { File(it) }
+                              },
                               onDelete = {
                                   contextTarget = null
                                   if (!readOnlyBlocked(targets.map { File(it) })) deleteTargets = targets
@@ -2481,6 +2522,41 @@ jobs:
                                   doZip(zt, name, password)
                               },
                               onDismiss = { zipTargets = null }
+                          )
+                      }
+
+                      // Details of the long-pressed item(s)
+                      val dt = detailsTargets
+                      if (dt != null) {
+                          DetailsDialog(targets = dt, onDismiss = { detailsTargets = null })
+                      }
+
+                      // Add New txt File ("New File" is selected, ".txt" stays; a name without an extension gets .txt)
+                      if (newFileOpen) {
+                          NewFolderDialog(
+                              title = "Add New txt File",
+                              initial = "New File.txt",
+                              selectEnd = 8,
+                              onConfirm = { raw ->
+                                  val dir = tabs.getOrNull(activeIndex)?.dir
+                                  val name = if (raw.substringAfterLast('.', "").isEmpty()) raw.trimEnd('.') + ".txt" else raw
+                                  when {
+                                      dir == null -> newFileOpen = false
+                                      name.contains('/') -> Toast.makeText(context, "Name can't contain /", Toast.LENGTH_SHORT).show()
+                                      File(dir, name).exists() -> Toast.makeText(context, "\"$name\" already exists", Toast.LENGTH_SHORT).show()
+                                      else -> {
+                                          val ok = try { File(dir, name).createNewFile() } catch (e: Exception) { false }
+                                          if (ok) {
+                                              newFileOpen = false
+                                              afterFileOp()
+                                              Toast.makeText(context, "File created", Toast.LENGTH_SHORT).show()
+                                          } else {
+                                              Toast.makeText(context, "Could not create file", Toast.LENGTH_SHORT).show()
+                                          }
+                                      }
+                                  }
+                              },
+                              onDismiss = { newFileOpen = false }
                           )
                       }
 
@@ -3256,6 +3332,11 @@ jobs:
                   set(v) { if (field !== v) { field = v; invalidate() } }
               var lastOpened: String? = null
                   set(v) { if (field != v) { field = v; invalidate() } }
+              // the item whose long-press menu is open blinks (white background, black text) like the menu rows do
+              var pulsePath: String? = null
+                  set(v) { if (field != v) { field = v; invalidate() } }
+              var pulseOn: Boolean = false
+                  set(v) { if (field != v) { field = v; if (pulsePath != null) invalidate() } }
               var refreshing: Boolean = false
                   set(v) {
                       if (field != v) {
@@ -3580,7 +3661,8 @@ jobs:
                   val path = e.file.absolutePath
 
                   val isMarked = marked.isNotEmpty() && marked.contains(path)
-                  val pressed = pressedRow == i || isMarked
+                  val pulsing = pulseOn && pulsePath != null && pulsePath == path
+                  val pressed = pressedRow == i || isMarked || pulsing
                   val lp = lastOpened
                   val isLast = !pressed && lp != null &&
                       (lp == path || (isDir && lp.length > path.length && lp[path.length] == '/' && lp.startsWith(path)))
@@ -4228,6 +4310,8 @@ jobs:
           // Folder / file counts of the open folder, shown under the breadcrumbs
           object ListStats {
               var text by mutableStateOf("")
+              // entries of the folder on screen (used by Mark all and Details)
+              var entries: List<Entry>? = null
               fun of(list: List<Entry>?): String {
                   if (list == null) return ""
                   val folders = list.count { it.isDir }
@@ -4312,7 +4396,8 @@ jobs:
               onOpenText: (File) -> Unit,
               onExtract: (files: List<File>, then: () -> Unit) -> Unit,
               onOpenImage: (images: List<File>, index: Int) -> Unit,
-              onSwipeTab: (Int) -> Unit = {}
+              onSwipeTab: (Int) -> Unit = {},
+              pulsePath: String? = null
           ) {
               val context = LocalContext.current
 
@@ -4354,7 +4439,11 @@ jobs:
               }
               FrameMonitor("list")
               val lastOpenedPath = LastOpened.path
-              LaunchedEffect(sorted) { ListStats.text = ListStats.of(sorted) }
+              LaunchedEffect(sorted) {
+                  ListStats.text = ListStats.of(sorted)
+                  ListStats.entries = sorted
+              }
+              val pulseNow = pulsePath != null && LocalPulse.current?.value == true
               val inArchiveDir = remember(dirPath) { ArchiveSupport.isVirtualPath(dirPath) }
               val imagesInDir = remember(sorted) {
                   sorted?.filter { !it.isDir && ThumbnailCache.isImage(it.name) }?.map { it.file } ?: emptyList()
@@ -4428,6 +4517,8 @@ jobs:
                                       v.marked = marked
                                       v.lastOpened = lastOpenedPath
                                       v.refreshing = refreshing
+                                      v.pulsePath = pulsePath
+                                      v.pulseOn = pulseNow
                                       v.setEntries(sorted, inArchiveDir, restorePos)
                                   }
                               )
@@ -4619,6 +4710,8 @@ jobs:
               onCopy: () -> Unit,
               onMove: () -> Unit,
               onArchive: () -> Unit,
+              onShare: () -> Unit,
+              onDetails: () -> Unit,
               onDelete: () -> Unit,
               onCancel: () -> Unit,
               onPaste: () -> Unit,
@@ -4650,6 +4743,8 @@ jobs:
                           MenuRow(text = "Copy") { onCopy() }
                           MenuRow(text = "Move") { onMove() }
                           MenuRow(text = "Archive (Zip)") { onArchive() }
+                          MenuRow(text = "Share") { onShare() }
+                          MenuRow(text = "Details") { onDetails() }
                           MenuRow(text = "Delete") { onDelete() }
                       }
                   }
@@ -4840,17 +4935,151 @@ jobs:
               }
           }
 
+          // Sends files to another app (folders are not shareable)
+          fun shareFiles(context: Context, files: List<File>) {
+              try {
+                  val uris = ArrayList<Uri>()
+                  for (f in files) uris.add(FileProvider.getUriForFile(context, context.packageName + ".fileprovider", f))
+                  val intent = if (uris.size == 1) {
+                      Intent(Intent.ACTION_SEND).apply {
+                          type = MimeTypeMap.getSingleton().getMimeTypeFromExtension(files[0].extension.lowercase()) ?: "*/*"
+                          putExtra(Intent.EXTRA_STREAM, uris[0])
+                      }
+                  } else {
+                      Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                          type = "*/*"
+                          putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                      }
+                  }
+                  val clip = ClipData.newRawUri("", uris[0])
+                  for (k in 1 until uris.size) clip.addItem(ClipData.Item(uris[k]))
+                  intent.clipData = clip
+                  intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  context.startActivity(Intent.createChooser(intent, "Share"))
+              } catch (e: Exception) {
+                  AppLog.w("share failed: ${e.javaClass.simpleName} ${e.message}")
+                  Toast.makeText(context, "Could not share", Toast.LENGTH_SHORT).show()
+              }
+          }
+
+          // Size and contents of the long-pressed item(s)
+          class DetailTotals(val bytes: Long, val files: Int, val folders: Int, val partial: Boolean)
+
+          @Composable
+          fun DetailsDialog(targets: List<File>, onDismiss: () -> Unit) {
+              val entries = ListStats.entries
+              val single = targets.size == 1
+              val first = targets[0]
+              val info = if (single) entries?.firstOrNull { it.file.absolutePath == first.absolutePath } else null
+              val isDir = info?.isDir ?: first.isDirectory
+              // Folders are counted in the background (can take a while for big ones); closing the popup stops it
+              val totals by produceState<DetailTotals?>(initialValue = null, key1 = targets) {
+                  value = withContext(Dispatchers.IO) {
+                      var bytes = 0L
+                      var files = 0
+                      var folders = 0
+                      var partial = false
+                      for (t in targets) {
+                          val e = entries?.firstOrNull { it.file.absolutePath == t.absolutePath }
+                          val dir = e?.isDir ?: t.isDirectory
+                          if (!dir) {
+                              bytes += e?.size ?: t.length()
+                              files++
+                          } else if (ArchiveSupport.isVirtualPath(t.absolutePath)) {
+                              folders++
+                              partial = true
+                          } else {
+                              folders++
+                              t.walkTopDown().forEach { f ->
+                                  ensureActive()
+                                  if (f.absolutePath != t.absolutePath) {
+                                      if (f.isDirectory) folders++ else {
+                                          files++
+                                          bytes += f.length()
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                      DetailTotals(bytes, files, folders, partial)
+                  }
+              }
+              val t = totals
+              Dialog(onDismissRequest = onDismiss) {
+                  Column(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .clip(RoundedCornerShape(14.dp))
+                          .background(Color(0xFF2A2A2A))
+                          .padding(vertical = 6.dp)
+                  ) {
+                      Text(
+                          text = "Details",
+                          color = Color.White,
+                          fontWeight = FontWeight.Bold,
+                          fontSize = 16.sp,
+                          modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                      )
+                      Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.15f)))
+                      Column(
+                          modifier = Modifier
+                              .weight(1f, fill = false)
+                              .verticalScroll(rememberScrollState())
+                              .padding(horizontal = 16.dp, vertical = 10.dp)
+                      ) {
+                          @Composable
+                          fun Line(label: String, value: String) {
+                              Text(label, color = Color.White.copy(alpha = 0.5f), fontSize = 11.sp)
+                              Text(value, color = Color.White, fontSize = 14.sp, maxLines = 6, overflow = TextOverflow.Ellipsis)
+                              Spacer(Modifier.height(10.dp))
+                          }
+                          if (single) {
+                              Line("Name", first.name)
+                              Line("Location", first.parentFile?.absolutePath ?: "/")
+                              Line(
+                                  "Type",
+                                  if (isDir) "Folder"
+                                  else first.extension.takeIf { it.isNotEmpty() }?.let { it.uppercase() + " file" } ?: "File"
+                              )
+                          } else {
+                              Line("Selected", "${targets.size} items")
+                          }
+                          val sizeText = when {
+                              t == null -> "Calculating..."
+                              t.partial -> "Not available inside an archive"
+                              else -> formatSize(t.bytes) + "  (" + String.format(Locale.US, "%,d", t.bytes) + " bytes)"
+                          }
+                          Line("Size", sizeText)
+                          if (t != null && !t.partial && (!single || isDir)) {
+                              val fl = if (t.files == 1) "1 file" else "${t.files} files"
+                              val fo = if (t.folders - (if (single) 1 else 0) == 1) "1 folder" else "${t.folders - (if (single) 1 else 0)} folders"
+                              Line("Contains", "$fl, $fo")
+                          }
+                          if (single) {
+                              Line("Modified", formatDate(info?.modified ?: first.lastModified()))
+                          }
+                      }
+                      DialogButton(text = "Close", modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp)) { onDismiss() }
+                  }
+              }
+          }
+
           // Add New Folder: "New Folder" is already selected, so typing replaces it. Blank = "New Folder".
           @Composable
-          fun NewFolderDialog(onConfirm: (String) -> Unit, onDismiss: () -> Unit) {
-              val initial = "New Folder"
-              var value by remember { mutableStateOf(TextFieldValue(initial, TextRange(0, initial.length))) }
+          fun NewFolderDialog(
+              onConfirm: (String) -> Unit,
+              onDismiss: () -> Unit,
+              title: String = "Add New Folder",
+              initial: String = "New Folder",
+              selectEnd: Int = initial.length
+          ) {
+              var value by remember { mutableStateOf(TextFieldValue(initial, TextRange(0, selectEnd))) }
               val focus = remember { FocusRequester() }
               LaunchedEffect(Unit) { focus.requestFocus() }
               AlertDialog(
                   onDismissRequest = onDismiss,
                   containerColor = Color(0xFF2A2A2A),
-                  title = { Text("Add New Folder", color = Color.White) },
+                  title = { Text(title, color = Color.White) },
                   text = {
                       OutlinedTextField(
                           value = value,
@@ -6217,7 +6446,7 @@ jobs:
           }
 
           // ---------- Bookmarks side panel ----------
-          // No animation: it appears and disappears at once.
+          // Opens / closes with a short slide + fade (170 ms): fast, but not a hard cut.
           // Press and hold the WHOLE row to drag; it follows the finger until release.
           // Each row shows an internal or SD card icon (same icons as Home).
           @Composable
@@ -6235,12 +6464,18 @@ jobs:
               var dragOffsetY by remember { mutableStateOf(0f) }
               val rowHeightPx = with(LocalDensity.current) { 44.dp.toPx() }
 
-              if (!visible && draggingIndex == -1) return
+              val progress by androidx.compose.animation.core.animateFloatAsState(
+                  targetValue = if (visible) 1f else 0f,
+                  animationSpec = tween(170, easing = androidx.compose.animation.core.FastOutSlowInEasing),
+                  label = "bookmarksPanel"
+              )
+              if (!visible && draggingIndex == -1 && progress <= 0.001f) return
 
               Box(modifier = Modifier.fillMaxSize()) {
                   Box(
                       modifier = Modifier
                           .fillMaxSize()
+                          .graphicsLayer { alpha = progress }
                           .background(Color(0x99000000))
                           .clickable(
                               interactionSource = remember { MutableInteractionSource() },
@@ -6254,6 +6489,7 @@ jobs:
                           .align(Alignment.CenterStart)
                           .fillMaxHeight()
                           .width(240.dp)
+                          .graphicsLayer { translationX = -(1f - progress) * size.width }
                           .background(Color(0xFF232323))
                           .windowInsetsPadding(WindowInsets.systemBars)
                           .padding(vertical = 12.dp)
