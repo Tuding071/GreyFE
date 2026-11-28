@@ -2526,9 +2526,9 @@ jobs:
                       }
 
                       // Details of the long-pressed item(s)
-                      val dt = detailsTargets
-                      if (dt != null) {
-                          DetailsDialog(targets = dt, onDismiss = { detailsTargets = null })
+                      val detailsList = detailsTargets
+                      if (detailsList != null) {
+                          DetailsDialog(targets = detailsList, onDismiss = { detailsTargets = null })
                       }
 
                       // Add New txt File ("New File" is selected, ".txt" stays; a name without an extension gets .txt)
@@ -3661,8 +3661,9 @@ jobs:
                   val path = e.file.absolutePath
 
                   val isMarked = marked.isNotEmpty() && marked.contains(path)
-                  val pulsing = pulseOn && pulsePath != null && pulsePath == path
-                  val pressed = pressedRow == i || isMarked || pulsing
+                  // the held item (long-press menu open) blinks; if it is also marked, its static white look is replaced by the blink
+                  val held = pulsePath != null && pulsePath == path
+                  val pressed = pressedRow == i || (if (held) pulseOn else isMarked)
                   val lp = lastOpened
                   val isLast = !pressed && lp != null &&
                       (lp == path || (isDir && lp.length > path.length && lp[path.length] == '/' && lp.startsWith(path)))
